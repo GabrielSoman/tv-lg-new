@@ -1084,20 +1084,64 @@
     /* --- atualização --- */
     var pAtu = painel('Atualização',
       'O app se atualiza pelo código no GitHub, sem pen drive.');
-    pAtu.appendChild(linha('Versão instalada',
-      (w.Updater && w.Updater.version && w.Updater.version()) || '—'));
+    /* O nome do método é `install`, não `apply`. Eu chamei
+       `Updater.apply(info)` e o botão estourava com
+       "is not a function" — sem sair do lugar, sem dizer nada.
+       O nome certo está em `app/js/boot.js`, que é a casca e não
+       muda pela atualização. */
+    var carregada = (w.Updater && w.Updater.loaded) || {};
+    pAtu.appendChild(linha('Versão instalada', carregada.version || '—'));
+    pAtu.appendChild(linha('Origem', carregada.source || '—'));
+
     var bAtu = el('button', { class: 'btn', 'data-focusable': '' });
+    var passo = el('div', { class: 'painel-sub', text: '' });
     bAtu.innerHTML = w.icon('refresh') + '<span>Procurar atualização</span>';
+
     bAtu.onclick = function () {
       var txt = bAtu.querySelector('span');
+      if (!w.Updater || !w.Updater.configured || !w.Updater.configured()) {
+        txt.textContent = 'Sem repositório configurado';
+        passo.textContent = 'O .ipk instalado não trouxe o campo "update" do ' +
+                            'nebula.config.json. Um "npm run deploy" resolve, uma vez só.';
+        return;
+      }
       txt.textContent = 'Procurando…';
+      passo.textContent = '';
       w.Updater.check().then(function (info) {
-        if (!info.isNew) { txt.textContent = 'Já está atualizado'; return; }
+        if (!info.isNew) {
+          txt.textContent = 'Já está atualizado';
+          passo.textContent = 'Versão no GitHub: ' + info.version;
+          return;
+        }
         txt.textContent = 'Instalar versão ' + info.version;
-        bAtu.onclick = function () { w.Updater.apply(info); };
-      }).catch(function (e) { txt.textContent = 'Falhou: ' + e.message; });
+        bAtu.onclick = function () {
+          txt.textContent = 'Instalando…';
+          w.Updater.install(info, function (m) { passo.textContent = m; })
+            .then(function () {
+              txt.textContent = 'Instalada — reiniciando';
+              setTimeout(function () { w.Updater.reload(); }, 900);
+            })
+            .catch(function (e) {
+              txt.textContent = 'Falhou ao instalar';
+              passo.textContent = e.message;
+            });
+        };
+      }).catch(function (e) {
+        txt.textContent = 'Falhou ao procurar';
+        passo.textContent = e.message;
+      });
     };
     pAtu.appendChild(bAtu);
+    pAtu.appendChild(passo);
+
+    if (w.Updater && w.Updater.hasPrevious && w.Updater.hasPrevious()) {
+      var bVolta = el('button', { class: 'btn ghost', 'data-focusable': '' });
+      bVolta.innerHTML = '<span>Voltar para a versão anterior</span>';
+      bVolta.onclick = function () {
+        if (w.Updater.rollback()) w.Updater.reload();
+      };
+      pAtu.appendChild(bVolta);
+    }
     caixa.appendChild(pAtu);
 
     /* --- conteúdo adulto --- */
