@@ -53,6 +53,8 @@
     list:     '<path d="M4 7h16M4 12h16M4 17h10"/>',
     layers:   '<path d="m12 4 8 4.5-8 4.5-8-4.5z"/><path d="m4 13 8 4.5 8-4.5"/>',
     audio:    '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="M16 9.5a4 4 0 0 1 0 5"/>',
+    volume:   '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="M16 9.5a4 4 0 0 1 0 5"/><path d="M18.4 7a7.5 7.5 0 0 1 0 10"/>',
+    mute:     '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="m16 10 4 4M20 10l-4 4"/>',
     cc:       '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M10 10.5a2.2 2.2 0 1 0 0 3M16.5 10.5a2.2 2.2 0 1 0 0 3"/>',
     refresh:  '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
     check:    '<path d="m5 12.5 4.5 4.5L19 7"/>',

@@ -118,11 +118,28 @@
      ----------------------------------------------------------- */
   function cartao(item, forma, extra) {
     forma = forma || 'poster';
+    extra = extra || {};
     var b = doc.createElement('button');
     b.className = 'card card-' + forma;
     b.setAttribute('data-focusable', '');
     b.setAttribute('data-id', item.id);
     b._item = item;
+
+    /* -----------------------------------------------------------
+       Fileira numerada
+       -----------------------------------------------------------
+       O número entra ANTES da capa e vive fora dela: é o desenho
+       do "Top 10" que todo mundo reconhece de longe, e é a única
+       fileira em que a ordem quer dizer alguma coisa.
+
+       O algarismo tem largura fixa no CSS de propósito. A
+       virtualização mede UM cartão para deduzir o passo da
+       fileira; se o "1" fosse mais estreito que o "10", todos os
+       cartões depois do nono ficariam deslocados — e o defeito só
+       apareceria a partir do décimo, que é o pior lugar para um
+       defeito aparecer.
+       ----------------------------------------------------------- */
+    if (extra.rank) b.classList.add('card-rank');
 
     var casca = poster(item.poster || item.backdrop || '', item.title, '');
 
@@ -173,13 +190,27 @@
     nome.className = 'card-name';
     nome.textContent = item.title || '';
     meta.appendChild(nome);
-    if (extra && extra.nota) {
-      var n = doc.createElement('div');
-      n.className = 'card-note';
-      n.textContent = extra.nota;
-      meta.appendChild(n);
+    if (extra.nota) {
+      var nt = doc.createElement('div');
+      nt.className = 'card-note';
+      nt.textContent = extra.nota;
+      meta.appendChild(nt);
     }
     b.appendChild(meta);
+
+    /* A capa e o nome viram uma coluna só, e o algarismo fica ao
+       lado dela. Sem este embrulho o cartão é um flex de três
+       filhos e o nome vai parar À DIREITA da capa, não embaixo. */
+    if (extra.rank) {
+      var corpo = doc.createElement('div');
+      corpo.appendChild(casca);
+      corpo.appendChild(meta);
+      var num = doc.createElement('span');
+      num.className = 'num';
+      num.textContent = String(extra.rank);
+      b.appendChild(num);
+      b.appendChild(corpo);
+    }
     return b;
   }
 
@@ -209,7 +240,8 @@
     }
 
     var janela = doc.createElement('div');
-    janela.className = 'janela fileira forma-' + (opts.forma || 'poster');
+    janela.className = 'janela fileira forma-' + (opts.forma || 'poster') +
+                       (opts.numerada ? ' numerada' : '');
     sec.appendChild(janela);
 
     /* O controlador precisa da janela já medida, então a fileira
@@ -217,7 +249,10 @@
        chama `UI.ligar(sec)`. */
     sec._ligar = function () {
       sec.ctrl = w.Virt.fileira(janela, itens, function (item, i) {
-        var c = cartao(item, opts.forma, { nota: opts.nota ? opts.nota(item, i) : '' });
+        var c = cartao(item, opts.forma, {
+          nota: opts.nota ? opts.nota(item, i) : '',
+          rank: opts.numerada ? (i + 1) : 0
+        });
         if (opts.aoAbrir) c.onclick = function () { opts.aoAbrir(item, i); };
         return c;
       }, opts.gap || 16);
@@ -325,9 +360,24 @@
 
      Cada tela informa aqui qual é a sua região principal.
      ----------------------------------------------------------- */
+  /* Nem tudo o que uma tela cria morre sozinho quando o nó sai do
+     documento. O trailer da abertura, por exemplo, é um <iframe>
+     do YouTube com um temporizador atrás: remover o nó para o
+     vídeo, mas deixa o temporizador vivo para recriar o iframe
+     numa tela que já não existe. Quem tem o que desligar pendura
+     `_desligar` no próprio nó e isto aqui chama. */
+  function desligarTudo(raiz) {
+    if (!raiz) return;
+    if (raiz._desligar) { try { raiz._desligar(); } catch (e) {} }
+    w.$$('*', raiz).forEach(function (n) {
+      if (n._desligar) { try { n._desligar(); } catch (e) {} }
+    });
+  }
+
   function trocar(elemento, regiaoPrincipal) {
     var palco = w.$('#stage');
     w.Virt.dentroDe(palco).forEach(function (c) { c.destruir(); });
+    desligarTudo(palco.firstChild);
     w.clear(palco);
     palco.appendChild(elemento);
     ligar(elemento);
@@ -351,6 +401,7 @@
     esqueleto: esqueleto,
     tela: tela,
     ligar: ligar,
+    desligar: desligarTudo,
     trocar: trocar,
     apontarMenu: apontarMenu,
     marcasDe: marcasDe

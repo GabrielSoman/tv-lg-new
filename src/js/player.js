@@ -510,7 +510,21 @@
      ----------------------------------------------------------- */
   function comecarASalvar() {
     pararDeSalvar();
-    salvar = setInterval(function () { gravar(false); }, w.CFG.SAVE_EVERY_MS);
+    salvar = setInterval(function () {
+      /* Ao vivo não tem posição para guardar, mas tem TEMPO — e
+         é o tempo, não o número de cliques, que separa "eu vejo
+         este canal" de "passei por ele zapeando". É a coluna
+         `segundos` da tabela `channel_usage`, e sem alguém
+         somando aqui ela ficaria zerada para sempre. */
+      if (aoVivo) {
+        if (!video.paused && w.Store.addChannelSeconds) {
+          w.Store.addChannelSeconds(item, w.CFG.SAVE_EVERY_MS / 1000,
+            degraus[iDegrau] ? degraus[iDegrau].rotulo : '');
+        }
+        return;
+      }
+      gravar(false);
+    }, w.CFG.SAVE_EVERY_MS);
   }
   function pararDeSalvar() { if (salvar) { clearInterval(salvar); salvar = null; } }
 

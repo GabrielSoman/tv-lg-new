@@ -440,6 +440,15 @@
      era, porque dividia espaço com um carrossel que já não
      existe mais.
      ----------------------------------------------------------- */
+  /* A arte certa para uma caixa larga é a DEITADA. O campo se
+     chama `fundo` no catálogo (vem de `backdrop_path`) e este
+     código lia só `backdrop`, que não existe em item nenhum — por
+     isso o hero sempre caía no cartaz em pé esticado, que é a
+     causa real de ele "parecer errado". */
+  function arteLarga(item) {
+    return item.backdrop || item.fundo || item.poster || '';
+  }
+
   function destaque(item, aoTocar, aoDetalhe) {
     var sec = el('div', {
       class: 'hero',
@@ -447,10 +456,10 @@
       'data-nb-left': 'rail', 'data-nb-down': 'rows', 'data-enter': 'first'
     });
 
-    if (item.backdrop || item.poster) {
+    var arteUrl = arteLarga(item);
+    if (arteUrl) {
       var arte = el('div', { class: 'hero-arte' });
-      arte.style.backgroundImage = 'url("' +
-        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      arte.style.backgroundImage = 'url("' + String(arteUrl).replace(/"/g, '%22') + '")';
       sec.appendChild(arte);
       sec.appendChild(el('div', { class: 'hero-veu' }));
     }
@@ -474,7 +483,190 @@
     }
     texto.appendChild(botoes);
     sec.appendChild(texto);
+
+    ligarTrailer(sec, item, botoes);
     return sec;
+  }
+
+  /* -----------------------------------------------------------
+     Trailer na abertura
+     -----------------------------------------------------------
+     `youtube_trailer` sempre veio na resposta do painel e nunca
+     foi usado. Agora vira o que o hero mostra depois de alguns
+     segundos de arte parada — mudo, em laço, atrás do degradê.
+
+     Três decisões, todas por causa de como isso falha numa TV:
+
+     · nunca entra de cara. Se a rede está ruim, o primeiro
+       quadro tem de ser uma imagem inteira, não um retângulo
+       preto carregando;
+
+     · se o iframe não subir em 9 segundos, desiste e some. Um
+       trailer que não veio é invisível; um trailer travado é uma
+       mancha preta em cima da abertura;
+
+     · morre junto com a tela. O <iframe> continuaria tocando som
+       — quando você tirasse o mudo — dentro de um nó que já saiu
+       do documento.
+     ----------------------------------------------------------- */
+  var ATRASO_TRAILER = 3200;
+  var LIMITE_TRAILER = 9000;
+
+  /* Aceita o que o painel mandar: id cru, link normal, link
+     curto, /embed/. Provedor nenhum é consistente nisto. */
+  function idYoutube(v) {
+    var s = String(v || '').trim();
+    if (!s) return '';
+    var m = s.match(/[?&]v=([A-Za-z0-9_-]{6,})/) ||
+            s.match(/(?:youtu\.be\/|\/embed\/|\/shorts\/|\/v\/)([A-Za-z0-9_-]{6,})/);
+    if (m) return m[1];
+    if (/^[A-Za-z0-9_-]{6,20}$/.test(s)) return s;
+    return '';
+  }
+
+  function ligarTrailer(sec, item, botoes) {
+    if (!item || item.kind === 'live') return;
+    if (w.Store.get('hero.trailer', true) === false) return;
+
+    var vid = idYoutube(item.trailer);
+    if (!vid) return;
+
+    var mudo = w.Store.get('hero.som', false) !== true;
+    var caixa = null, quadro = null, relogio = null, vigia = null, morto = false;
+
+    function parar() {
+      clearTimeout(relogio); clearTimeout(vigia);
+      if (quadro) { try { quadro.src = 'about:blank'; } catch (e) {} }
+      if (caixa && caixa.parentNode) caixa.parentNode.removeChild(caixa);
+      caixa = null; quadro = null;
+      sec.classList.remove('tocando');
+    }
+
+    /* A API do YouTube por postMessage. Só serve para o som: o
+       resto (laço, sem controles) já vai na própria URL. */
+    function comandar(func) {
+      if (!quadro || !quadro.contentWindow) return;
+      try {
+        quadro.contentWindow.postMessage(
+          JSON.stringify({ event: 'command', func: func, args: [] }), '*');
+      } catch (e) {}
+    }
+
+    function botaoSom() {
+      var b = el('button', { class: 'btn ghost', 'data-focusable': '' });
+      var pinta = function () {
+        b.innerHTML = w.icon(mudo ? 'mute' : 'volume') +
+                      '<span>' + (mudo ? 'Ativar som' : 'Sem som') + '</span>';
+      };
+      pinta();
+      b.onclick = function () {
+        mudo = !mudo;
+        w.Store.set('hero.som', !mudo);
+        comandar(mudo ? 'mute' : 'unMute');
+        pinta();
+      };
+      return b;
+    }
+
+    function comecar() {
+      if (morto) return;
+      caixa = el('div', { class: 'hero-trailer' });
+      quadro = document.createElement('iframe');
+      quadro.setAttribute('frameborder', '0');
+      quadro.setAttribute('allow', 'autoplay; encrypted-media');
+      quadro.setAttribute('tabindex', '-1');
+      quadro.src = 'https://www.youtube.com/embed/' + vid +
+        '?autoplay=1&mute=' + (mudo ? 1 : 0) +
+        '&controls=0&disablekb=1&fs=0&rel=0&modestbranding=1' +
+        '&iv_load_policy=3&playsinline=1&enablejsapi=1' +
+        '&loop=1&playlist=' + vid;
+
+      quadro.onload = function () {
+        if (morto) return;
+        clearTimeout(vigia);
+        caixa.classList.add('on');
+        sec.classList.add('tocando');
+        if (botoes && !botoes.querySelector('.hero-som')) {
+          var b = botaoSom();
+          b.classList.add('hero-som');
+          botoes.appendChild(b);
+        }
+      };
+
+      caixa.appendChild(quadro);
+      /* Antes do véu e do texto: o degradê tem de continuar por
+         cima, senão o título fica ilegível sobre o vídeo. */
+      sec.insertBefore(caixa, sec.firstChild);
+
+      vigia = setTimeout(function () {
+        if (!sec.classList.contains('tocando')) parar();
+      }, LIMITE_TRAILER);
+    }
+
+    relogio = setTimeout(comecar, ATRASO_TRAILER);
+    sec._desligar = function () { morto = true; parar(); };
+  }
+
+  /* O destaque merece uma chamada a mais: o registro de progresso
+     guarda só título e cartaz, e o hero quer a arte deitada, a
+     sinopse e o trailer. É uma requisição, cacheada, e é ela que
+     separa um hero bonito de um cartaz esticado com o nome em
+     cima. */
+  function enriquecerDestaque(item) {
+    if (!item) return Promise.resolve(null);
+    if (item.kind === 'live') return Promise.resolve(item);
+
+    var id = String(item.id || '');
+    var num = id.replace(/^[a-z]+:/, '');
+    var serieId = item.seriesId || item.series_id || (/^series:/.test(id) ? num : '');
+    var busca = serieId
+      ? w.Catalog.serie(serieId)
+      : (/^movie:/.test(id) || item.kind === 'movie')
+        ? w.Catalog.filme(item.streamId || num)
+        : null;
+    if (!busca) return Promise.resolve(item);
+
+    return busca.then(function (info) {
+      if (!info) return item;
+      var c = {};
+      Object.keys(item).forEach(function (k) { c[k] = item[k]; });
+      c.backdrop = item.backdrop || item.fundo || info.fundo || '';
+      c.poster   = item.poster || info.poster || '';
+      c.plot     = item.plot || item.sinopse || info.sinopse || '';
+      c.trailer  = item.trailer || info.trailer || '';
+      return c;
+    }).catch(function () { return item; });
+  }
+
+  /* -----------------------------------------------------------
+     Top 10 novidades
+     -----------------------------------------------------------
+     Um painel Xtream não tem dado de popularidade — não existe
+     "mais assistido" para pedir, e inventar um ranking com número
+     aleatório seria mentira desenhada com capricho. O que ele TEM
+     é a data em que cada coisa entrou no acervo (`added` nos
+     filmes, `last_modified` nas séries). "Chegou agora" é um
+     ranking honesto, e é o que a fileira numerada mostra.
+
+     Sai do material que a abertura já baixou para montar as
+     outras fileiras: nenhuma requisição a mais.
+     ----------------------------------------------------------- */
+  function topNovidades(blocos, quantos) {
+    var todos = [];
+    (blocos || []).forEach(function (b) { todos = todos.concat((b && b.itens) || []); });
+
+    var vistos = {};
+    return todos.filter(function (i) {
+      if (!i || !i.added) return false;
+      if (!naoAdulto(i)) return false;
+      if (!i.poster && !i.fundo) return false;
+      var chave = i.seriesId ? 's:' + i.seriesId : i.id;
+      if (vistos[chave]) return false;
+      vistos[chave] = true;
+      return true;
+    }).sort(function (a, b) {
+      return (b.added || 0) - (a.added || 0);
+    }).slice(0, quantos || 10);
   }
 
   function inicio() {
@@ -501,12 +693,13 @@
        foi o que apareceu com "Moana". Se o primeiro não tem,
        pega o primeiro que tiver. */
     var comArte = continuar.filter(comCapa)[0];
-    var promessaDestaque = comArte
+    var promessaDestaque = (comArte
       ? Promise.resolve(marcarRetomar(comArte))
       : w.Catalog.categorias('movie')
           .then(function (cs) { return cs.length ? w.Catalog.itens('movie', cs[0].id) : []; })
           .then(function (fs) { return fs.filter(comCapa)[0] || null; })
-          .catch(function () { return null; });
+          .catch(function () { return null; })
+      ).then(enriquecerDestaque);
 
     Promise.all([
       promessaDestaque,
@@ -531,6 +724,19 @@
         fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
           { forma: 'wide', aoAbrir: tocarDoDestaque }));
       }
+
+      /* A fileira numerada vem logo depois do que está em
+         andamento e antes das pastas: é a única fileira em que a
+         ordem quer dizer alguma coisa, e ela se perde no meio de
+         seis fileiras iguais lá embaixo. */
+      var novidades = topNovidades(filmes.concat(series), 10);
+      if (novidades.length >= 5) {
+        fileiras.appendChild(w.UI.fileira('Top 10 novidades', novidades, {
+          forma: 'poster', numerada: true, aoAbrir: abrir,
+          subtitulo: 'o que chegou por último'
+        }));
+      }
+
       if (canais.length) {
         fileiras.appendChild(w.UI.fileira('Canais ao vivo', porHabito(canais).slice(0, 120),
           { forma: 'logo', aoAbrir: abrir, subtitulo: canais.length + ' canais' }));
@@ -722,7 +928,7 @@
   function naoAdulto(item) {
     return !(w.Catalog.itemAdulto && w.Catalog.itemAdulto(item));
   }
-  function comCapa(i) { return !!(i.backdrop || i.poster); }
+  function comCapa(i) { return !!(i.backdrop || i.fundo || i.poster); }
   function marcarRetomar(i) {
     var c = {}; Object.keys(i).forEach(function (k) { c[k] = i[k]; });
     c.retomar = true; return c;
@@ -926,10 +1132,10 @@
   /* Cabeçalho comum aos dois detalhes. */
   function cabecalhoDetalhe(item, acoes) {
     var topo = el('div', { class: 'det-topo' });
-    if (item.backdrop || item.poster) {
+    var arteDet = arteLarga(item);
+    if (arteDet) {
       var arte = el('div', { class: 'det-arte' });
-      arte.style.backgroundImage = 'url("' +
-        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      arte.style.backgroundImage = 'url("' + String(arteDet).replace(/"/g, '%22') + '")';
       topo.appendChild(arte);
       topo.appendChild(el('div', { class: 'det-veu' }));
     }
@@ -1163,6 +1369,44 @@
     }
     caixa.appendChild(pAtu);
 
+    /* --- abertura --- */
+    var pIni = painel('Tela inicial',
+      'O trailer entra depois de alguns segundos de arte parada, sem som. ' +
+      'Se o vídeo não subir em nove segundos, o app desiste e a arte fica.');
+
+    var trOn = w.Store.get('hero.trailer', true) !== false;
+    var bTr = el('button', { class: 'btn ghost' + (trOn ? ' ativo' : ''), 'data-focusable': '' });
+    var pintaTr = function () {
+      bTr.innerHTML = w.icon(trOn ? 'play' : 'pause') + '<span>' +
+        (trOn ? 'Trailer no destaque: ligado' : 'Trailer no destaque: desligado') + '</span>';
+      bTr.classList.toggle('ativo', trOn);
+    };
+    pintaTr();
+    bTr.onclick = function () {
+      trOn = !trOn;
+      w.Store.set('hero.trailer', trOn);
+      pintaTr();
+      w.toast(trOn ? 'Trailer ligado — vale na próxima abertura.'
+                   : 'Trailer desligado.', 3000);
+    };
+    pIni.appendChild(bTr);
+
+    var somOn = w.Store.get('hero.som', false) === true;
+    var bSom = el('button', { class: 'btn ghost' + (somOn ? ' ativo' : ''), 'data-focusable': '' });
+    var pintaSom = function () {
+      bSom.innerHTML = w.icon(somOn ? 'volume' : 'mute') + '<span>' +
+        (somOn ? 'Trailer com som' : 'Trailer sem som') + '</span>';
+      bSom.classList.toggle('ativo', somOn);
+    };
+    pintaSom();
+    bSom.onclick = function () {
+      somOn = !somOn;
+      w.Store.set('hero.som', somOn);
+      pintaSom();
+    };
+    pIni.appendChild(bSom);
+    caixa.appendChild(pIni);
+
     /* --- conteúdo adulto --- */
     var pAd = painel('Conteúdo adulto',
       'Independentemente desta opção, nada de conteúdo adulto é gravado como ' +
@@ -1189,19 +1433,55 @@
        desligado na TV e não havia como saber olhando a tela. */
     pD.appendChild(linha('Banco de dados',
       w.Cloud.enabled() ? 'conectado' : 'desligado (sem credenciais)'));
-    pD.appendChild(linha('Fila para enviar', w.Cloud.pending()));
+
+    /* -------------------------------------------------------
+       Uma linha por tabela
+       -------------------------------------------------------
+       "Conectado" sozinho escondia o problema real: quatro das
+       cinco tabelas nunca recebiam nada, e a tela dizia que
+       estava tudo bem. Agora cada uma responde por si — o que
+       tem na TV, o que está esperando para subir e, depois do
+       teste, se ela existe mesmo lá.
+       ------------------------------------------------------- */
+    var CONTAGEM = {
+      progresso: function () { return Object.keys(w.Store.allProgress()).length; },
+      favoritos: function () { return w.Store.favorites().length; },
+      canais:    function () { return w.Store.allChannels().length; },
+      series:    function () { return w.Store.allSeries().length; },
+      ajustes:   function () { return w.Store.syncedSettings().length; }
+    };
+    var linhasTab = {};
+    (w.Cloud.chaves || []).forEach(function (k) {
+      var fila = w.Cloud.pending(k);
+      var txt = CONTAGEM[k]() + ' na TV' + (fila ? ' · ' + fila + ' na fila' : '');
+      var l = linha(w.Cloud.tabelas[k].rotulo, txt);
+      linhasTab[k] = l.querySelector('.linha-v');
+      pD.appendChild(l);
+    });
+
     if (w.Cloud.lastError && w.Cloud.lastError()) {
       pD.appendChild(linha('Último erro', w.Cloud.lastError()));
     }
 
     if (w.Cloud.enabled()) {
       var bTeste = el('button', { class: 'btn ghost', 'data-focusable': '' });
-      bTeste.innerHTML = '<span>Testar conexão com o banco</span>';
+      bTeste.innerHTML = '<span>Conferir as cinco tabelas</span>';
       bTeste.onclick = function () {
         var t = bTeste.querySelector('span');
-        t.textContent = 'Testando…';
+        t.textContent = 'Conferindo…';
         w.Cloud.test()
-          .then(function () { t.textContent = 'Conexão ok'; })
+          .then(function (res) {
+            var faltam = res.filter(function (r) { return !r.ok; });
+            res.forEach(function (r) {
+              var alvo = linhasTab[r.chave];
+              if (!alvo) return;
+              alvo.textContent = alvo.textContent.split(' · ')[0] +
+                (r.ok ? ' · tabela ok' : ' · NÃO EXISTE no banco');
+            });
+            t.textContent = faltam.length
+              ? faltam.length + ' tabela(s) faltando — rode o supabase/schema-v2.sql'
+              : 'As cinco tabelas respondem';
+          })
           .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
       };
       pD.appendChild(bTeste);
@@ -1216,20 +1496,18 @@
          Conectar depois não recupera sozinho; precisa reenviar.
          ------------------------------------------------------- */
       var bTudo = el('button', { class: 'btn ghost', 'data-focusable': '' });
-      bTudo.innerHTML = '<span>Enviar todo o histórico para o banco</span>';
+      bTudo.innerHTML = '<span>Enviar tudo o que está na TV</span>';
       bTudo.onclick = function () {
         var t = bTudo.querySelector('span');
-        var todos = w.Store.allProgress();
-        var ids = Object.keys(todos);
-        if (!ids.length) { t.textContent = 'Não há histórico para enviar'; return; }
-        t.textContent = 'Enfileirando ' + ids.length + '…';
-        ids.forEach(function (k) { w.Cloud.queue(todos[k]); });
+        var n = w.Cloud.reenviarTudo();
+        if (!n) { t.textContent = 'Não há nada para enviar'; return; }
+        t.textContent = 'Enfileirando ' + n + '…';
         Promise.resolve(w.Cloud.flush())
           .then(function () {
             var faltam = w.Cloud.pending();
             t.textContent = faltam
               ? 'Enviado — ' + faltam + ' ainda na fila'
-              : 'Enviado: ' + ids.length + ' registros';
+              : 'Enviado: ' + n + ' registros nas cinco tabelas';
           })
           .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
       };

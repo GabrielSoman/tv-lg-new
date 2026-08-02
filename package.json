@@ -26,7 +26,8 @@
     "test:telas": "node tools/test-telas.js",
     "test:player": "node tools/test-player.js",
     "mock": "node tools/mock-iptv.js",
-    "sonda:4k": "node tools/sonda-4k.js"
+    "sonda:4k": "node tools/sonda-4k.js",
+    "test:nuvem": "node tools/test-nuvem.js"
   },
   "devDependencies": {
     "@webos-tools/cli": "^3.2.5"

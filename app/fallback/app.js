@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+ac1f3422";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+3f7d4260";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -293,9 +293,28 @@ window.CFG = {
 
 /* ===== store.js ================================================== */
 /* =========================================================
-   Estado persistente pequeno: ajustes, favoritos e progresso.
-   Fica em localStorage (rapido e sincrono). O progresso tambem
-   e espelhado na nuvem por cloud.js.
+   ESTADO PERSISTENTE
+   =========================================================
+   Ajustes, favoritos, progresso, hábito de canal e estado de
+   série. Tudo mora em localStorage — rápido e síncrono, que é
+   o que a interface precisa — e tudo é espelhado na nuvem pelo
+   `cloud.js`, que trabalha em fila e nunca faz a TV esperar.
+
+   Até esta versão só o progresso subia. Os favoritos moravam
+   apenas aqui, e por isso desapareciam na reinstalação — o
+   problema que motivou o projeto inteiro. Agora cada coisa que
+   se grava tem um destino no banco:
+
+     favoritos       → favorites
+     hábito de canal → channel_usage
+     estado de série → series_state
+     preferências    → settings_sync   (uma lista curta, ver SYNC)
+
+   PRIVACIDADE — a regra que vale acima de todas as outras:
+   conteúdo de categoria marcada como adulta NÃO É GRAVADO. Nem
+   local, nem na nuvem, nem como favorito, nem como hábito. Não
+   é "gravar e esconder", não é "apagar depois". Apagar depois
+   deixa rastro; não gravar, não.
    ========================================================= */
 (function (w) {
   'use strict';
@@ -304,7 +323,27 @@ window.CFG = {
   var K_PROGRESS  = 'nebula.progress';
   var K_FAVORITES = 'nebula.favorites';
   var K_CHANNELS  = 'nebula.channels';
+  var K_SERIES    = 'nebula.series';
+  var K_SYNCAT    = 'nebula.syncat';    /* quando cada ajuste mudou */
   var MAX_PROGRESS = 300;
+
+  /* -----------------------------------------------------------
+     Quais preferências valem uma viagem ao banco
+     -----------------------------------------------------------
+     Não é tudo. Credenciais da lista NÃO entram aqui — se um dia
+     a chave anon vazar, o que se achar no banco tem de ser
+     inofensivo. Só o que é preferência de uso, e o que dói
+     reconfigurar à mão depois de uma reinstalação.
+     ----------------------------------------------------------- */
+  var SYNC = [
+    'adulto.ocultar',
+    'adulto.categorias',
+    'adulto.liberadas',
+    'update.auto',
+    'hero.trailer',
+    'hero.som',
+    'player.autoplay'
+  ];
 
   function read(key, fallback) {
     try {
@@ -319,6 +358,7 @@ window.CFG = {
 
   var settings  = read(K_SETTINGS, {});
   var progress  = read(K_PROGRESS, {});
+  var syncAt    = read(K_SYNCAT, {});
 
   /* Limpeza de uma sujeira que a versão anterior deixou: ela
      gravava progresso de canal AO VIVO, que é um número sem
@@ -336,8 +376,23 @@ window.CFG = {
     });
     if (mudou) write(K_PROGRESS, progress);
   }());
+
   var favorites = read(K_FAVORITES, {});
   var channels  = read(K_CHANNELS, {});
+  var series    = read(K_SERIES, {});
+
+  function agora() { return new Date().toISOString(); }
+  function maisNovo(a, b) { return String(a || '') > String(b || ''); }
+
+  /* O corte de privacidade, num lugar só. `Catalog` pode ainda
+     não existir quando isto roda no boot, daí a guarda. */
+  function adulto(item) {
+    return !!(item && w.Catalog && w.Catalog.itemAdulto && w.Catalog.itemAdulto(item));
+  }
+
+  function nuvem() {
+    return (w.Cloud && w.Cloud.enabled && w.Cloud.enabled()) ? w.Cloud : null;
+  }
 
   w.Store = {
 
@@ -353,7 +408,10 @@ window.CFG = {
       return node === undefined ? fallback : node;
     },
 
-    set: function (path, value) {
+    /* `semSync` existe para o caminho de volta: quando o valor
+       ACABOU de chegar do banco, gravá-lo de novo no banco seria
+       um eco. */
+    set: function (path, value, semSync) {
       var parts = path.split('.'), node = settings;
       for (var i = 0; i < parts.length - 1; i++) {
         if (typeof node[parts[i]] !== 'object' || node[parts[i]] === null) node[parts[i]] = {};
@@ -361,52 +419,237 @@ window.CFG = {
       }
       node[parts[parts.length - 1]] = value;
       write(K_SETTINGS, settings);
+
+      if (!semSync && SYNC.indexOf(path) >= 0) {
+        syncAt[path] = agora();
+        write(K_SYNCAT, syncAt);
+        var c = nuvem();
+        if (c) c.gravar('ajustes', path, { chave: path, valor: value, updated_at: syncAt[path] });
+      }
       return value;
+    },
+
+    /* As preferências sincronizáveis, no formato que a nuvem
+       espera. Usado pelo "reenviar tudo". */
+    syncedSettings: function () {
+      var saida = [];
+      SYNC.forEach(function (p) {
+        var v = w.Store.get(p, undefined);
+        if (v === undefined) return;
+        saida.push({ chave: p, valor: v, updated_at: syncAt[p] || agora() });
+      });
+      return saida;
+    },
+
+    /* Só aceita o que veio do banco se for mais recente do que a
+       última mudança feita nesta TV. Sem isso, desligar uma opção
+       aqui e abrir o app amanhã traria a opção ligada de volta. */
+    mergeSettings: function (rows) {
+      var mudou = 0;
+      (rows || []).forEach(function (r) {
+        if (!r || SYNC.indexOf(r.chave) < 0) return;
+        if (!maisNovo(r.updated_at, syncAt[r.chave])) return;
+        w.Store.set(r.chave, r.valor, true);
+        syncAt[r.chave] = r.updated_at;
+        mudou++;
+      });
+      if (mudou) write(K_SYNCAT, syncAt);
+      return mudou;
     },
 
     isConfigured: function () {
       return !!w.Store.get('source.url');
     },
 
-    /* ---------------- Favoritos ---------------- */
+    /* ---------------- Favoritos ----------------
+       Sincronizados desde esta versão. Antes viviam só aqui e
+       morriam na reinstalação. */
     isFavorite: function (id) { return !!favorites[id]; },
 
     toggleFavorite: function (item) {
-      if (favorites[item.id]) delete favorites[item.id];
-      else favorites[item.id] = {
-        id: item.id, kind: item.kind, title: item.title,
-        poster: item.poster || '', at: new Date().toISOString()
+      if (!item || !item.id) return false;
+
+      if (favorites[item.id]) {
+        delete favorites[item.id];
+        write(K_FAVORITES, favorites);
+        var fora = nuvem();
+        if (fora) fora.apagar('favoritos', { id: item.id });
+        return false;
+      }
+
+      /* Não grava o que não pode ser gravado. Devolve falso: a
+         estrela não acende, e é o comportamento pedido. */
+      if (adulto(item)) return false;
+
+      var r = {
+        id: item.id,
+        kind: item.kind || 'movie',
+        title: item.title || '',
+        poster: item.poster || item.backdrop || '',
+        chave: item.chave || '',
+        ordem: 0,
+        at: agora()
       };
+      favorites[item.id] = r;
       write(K_FAVORITES, favorites);
-      return !!favorites[item.id];
+      var c = nuvem();
+      if (c) c.gravar('favoritos', r.id, r);
+      return true;
     },
 
     favorites: function () {
       return Object.keys(favorites).map(function (k) { return favorites[k]; })
-        .sort(function (a, b) { return (b.at || '').localeCompare(a.at || ''); });
+        .sort(function (a, b) {
+          if ((a.ordem || 0) !== (b.ordem || 0)) return (a.ordem || 0) - (b.ordem || 0);
+          return String(b.at || '').localeCompare(String(a.at || ''));
+        });
+    },
+
+    mergeFavorites: function (rows) {
+      var mudou = 0;
+      (rows || []).forEach(function (r) {
+        if (!r || !r.id) return;
+        var meu = favorites[r.id];
+        if (!meu || maisNovo(r.at, meu.at)) { favorites[r.id] = r; mudou++; }
+      });
+      if (mudou) write(K_FAVORITES, favorites);
+      return mudou;
     },
 
     /* ---------------- Hábito de canal ----------------
        Ao vivo não tem "onde parei", mas TEM "o que eu vejo".
-       Guardar aberturas e a hora da última é o que deixa a lista
-       de canais em ordem de uso em vez de ordem alfabética — e é
-       o espelho local da tabela `channel_usage` do schema v2. */
+       Aberturas ordenam a lista; segundos dizem o que você
+       realmente assiste — zapear por cima de um canal não é
+       assistir a ele, e só o contador de cliques não separa uma
+       coisa da outra. */
     touchChannel: function (item) {
-      if (!item || !item.id) return;
-      var r = channels[item.id] || { id: item.id, chave: item.chave || '', aberturas: 0 };
+      if (!item || !item.id || adulto(item)) return;
+      var chave = item.chave || item.id;
+      var r = channels[chave] || { id: chave, chave: chave, aberturas: 0, segundos: 0 };
       r.title = item.title || r.title || '';
-      r.aberturas++;
-      r.at = new Date().toISOString();
-      channels[item.id] = r;
+      r.aberturas = (r.aberturas || 0) + 1;
+      r.at = agora();
+      if (item.qualidade) r.posto = item.qualidade;
+      channels[chave] = r;
       write(K_CHANNELS, channels);
+      var c = nuvem();
+      if (c) c.gravar('canais', chave, r);
+    },
+
+    /* Chamado pelo player enquanto o canal está tocando. Não sobe
+       a cada tique: acumula aqui e manda a cada minuto, senão
+       seriam seis POSTs por minuto de canal aberto para gravar um
+       número que ninguém olha em tempo real. */
+    addChannelSeconds: function (item, segundos, posto) {
+      if (!item || !item.id || !segundos || adulto(item)) return;
+      var chave = item.chave || item.id;
+      var r = channels[chave] || { id: chave, chave: chave, aberturas: 1, segundos: 0 };
+      r.title = r.title || item.title || '';
+      r.segundos = (r.segundos || 0) + segundos;
+      r.at = agora();
+      if (posto) r.posto = posto;
+      channels[chave] = r;
+      write(K_CHANNELS, channels);
+
+      r._desde = r._desde || 0;
+      if (r.segundos - r._desde >= 60) {
+        r._desde = r.segundos;
+        var c = nuvem();
+        if (c) c.gravar('canais', chave, r);
+      }
     },
 
     channelUsage: function (id) { return channels[id] || null; },
 
+    allChannels: function () {
+      return Object.keys(channels).map(function (k) { return channels[k]; });
+    },
+
     recentChannels: function (limit) {
-      return Object.keys(channels).map(function (k) { return channels[k]; })
-        .sort(function (a, b) { return (b.at || '').localeCompare(a.at || ''); })
+      return w.Store.allChannels()
+        .sort(function (a, b) { return String(b.at || '').localeCompare(String(a.at || '')); })
         .slice(0, limit || 30);
+    },
+
+    /* Os canais que você mais vê, por tempo. É a ordenação que a
+       tabela `channel_usage` existe para permitir. */
+    topChannels: function (limit) {
+      return w.Store.allChannels()
+        .filter(function (r) { return (r.segundos || 0) > 0 || (r.aberturas || 0) > 1; })
+        .sort(function (a, b) {
+          var d = (b.segundos || 0) - (a.segundos || 0);
+          return d !== 0 ? d : (b.aberturas || 0) - (a.aberturas || 0);
+        })
+        .slice(0, limit || 20);
+    },
+
+    mergeChannels: function (rows) {
+      var mudou = 0;
+      (rows || []).forEach(function (r) {
+        if (!r || !r.chave) return;
+        var meu = channels[r.chave];
+        if (!meu) { channels[r.chave] = r; mudou++; return; }
+        /* O contador é cumulativo dos dois lados; fica o maior.
+           É o que sobrevive a duas TVs somando em paralelo sem
+           inventar um número menor do que os dois. */
+        var novo = {
+          id: r.chave, chave: r.chave,
+          title: meu.title || r.title,
+          aberturas: Math.max(meu.aberturas || 0, r.aberturas || 0),
+          segundos:  Math.max(meu.segundos || 0, r.segundos || 0),
+          posto: meu.posto || r.posto || '',
+          at: maisNovo(r.at, meu.at) ? r.at : meu.at
+        };
+        if (novo.aberturas !== meu.aberturas || novo.segundos !== meu.segundos ||
+            novo.at !== meu.at) { channels[r.chave] = novo; mudou++; }
+      });
+      if (mudou) write(K_CHANNELS, channels);
+      return mudou;
+    },
+
+    /* ---------------- Estado da série ----------------
+       Responde "em que ponto da série eu estou", que é outra
+       pergunta que "quanto deste episódio eu vi". Sem isto o
+       botão principal do detalhe tem de varrer o histórico
+       inteiro para adivinhar. */
+    seriesState: function (seriesId) { return series[String(seriesId)] || null; },
+
+    allSeries: function () {
+      return Object.keys(series).map(function (k) { return series[k]; });
+    },
+
+    setSeriesState: function (r) {
+      if (!r || !r.series_id) return null;
+      var id = String(r.series_id);
+      var atual = series[id] || {};
+      var novo = {
+        series_id: id,
+        series_title: r.series_title || atual.series_title || '',
+        poster: r.poster || atual.poster || '',
+        ultimo_ep_id: r.ultimo_ep_id || atual.ultimo_ep_id || '',
+        temporada: r.temporada || atual.temporada || 0,
+        episodio: r.episodio || atual.episodio || 0,
+        concluida: r.concluida === undefined ? !!atual.concluida : !!r.concluida,
+        updated_at: agora()
+      };
+      series[id] = novo;
+      write(K_SERIES, series);
+      var c = nuvem();
+      if (c) c.gravar('series', id, novo);
+      return novo;
+    },
+
+    mergeSeries: function (rows) {
+      var mudou = 0;
+      (rows || []).forEach(function (r) {
+        if (!r || !r.series_id) return;
+        var meu = series[r.series_id];
+        if (!meu || maisNovo(r.updated_at, meu.updated_at)) {
+          series[r.series_id] = r; mudou++;
+        }
+      });
+      if (mudou) write(K_SERIES, series);
+      return mudou;
     },
 
     /* ---------------- Progresso ---------------- */
@@ -414,13 +657,12 @@ window.CFG = {
 
     allProgress: function () { return progress; },
 
-    /* Substitui todo o mapa (usado ao trazer o historico da nuvem). */
     mergeProgress: function (records) {
       var changed = 0;
       (records || []).forEach(function (r) {
         if (!r || !r.id) return;
         var mine = progress[r.id];
-        if (!mine || (r.updated_at || '') > (mine.updated_at || '')) {
+        if (!mine || maisNovo(r.updated_at, mine.updated_at)) {
           progress[r.id] = r;
           changed++;
         }
@@ -430,7 +672,11 @@ window.CFG = {
     },
 
     saveProgress: function (rec) {
-      rec.updated_at = new Date().toISOString();
+      if (!rec || !rec.id) return null;
+      if (rec.kind === 'live') return null;      /* canal não tem posição */
+      if (adulto(rec)) return null;
+
+      rec.updated_at = agora();
       if (rec.duration > 0) {
         rec.completed = (rec.position / rec.duration) >= w.CFG.COMPLETED_RATIO;
       }
@@ -438,6 +684,20 @@ window.CFG = {
       w.Store._trim();
       write(K_PROGRESS, progress);
       if (w.Cloud) w.Cloud.queue(rec);
+
+      /* Um episódio salvo é também o ponto em que a série está.
+         Fazer isto aqui, e não no player, garante que vale para
+         qualquer caminho que grave progresso. */
+      if (rec.kind === 'episode' && rec.series_id) {
+        w.Store.setSeriesState({
+          series_id: rec.series_id,
+          series_title: rec.series_title || '',
+          poster: rec.poster || '',
+          ultimo_ep_id: rec.id,
+          temporada: rec.season || 0,
+          episodio: rec.episode || 0
+        });
+      }
       return rec;
     },
 
@@ -445,6 +705,28 @@ window.CFG = {
       delete progress[id];
       write(K_PROGRESS, progress);
       if (w.Cloud) w.Cloud.remove(id);
+    },
+
+    /* Marcar à mão, nos dois sentidos. Toda detecção automática
+       erra, e sem estas duas ações a pessoa fica presa ao erro. */
+    marcarAssistido: function (item, sim) {
+      if (!item || !item.id || adulto(item)) return null;
+      var r = progress[item.id] || {
+        id: item.id, kind: item.kind || 'movie', title: item.title || '',
+        subtitle: item.subtitle || '', poster: item.poster || '',
+        position: 0, duration: 0,
+        series_id: item.seriesId || item.series_id || '',
+        series_title: item.seriesTitle || item.series_title || '',
+        season: item.temporada || item.season || 0,
+        episode: item.episodio || item.episode || 0
+      };
+      r.completed = sim !== false;
+      r.position = r.completed ? (r.duration || r.position || 1) : 0;
+      r.updated_at = agora();
+      progress[r.id] = r;
+      write(K_PROGRESS, progress);
+      if (w.Cloud) w.Cloud.queue(r);
+      return r;
     },
 
     /* Lista "Continuar assistindo": nao concluidos, mais recentes primeiro. */
@@ -469,8 +751,14 @@ window.CFG = {
         .slice(0, limit || w.CFG.HISTORY_LIMIT);
     },
 
-    /* Ultimo episodio visto de uma serie, para sugerir o proximo. */
+    /* Ultimo episodio visto de uma serie, para sugerir o proximo.
+       O estado da série responde isso direto agora; a varredura
+       fica como rede de segurança para o histórico antigo, de
+       antes de a tabela existir. */
     lastEpisodeOf: function (seriesId) {
+      var st = series[String(seriesId)];
+      if (st && st.ultimo_ep_id && progress[st.ultimo_ep_id]) return progress[st.ultimo_ep_id];
+
       var best = null;
       Object.keys(progress).forEach(function (k) {
         var r = progress[k];
@@ -489,13 +777,18 @@ window.CFG = {
       }).slice(MAX_PROGRESS).forEach(function (k) { delete progress[k]; });
     },
 
-    /* Apaga tudo (usado no botao "recomeçar do zero" nos ajustes). */
+    /* Apaga tudo (usado no botao "recomeçar do zero" nos ajustes).
+       Só na TV: o banco continua com o que tem, e é de lá que dá
+       para trazer de volta. */
     wipe: function () {
-      settings = {}; progress = {}; favorites = {};
+      settings = {}; progress = {}; favorites = {}; channels = {}; series = {}; syncAt = {};
       try {
         localStorage.removeItem(K_SETTINGS);
         localStorage.removeItem(K_PROGRESS);
         localStorage.removeItem(K_FAVORITES);
+        localStorage.removeItem(K_CHANNELS);
+        localStorage.removeItem(K_SERIES);
+        localStorage.removeItem(K_SYNCAT);
       } catch (e) {}
       if (w.IDB) w.IDB.clear();
     }
@@ -506,19 +799,52 @@ window.CFG = {
 
 /* ===== cloud.js ================================================== */
 /* =========================================================
-   Sincronizacao com o Supabase (opcional).
-   Regra de ouro: a TV nunca espera a nuvem. Tudo e gravado
-   primeiro em localStorage; a nuvem recebe depois, em fila,
-   e tenta de novo sozinha se a rede falhar.
+   SINCRONIZAÇÃO COM O SUPABASE
+   =========================================================
+   Regra de ouro, a mesma de sempre: a TV nunca espera a nuvem.
+   Tudo é gravado primeiro em localStorage; a nuvem recebe
+   depois, em fila, e tenta de novo sozinha se a rede falhar.
+
+   O que mudou nesta versão: eram cinco tabelas no banco e uma
+   só chegava a ser usada. `favorites`, `channel_usage`,
+   `series_state` e `settings_sync` existiam no `schema-v2.sql`
+   e nenhuma linha de código escrevia nelas — ou seja, a lista
+   que você montava continuava morrendo na reinstalação, que é
+   exatamente o problema que o banco existia para resolver.
+
+   Agora o motor é genérico: uma fila por tabela, um POST por
+   tabela no flush, um GET por tabela no pull. Acrescentar a
+   sexta tabela um dia é acrescentar uma linha em `TABELAS`.
+
+   PRIVACIDADE: nada de conteúdo adulto passa por aqui. O corte
+   é na origem, no `store.js` e no `player.js` — o que não é
+   gravado não precisa ser filtrado depois.
    ========================================================= */
 (function (w) {
   'use strict';
 
   var K_QUEUE = 'nebula.cloudq';
-  var TABLE   = 'watch_progress';
   var flushTimer = null;
   var flushing = false;
   var lastError = null;
+  var erroDe = {};          /* último erro por tabela */
+
+  /* -----------------------------------------------------------
+     As tabelas
+     -----------------------------------------------------------
+     `conflito` é a lista de colunas do índice único que o
+     PostgREST usa para transformar o POST num upsert. Tem de
+     bater com a chave primária declarada no schema — se não
+     bater, o Supabase responde 42P10 e a fila nunca esvazia.
+     ----------------------------------------------------------- */
+  var TABELAS = {
+    progresso: { nome: 'watch_progress', conflito: 'id',                rotulo: 'Progresso' },
+    favoritos: { nome: 'favorites',      conflito: 'profile,id',        rotulo: 'Favoritos' },
+    canais:    { nome: 'channel_usage',  conflito: 'profile,chave',     rotulo: 'Canais'    },
+    series:    { nome: 'series_state',   conflito: 'profile,series_id', rotulo: 'Séries'    },
+    ajustes:   { nome: 'settings_sync',  conflito: 'profile,chave',     rotulo: 'Ajustes'   }
+  };
+  var CHAVES = Object.keys(TABELAS);
 
   function cfg() {
     var url = w.Store.get('cloud.url', '');
@@ -539,141 +865,388 @@ window.CFG = {
     return h;
   }
 
-  function toRow(r) {
-    return {
-      id:            r.id,
-      profile:       profile(),
-      kind:          r.kind || 'movie',
-      title:         r.title || '',
-      subtitle:      r.subtitle || null,
-      poster:        r.poster || null,
-      stream_url:    r.stream_url || null,
-      position_sec:  Math.round(r.position || 0),
-      duration_sec:  r.duration ? Math.round(r.duration) : null,
-      completed:     !!r.completed,
-      series_id:     r.series_id ? String(r.series_id) : null,
-      series_title:  r.series_title || null,
-      season:        r.season || null,
-      episode:       r.episode || null,
-      updated_at:    r.updated_at || new Date().toISOString()
-    };
-  }
+  function agora() { return new Date().toISOString(); }
 
-  function fromRow(row) {
-    return {
-      id: row.id, kind: row.kind, title: row.title,
-      subtitle: row.subtitle || '', poster: row.poster || '',
-      stream_url: row.stream_url || '',
-      position: Number(row.position_sec) || 0,
-      duration: row.duration_sec ? Number(row.duration_sec) : 0,
-      completed: !!row.completed,
-      series_id: row.series_id || '', series_title: row.series_title || '',
-      season: row.season || 0, episode: row.episode || 0,
-      updated_at: row.updated_at
-    };
-  }
-
+  /* -----------------------------------------------------------
+     A fila
+     -----------------------------------------------------------
+     Formato: { tabela: { chaveDaLinha: linha } }. A versão
+     anterior guardava `{ id: linha }` direto, só de progresso —
+     a migração abaixo recolhe aquilo para dentro de `progresso`
+     em vez de descartar, senão o que estivesse na fila no
+     momento da atualização se perderia em silêncio.
+     ----------------------------------------------------------- */
   function loadQueue() {
-    try { return JSON.parse(localStorage.getItem(K_QUEUE) || '{}'); }
-    catch (e) { return {}; }
+    var q;
+    try { q = JSON.parse(localStorage.getItem(K_QUEUE) || '{}'); }
+    catch (e) { q = {}; }
+    if (!q || typeof q !== 'object') q = {};
+
+    var precisaMigrar = false;
+    Object.keys(q).forEach(function (k) {
+      if (CHAVES.indexOf(k) < 0) precisaMigrar = true;
+    });
+    if (precisaMigrar) {
+      var antigo = q;
+      q = { progresso: {} };
+      Object.keys(antigo).forEach(function (k) {
+        var linha = antigo[k];
+        if (linha && typeof linha === 'object' && linha.id) q.progresso[linha.id] = linha;
+      });
+      saveQueue(q);
+    }
+    CHAVES.forEach(function (k) { if (!q[k]) q[k] = {}; });
+    return q;
   }
+
   function saveQueue(q) {
     try { localStorage.setItem(K_QUEUE, JSON.stringify(q)); } catch (e) {}
   }
 
+  function agendar(ms) {
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(function () { w.Cloud.flush(); }, ms);
+  }
+
+  /* -----------------------------------------------------------
+     Tradução: formato da TV → formato do banco
+     ----------------------------------------------------------- */
+  var linhaDe = {
+
+    progresso: function (r) {
+      return {
+        id:            r.id,
+        profile:       profile(),
+        kind:          r.kind || 'movie',
+        title:         r.title || '',
+        subtitle:      r.subtitle || null,
+        poster:        r.poster || null,
+        stream_url:    r.stream_url || null,
+        position_sec:  Math.round(r.position || 0),
+        duration_sec:  r.duration ? Math.round(r.duration) : null,
+        completed:     !!r.completed,
+        series_id:     r.series_id ? String(r.series_id) : null,
+        series_title:  r.series_title || null,
+        season:        r.season || null,
+        episode:       r.episode || null,
+        updated_at:    r.updated_at || agora()
+      };
+    },
+
+    favoritos: function (r) {
+      return {
+        profile:    profile(),
+        id:         r.id,
+        kind:       r.kind || 'movie',
+        title:      r.title || '',
+        poster:     r.poster || null,
+        chave:      r.chave || null,
+        ordem:      r.ordem || 0,
+        created_at: r.at || r.created_at || agora()
+      };
+    },
+
+    canais: function (r) {
+      return {
+        profile:      profile(),
+        chave:        r.chave || r.id,
+        title:        r.title || '',
+        aberturas:    Math.round(r.aberturas || 0),
+        segundos:     Math.round(r.segundos || 0),
+        ultima_em:    r.at || r.ultima_em || agora(),
+        ultimo_posto: r.posto || r.ultimo_posto || null
+      };
+    },
+
+    series: function (r) {
+      return {
+        profile:      profile(),
+        series_id:    String(r.series_id || r.seriesId),
+        series_title: r.series_title || r.title || '',
+        poster:       r.poster || null,
+        ultimo_ep_id: r.ultimo_ep_id || null,
+        temporada:    r.temporada || null,
+        episodio:     r.episodio || null,
+        concluida:    !!r.concluida,
+        updated_at:   r.updated_at || agora()
+      };
+    },
+
+    ajustes: function (r) {
+      return {
+        profile:    profile(),
+        chave:      r.chave,
+        valor:      r.valor === undefined ? null : r.valor,
+        updated_at: r.updated_at || agora()
+      };
+    }
+  };
+
+  /* Tradução: formato do banco → o que o `store.js` entende. */
+  var vindoDe = {
+
+    progresso: function (row) {
+      return {
+        id: row.id, kind: row.kind, title: row.title,
+        subtitle: row.subtitle || '', poster: row.poster || '',
+        stream_url: row.stream_url || '',
+        position: Number(row.position_sec) || 0,
+        duration: row.duration_sec ? Number(row.duration_sec) : 0,
+        completed: !!row.completed,
+        series_id: row.series_id || '', series_title: row.series_title || '',
+        season: row.season || 0, episode: row.episode || 0,
+        updated_at: row.updated_at
+      };
+    },
+
+    favoritos: function (row) {
+      return {
+        id: row.id, kind: row.kind, title: row.title || '',
+        poster: row.poster || '', chave: row.chave || '',
+        ordem: row.ordem || 0, at: row.created_at
+      };
+    },
+
+    canais: function (row) {
+      return {
+        id: row.chave, chave: row.chave, title: row.title || '',
+        aberturas: Number(row.aberturas) || 0,
+        segundos: Number(row.segundos) || 0,
+        posto: row.ultimo_posto || '',
+        at: row.ultima_em
+      };
+    },
+
+    series: function (row) {
+      return {
+        series_id: String(row.series_id),
+        series_title: row.series_title || '',
+        poster: row.poster || '',
+        ultimo_ep_id: row.ultimo_ep_id || '',
+        temporada: row.temporada || 0,
+        episodio: row.episodio || 0,
+        concluida: !!row.concluida,
+        updated_at: row.updated_at
+      };
+    },
+
+    ajustes: function (row) {
+      return { chave: row.chave, valor: row.valor, updated_at: row.updated_at };
+    }
+  };
+
+  /* Para onde cada tabela deságua ao voltar do banco. */
+  var funde = {
+    progresso: function (rs) { return w.Store.mergeProgress(rs); },
+    favoritos: function (rs) { return w.Store.mergeFavorites(rs); },
+    canais:    function (rs) { return w.Store.mergeChannels(rs); },
+    series:    function (rs) { return w.Store.mergeSeries(rs); },
+    ajustes:   function (rs) { return w.Store.mergeSettings(rs); }
+  };
+
+  /* Quantas linhas trazer de cada tabela, e por qual coluna
+     ordenar. Progresso é o que mais cresce; ajustes cabem numa
+     mão. */
+  var LIMITE = { progresso: 400, favoritos: 500, canais: 400, series: 300, ajustes: 60 };
+  var ORDEM  = {
+    progresso: 'updated_at.desc', favoritos: 'created_at.desc',
+    canais: 'ultima_em.desc', series: 'updated_at.desc', ajustes: 'updated_at.desc'
+  };
+
+  function endpoint(chave) { return cfg().url + '/rest/v1/' + TABELAS[chave].nome; }
+  function filtroPerfil()  { return 'profile=eq.' + encodeURIComponent(profile()); }
+
+  /* O carimbo que diz se a linha na fila ainda é a mesma que foi
+     enviada. Cada tabela tem o seu nome para a hora. */
+  function carimbo(linha) {
+    return String(linha.updated_at || linha.ultima_em || linha.created_at || '');
+  }
+
+  function primeiraColuna(chave) {
+    if (chave === 'progresso' || chave === 'favoritos') return 'id';
+    if (chave === 'series') return 'series_id';
+    return 'chave';
+  }
+
   w.Cloud = {
 
-    enabled: function () { return !!cfg(); },
+    tabelas: TABELAS,
+    chaves: CHAVES,
+
+    enabled:   function () { return !!cfg(); },
     lastError: function () { return lastError; },
-    pending: function () { return Object.keys(loadQueue()).length; },
+    errorDe:   function (chave) { return erroDe[chave] || null; },
 
-    /* Traz o historico da nuvem e funde com o que ja existe na TV. */
-    pull: function () {
-      var c = cfg();
-      if (!c) return Promise.resolve(0);
-      var url = c.url + '/rest/v1/' + TABLE +
-                '?select=*&profile=eq.' + encodeURIComponent(profile()) +
-                '&order=updated_at.desc&limit=400';
-      return w.fetchJSON(url, { headers: headers(), raw: true })
-        .then(function (rows) {
-          lastError = null;
-          if (!rows || !rows.length) return 0;
-          return w.Store.mergeProgress(rows.map(fromRow));
-        })
-        .catch(function (e) {
-          lastError = e.message;
-          return 0;
-        });
-    },
-
-    /* Testa credenciais e a existencia da tabela. */
-    test: function () {
-      var c = cfg();
-      if (!c) return Promise.reject(new Error('Preencha a URL e a chave do Supabase.'));
-      return w.fetchJSON(c.url + '/rest/v1/' + TABLE + '?select=id&limit=1',
-                         { headers: headers(), raw: true })
-        .then(function () { lastError = null; return true; });
-    },
-
-    /* Enfileira uma gravacao. Nunca lanca erro. */
-    queue: function (rec) {
-      if (!cfg()) return;
+    /* Total na fila, ou o total de uma tabela só. */
+    pending: function (chave) {
       var q = loadQueue();
-      q[rec.id] = toRow(rec);
-      saveQueue(q);
-      clearTimeout(flushTimer);
-      flushTimer = setTimeout(w.Cloud.flush, 1200);
+      if (chave) return Object.keys(q[chave] || {}).length;
+      return CHAVES.reduce(function (n, k) {
+        return n + Object.keys(q[k] || {}).length;
+      }, 0);
     },
 
-    remove: function (id) {
-      var c = cfg();
-      if (!c) return;
+    /* -------------------------------------------------------
+       Escrita
+       -------------------------------------------------------
+       `gravar` é o caminho novo e genérico. `queue` e `remove`
+       continuam existindo com a assinatura antiga porque é
+       assim que o resto do app chama — e porque uma versão já
+       instalada na TV pode estar no meio de um flush quando a
+       atualização chegar.
+       ------------------------------------------------------- */
+    gravar: function (chave, id, dados) {
+      if (!cfg() || !TABELAS[chave] || !dados) return;
       var q = loadQueue();
-      delete q[id];
+      q[chave][String(id)] = linhaDe[chave](dados);
       saveQueue(q);
-      w.fetchText(c.url + '/rest/v1/' + TABLE +
-                  '?id=eq.' + encodeURIComponent(id) +
-                  '&profile=eq.' + encodeURIComponent(profile()),
+      agendar(1200);
+    },
+
+    queue: function (rec) { w.Cloud.gravar('progresso', rec.id, rec); },
+
+    /* Apaga uma linha. `filtro` é um mapa coluna→valor; o perfil
+       entra sozinho, porque nenhuma tabela aqui é global. */
+    apagar: function (chave, filtro) {
+      var c = cfg();
+      if (!c || !TABELAS[chave]) return;
+
+      var q = loadQueue();
+      var idLocal = filtro && (filtro.id || filtro.chave || filtro.series_id);
+      if (idLocal) delete q[chave][String(idLocal)];
+      saveQueue(q);
+
+      var qs = [filtroPerfil()];
+      Object.keys(filtro || {}).forEach(function (col) {
+        qs.push(col + '=eq.' + encodeURIComponent(filtro[col]));
+      });
+      w.fetchText(endpoint(chave) + '?' + qs.join('&'),
                   { method: 'DELETE', raw: true,
                     headers: headers({ 'Prefer': 'return=minimal' }) })
        .catch(function () {});
     },
 
-    /* Envia a fila inteira num unico POST (upsert). */
+    remove: function (id) { w.Cloud.apagar('progresso', { id: id }); },
+
+    /* -------------------------------------------------------
+       Envio
+       -------------------------------------------------------
+       Um POST por tabela que tem fila. Cada tabela falha por si:
+       se uma delas recusar, o resto continua subindo em vez de
+       a fila inteira travar por causa de uma só.
+       ------------------------------------------------------- */
     flush: function () {
       var c = cfg();
       if (!c || flushing) return Promise.resolve(false);
+
       var q = loadQueue();
-      var rows = Object.keys(q).map(function (k) { return q[k]; });
-      if (!rows.length) return Promise.resolve(true);
+      var pendentes = CHAVES.filter(function (k) { return Object.keys(q[k]).length > 0; });
+      if (!pendentes.length) return Promise.resolve(true);
 
       flushing = true;
-      return w.fetchText(c.url + '/rest/v1/' + TABLE + '?on_conflict=id',
-        {
-          method: 'POST', raw: true,
-          headers: headers({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-          body: JSON.stringify(rows)
-        })
-        .then(function () {
-          lastError = null;
-          /* Remove da fila apenas o que foi enviado; algo pode ter entrado
-             na fila enquanto a requisicao estava no ar. */
-          var now = loadQueue();
-          rows.forEach(function (r) {
-            if (now[r.id] && now[r.id].updated_at === r.updated_at) delete now[r.id];
+      var algumFalhou = false;
+
+      return Promise.all(pendentes.map(function (k) {
+        var linhas = Object.keys(q[k]).map(function (id) { return q[k][id]; });
+        return w.fetchText(endpoint(k) + '?on_conflict=' + TABELAS[k].conflito,
+          {
+            method: 'POST', raw: true,
+            headers: headers({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+            body: JSON.stringify(linhas)
+          })
+          .then(function () {
+            erroDe[k] = null;
+            /* Tira da fila só o que subiu: algo pode ter entrado
+               enquanto a requisição estava no ar. */
+            var atual = loadQueue();
+            Object.keys(q[k]).forEach(function (id) {
+              var antes = q[k][id], depois = atual[k][id];
+              if (depois && carimbo(depois) === carimbo(antes)) delete atual[k][id];
+            });
+            saveQueue(atual);
+          })
+          .catch(function (e) {
+            algumFalhou = true;
+            erroDe[k] = e.message;
+            lastError = TABELAS[k].rotulo + ': ' + e.message;
           });
-          saveQueue(now);
-          flushing = false;
-          return true;
-        })
-        .catch(function (e) {
-          lastError = e.message;
-          flushing = false;
-          /* Tenta de novo daqui a 30 segundos. */
-          clearTimeout(flushTimer);
-          flushTimer = setTimeout(w.Cloud.flush, 30000);
-          return false;
-        });
+      })).then(function () {
+        flushing = false;
+        if (algumFalhou) agendar(30000);
+        else lastError = null;
+        return !algumFalhou;
+      });
+    },
+
+    /* -------------------------------------------------------
+       Leitura
+       -------------------------------------------------------
+       Traz as cinco tabelas em paralelo e devolve quantos
+       registros mudaram alguma coisa na TV. Uma tabela que
+       falha vale zero e não derruba as outras.
+       ------------------------------------------------------- */
+    pull: function () {
+      var c = cfg();
+      if (!c) return Promise.resolve(0);
+
+      return Promise.all(CHAVES.map(function (k) {
+        var url = endpoint(k) + '?select=*&' + filtroPerfil() +
+                  '&order=' + ORDEM[k] + '&limit=' + LIMITE[k];
+        return w.fetchJSON(url, { headers: headers(), raw: true })
+          .then(function (rows) {
+            erroDe[k] = null;
+            if (!rows || !rows.length) return 0;
+            return funde[k](rows.map(vindoDe[k])) || 0;
+          })
+          .catch(function (e) {
+            erroDe[k] = e.message;
+            lastError = TABELAS[k].rotulo + ': ' + e.message;
+            return 0;
+          });
+      })).then(function (ns) {
+        return ns.reduce(function (a, b) { return a + b; }, 0);
+      });
+    },
+
+    /* -------------------------------------------------------
+       Conferência
+       -------------------------------------------------------
+       Devolve o estado de cada tabela, uma a uma. É o que os
+       Ajustes mostram: "conectado" sem dizer a QUAL tabela não
+       ajudava ninguém a descobrir o que faltava.
+       ------------------------------------------------------- */
+    test: function () {
+      var c = cfg();
+      if (!c) return Promise.reject(new Error('Preencha a URL e a chave do Supabase.'));
+      return Promise.all(CHAVES.map(function (k) {
+        return w.fetchJSON(endpoint(k) + '?select=' + primeiraColuna(k) + '&limit=1',
+                           { headers: headers(), raw: true })
+          .then(function () {
+            erroDe[k] = null;
+            return { chave: k, rotulo: TABELAS[k].rotulo, ok: true };
+          })
+          .catch(function (e) {
+            erroDe[k] = e.message;
+            return { chave: k, rotulo: TABELAS[k].rotulo, ok: false, erro: e.message };
+          });
+      }));
+    },
+
+    /* Reenfileira tudo o que existe na TV. Serve para o dia em
+       que o banco esteve desligado e a fila nunca chegou a
+       receber nada — conectar depois não recupera sozinho. */
+    reenviarTudo: function () {
+      if (!cfg()) return 0;
+      var n = 0;
+      var prog = w.Store.allProgress();
+      Object.keys(prog).forEach(function (k) { w.Cloud.gravar('progresso', k, prog[k]); n++; });
+      w.Store.favorites().forEach(function (f) { w.Cloud.gravar('favoritos', f.id, f); n++; });
+      w.Store.allChannels().forEach(function (ch) {
+        w.Cloud.gravar('canais', ch.chave || ch.id, ch); n++;
+      });
+      w.Store.allSeries().forEach(function (s) { w.Cloud.gravar('series', s.series_id, s); n++; });
+      w.Store.syncedSettings().forEach(function (s) { w.Cloud.gravar('ajustes', s.chave, s); n++; });
+      return n;
     }
   };
 
@@ -1293,6 +1866,10 @@ window.CFG = {
           ano: String(info.releaseDate || '').slice(0, 4),
           elenco: info.cast || '',
           direcao: info.director || '',
+          /* `get_series_info` devolve o trailer no mesmo campo que
+             `get_series`, e ele estava sendo jogado fora aqui — por
+             isso o destaque de série nunca tinha o que tocar. */
+          trailer: info.youtube_trailer || '',
           temporadas: temporadas
         };
       });
@@ -2719,6 +3296,8 @@ window.CFG = {
     list:     '<path d="M4 7h16M4 12h16M4 17h10"/>',
     layers:   '<path d="m12 4 8 4.5-8 4.5-8-4.5z"/><path d="m4 13 8 4.5 8-4.5"/>',
     audio:    '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="M16 9.5a4 4 0 0 1 0 5"/>',
+    volume:   '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="M16 9.5a4 4 0 0 1 0 5"/><path d="M18.4 7a7.5 7.5 0 0 1 0 10"/>',
+    mute:     '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="m16 10 4 4M20 10l-4 4"/>',
     cc:       '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M10 10.5a2.2 2.2 0 1 0 0 3M16.5 10.5a2.2 2.2 0 1 0 0 3"/>',
     refresh:  '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
     check:    '<path d="m5 12.5 4.5 4.5L19 7"/>',
@@ -3079,11 +3658,28 @@ window.CFG = {
      ----------------------------------------------------------- */
   function cartao(item, forma, extra) {
     forma = forma || 'poster';
+    extra = extra || {};
     var b = doc.createElement('button');
     b.className = 'card card-' + forma;
     b.setAttribute('data-focusable', '');
     b.setAttribute('data-id', item.id);
     b._item = item;
+
+    /* -----------------------------------------------------------
+       Fileira numerada
+       -----------------------------------------------------------
+       O número entra ANTES da capa e vive fora dela: é o desenho
+       do "Top 10" que todo mundo reconhece de longe, e é a única
+       fileira em que a ordem quer dizer alguma coisa.
+
+       O algarismo tem largura fixa no CSS de propósito. A
+       virtualização mede UM cartão para deduzir o passo da
+       fileira; se o "1" fosse mais estreito que o "10", todos os
+       cartões depois do nono ficariam deslocados — e o defeito só
+       apareceria a partir do décimo, que é o pior lugar para um
+       defeito aparecer.
+       ----------------------------------------------------------- */
+    if (extra.rank) b.classList.add('card-rank');
 
     var casca = poster(item.poster || item.backdrop || '', item.title, '');
 
@@ -3134,13 +3730,27 @@ window.CFG = {
     nome.className = 'card-name';
     nome.textContent = item.title || '';
     meta.appendChild(nome);
-    if (extra && extra.nota) {
-      var n = doc.createElement('div');
-      n.className = 'card-note';
-      n.textContent = extra.nota;
-      meta.appendChild(n);
+    if (extra.nota) {
+      var nt = doc.createElement('div');
+      nt.className = 'card-note';
+      nt.textContent = extra.nota;
+      meta.appendChild(nt);
     }
     b.appendChild(meta);
+
+    /* A capa e o nome viram uma coluna só, e o algarismo fica ao
+       lado dela. Sem este embrulho o cartão é um flex de três
+       filhos e o nome vai parar À DIREITA da capa, não embaixo. */
+    if (extra.rank) {
+      var corpo = doc.createElement('div');
+      corpo.appendChild(casca);
+      corpo.appendChild(meta);
+      var num = doc.createElement('span');
+      num.className = 'num';
+      num.textContent = String(extra.rank);
+      b.appendChild(num);
+      b.appendChild(corpo);
+    }
     return b;
   }
 
@@ -3170,7 +3780,8 @@ window.CFG = {
     }
 
     var janela = doc.createElement('div');
-    janela.className = 'janela fileira forma-' + (opts.forma || 'poster');
+    janela.className = 'janela fileira forma-' + (opts.forma || 'poster') +
+                       (opts.numerada ? ' numerada' : '');
     sec.appendChild(janela);
 
     /* O controlador precisa da janela já medida, então a fileira
@@ -3178,7 +3789,10 @@ window.CFG = {
        chama `UI.ligar(sec)`. */
     sec._ligar = function () {
       sec.ctrl = w.Virt.fileira(janela, itens, function (item, i) {
-        var c = cartao(item, opts.forma, { nota: opts.nota ? opts.nota(item, i) : '' });
+        var c = cartao(item, opts.forma, {
+          nota: opts.nota ? opts.nota(item, i) : '',
+          rank: opts.numerada ? (i + 1) : 0
+        });
         if (opts.aoAbrir) c.onclick = function () { opts.aoAbrir(item, i); };
         return c;
       }, opts.gap || 16);
@@ -3286,9 +3900,24 @@ window.CFG = {
 
      Cada tela informa aqui qual é a sua região principal.
      ----------------------------------------------------------- */
+  /* Nem tudo o que uma tela cria morre sozinho quando o nó sai do
+     documento. O trailer da abertura, por exemplo, é um <iframe>
+     do YouTube com um temporizador atrás: remover o nó para o
+     vídeo, mas deixa o temporizador vivo para recriar o iframe
+     numa tela que já não existe. Quem tem o que desligar pendura
+     `_desligar` no próprio nó e isto aqui chama. */
+  function desligarTudo(raiz) {
+    if (!raiz) return;
+    if (raiz._desligar) { try { raiz._desligar(); } catch (e) {} }
+    w.$$('*', raiz).forEach(function (n) {
+      if (n._desligar) { try { n._desligar(); } catch (e) {} }
+    });
+  }
+
   function trocar(elemento, regiaoPrincipal) {
     var palco = w.$('#stage');
     w.Virt.dentroDe(palco).forEach(function (c) { c.destruir(); });
+    desligarTudo(palco.firstChild);
     w.clear(palco);
     palco.appendChild(elemento);
     ligar(elemento);
@@ -3312,6 +3941,7 @@ window.CFG = {
     esqueleto: esqueleto,
     tela: tela,
     ligar: ligar,
+    desligar: desligarTudo,
     trocar: trocar,
     apontarMenu: apontarMenu,
     marcasDe: marcasDe
@@ -3833,7 +4463,21 @@ window.CFG = {
      ----------------------------------------------------------- */
   function comecarASalvar() {
     pararDeSalvar();
-    salvar = setInterval(function () { gravar(false); }, w.CFG.SAVE_EVERY_MS);
+    salvar = setInterval(function () {
+      /* Ao vivo não tem posição para guardar, mas tem TEMPO — e
+         é o tempo, não o número de cliques, que separa "eu vejo
+         este canal" de "passei por ele zapeando". É a coluna
+         `segundos` da tabela `channel_usage`, e sem alguém
+         somando aqui ela ficaria zerada para sempre. */
+      if (aoVivo) {
+        if (!video.paused && w.Store.addChannelSeconds) {
+          w.Store.addChannelSeconds(item, w.CFG.SAVE_EVERY_MS / 1000,
+            degraus[iDegrau] ? degraus[iDegrau].rotulo : '');
+        }
+        return;
+      }
+      gravar(false);
+    }, w.CFG.SAVE_EVERY_MS);
   }
   function pararDeSalvar() { if (salvar) { clearInterval(salvar); salvar = null; } }
 
@@ -4863,6 +5507,15 @@ window.CFG = {
      era, porque dividia espaço com um carrossel que já não
      existe mais.
      ----------------------------------------------------------- */
+  /* A arte certa para uma caixa larga é a DEITADA. O campo se
+     chama `fundo` no catálogo (vem de `backdrop_path`) e este
+     código lia só `backdrop`, que não existe em item nenhum — por
+     isso o hero sempre caía no cartaz em pé esticado, que é a
+     causa real de ele "parecer errado". */
+  function arteLarga(item) {
+    return item.backdrop || item.fundo || item.poster || '';
+  }
+
   function destaque(item, aoTocar, aoDetalhe) {
     var sec = el('div', {
       class: 'hero',
@@ -4870,10 +5523,10 @@ window.CFG = {
       'data-nb-left': 'rail', 'data-nb-down': 'rows', 'data-enter': 'first'
     });
 
-    if (item.backdrop || item.poster) {
+    var arteUrl = arteLarga(item);
+    if (arteUrl) {
       var arte = el('div', { class: 'hero-arte' });
-      arte.style.backgroundImage = 'url("' +
-        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      arte.style.backgroundImage = 'url("' + String(arteUrl).replace(/"/g, '%22') + '")';
       sec.appendChild(arte);
       sec.appendChild(el('div', { class: 'hero-veu' }));
     }
@@ -4897,7 +5550,190 @@ window.CFG = {
     }
     texto.appendChild(botoes);
     sec.appendChild(texto);
+
+    ligarTrailer(sec, item, botoes);
     return sec;
+  }
+
+  /* -----------------------------------------------------------
+     Trailer na abertura
+     -----------------------------------------------------------
+     `youtube_trailer` sempre veio na resposta do painel e nunca
+     foi usado. Agora vira o que o hero mostra depois de alguns
+     segundos de arte parada — mudo, em laço, atrás do degradê.
+
+     Três decisões, todas por causa de como isso falha numa TV:
+
+     · nunca entra de cara. Se a rede está ruim, o primeiro
+       quadro tem de ser uma imagem inteira, não um retângulo
+       preto carregando;
+
+     · se o iframe não subir em 9 segundos, desiste e some. Um
+       trailer que não veio é invisível; um trailer travado é uma
+       mancha preta em cima da abertura;
+
+     · morre junto com a tela. O <iframe> continuaria tocando som
+       — quando você tirasse o mudo — dentro de um nó que já saiu
+       do documento.
+     ----------------------------------------------------------- */
+  var ATRASO_TRAILER = 3200;
+  var LIMITE_TRAILER = 9000;
+
+  /* Aceita o que o painel mandar: id cru, link normal, link
+     curto, /embed/. Provedor nenhum é consistente nisto. */
+  function idYoutube(v) {
+    var s = String(v || '').trim();
+    if (!s) return '';
+    var m = s.match(/[?&]v=([A-Za-z0-9_-]{6,})/) ||
+            s.match(/(?:youtu\.be\/|\/embed\/|\/shorts\/|\/v\/)([A-Za-z0-9_-]{6,})/);
+    if (m) return m[1];
+    if (/^[A-Za-z0-9_-]{6,20}$/.test(s)) return s;
+    return '';
+  }
+
+  function ligarTrailer(sec, item, botoes) {
+    if (!item || item.kind === 'live') return;
+    if (w.Store.get('hero.trailer', true) === false) return;
+
+    var vid = idYoutube(item.trailer);
+    if (!vid) return;
+
+    var mudo = w.Store.get('hero.som', false) !== true;
+    var caixa = null, quadro = null, relogio = null, vigia = null, morto = false;
+
+    function parar() {
+      clearTimeout(relogio); clearTimeout(vigia);
+      if (quadro) { try { quadro.src = 'about:blank'; } catch (e) {} }
+      if (caixa && caixa.parentNode) caixa.parentNode.removeChild(caixa);
+      caixa = null; quadro = null;
+      sec.classList.remove('tocando');
+    }
+
+    /* A API do YouTube por postMessage. Só serve para o som: o
+       resto (laço, sem controles) já vai na própria URL. */
+    function comandar(func) {
+      if (!quadro || !quadro.contentWindow) return;
+      try {
+        quadro.contentWindow.postMessage(
+          JSON.stringify({ event: 'command', func: func, args: [] }), '*');
+      } catch (e) {}
+    }
+
+    function botaoSom() {
+      var b = el('button', { class: 'btn ghost', 'data-focusable': '' });
+      var pinta = function () {
+        b.innerHTML = w.icon(mudo ? 'mute' : 'volume') +
+                      '<span>' + (mudo ? 'Ativar som' : 'Sem som') + '</span>';
+      };
+      pinta();
+      b.onclick = function () {
+        mudo = !mudo;
+        w.Store.set('hero.som', !mudo);
+        comandar(mudo ? 'mute' : 'unMute');
+        pinta();
+      };
+      return b;
+    }
+
+    function comecar() {
+      if (morto) return;
+      caixa = el('div', { class: 'hero-trailer' });
+      quadro = document.createElement('iframe');
+      quadro.setAttribute('frameborder', '0');
+      quadro.setAttribute('allow', 'autoplay; encrypted-media');
+      quadro.setAttribute('tabindex', '-1');
+      quadro.src = 'https://www.youtube.com/embed/' + vid +
+        '?autoplay=1&mute=' + (mudo ? 1 : 0) +
+        '&controls=0&disablekb=1&fs=0&rel=0&modestbranding=1' +
+        '&iv_load_policy=3&playsinline=1&enablejsapi=1' +
+        '&loop=1&playlist=' + vid;
+
+      quadro.onload = function () {
+        if (morto) return;
+        clearTimeout(vigia);
+        caixa.classList.add('on');
+        sec.classList.add('tocando');
+        if (botoes && !botoes.querySelector('.hero-som')) {
+          var b = botaoSom();
+          b.classList.add('hero-som');
+          botoes.appendChild(b);
+        }
+      };
+
+      caixa.appendChild(quadro);
+      /* Antes do véu e do texto: o degradê tem de continuar por
+         cima, senão o título fica ilegível sobre o vídeo. */
+      sec.insertBefore(caixa, sec.firstChild);
+
+      vigia = setTimeout(function () {
+        if (!sec.classList.contains('tocando')) parar();
+      }, LIMITE_TRAILER);
+    }
+
+    relogio = setTimeout(comecar, ATRASO_TRAILER);
+    sec._desligar = function () { morto = true; parar(); };
+  }
+
+  /* O destaque merece uma chamada a mais: o registro de progresso
+     guarda só título e cartaz, e o hero quer a arte deitada, a
+     sinopse e o trailer. É uma requisição, cacheada, e é ela que
+     separa um hero bonito de um cartaz esticado com o nome em
+     cima. */
+  function enriquecerDestaque(item) {
+    if (!item) return Promise.resolve(null);
+    if (item.kind === 'live') return Promise.resolve(item);
+
+    var id = String(item.id || '');
+    var num = id.replace(/^[a-z]+:/, '');
+    var serieId = item.seriesId || item.series_id || (/^series:/.test(id) ? num : '');
+    var busca = serieId
+      ? w.Catalog.serie(serieId)
+      : (/^movie:/.test(id) || item.kind === 'movie')
+        ? w.Catalog.filme(item.streamId || num)
+        : null;
+    if (!busca) return Promise.resolve(item);
+
+    return busca.then(function (info) {
+      if (!info) return item;
+      var c = {};
+      Object.keys(item).forEach(function (k) { c[k] = item[k]; });
+      c.backdrop = item.backdrop || item.fundo || info.fundo || '';
+      c.poster   = item.poster || info.poster || '';
+      c.plot     = item.plot || item.sinopse || info.sinopse || '';
+      c.trailer  = item.trailer || info.trailer || '';
+      return c;
+    }).catch(function () { return item; });
+  }
+
+  /* -----------------------------------------------------------
+     Top 10 novidades
+     -----------------------------------------------------------
+     Um painel Xtream não tem dado de popularidade — não existe
+     "mais assistido" para pedir, e inventar um ranking com número
+     aleatório seria mentira desenhada com capricho. O que ele TEM
+     é a data em que cada coisa entrou no acervo (`added` nos
+     filmes, `last_modified` nas séries). "Chegou agora" é um
+     ranking honesto, e é o que a fileira numerada mostra.
+
+     Sai do material que a abertura já baixou para montar as
+     outras fileiras: nenhuma requisição a mais.
+     ----------------------------------------------------------- */
+  function topNovidades(blocos, quantos) {
+    var todos = [];
+    (blocos || []).forEach(function (b) { todos = todos.concat((b && b.itens) || []); });
+
+    var vistos = {};
+    return todos.filter(function (i) {
+      if (!i || !i.added) return false;
+      if (!naoAdulto(i)) return false;
+      if (!i.poster && !i.fundo) return false;
+      var chave = i.seriesId ? 's:' + i.seriesId : i.id;
+      if (vistos[chave]) return false;
+      vistos[chave] = true;
+      return true;
+    }).sort(function (a, b) {
+      return (b.added || 0) - (a.added || 0);
+    }).slice(0, quantos || 10);
   }
 
   function inicio() {
@@ -4924,12 +5760,13 @@ window.CFG = {
        foi o que apareceu com "Moana". Se o primeiro não tem,
        pega o primeiro que tiver. */
     var comArte = continuar.filter(comCapa)[0];
-    var promessaDestaque = comArte
+    var promessaDestaque = (comArte
       ? Promise.resolve(marcarRetomar(comArte))
       : w.Catalog.categorias('movie')
           .then(function (cs) { return cs.length ? w.Catalog.itens('movie', cs[0].id) : []; })
           .then(function (fs) { return fs.filter(comCapa)[0] || null; })
-          .catch(function () { return null; });
+          .catch(function () { return null; })
+      ).then(enriquecerDestaque);
 
     Promise.all([
       promessaDestaque,
@@ -4954,6 +5791,19 @@ window.CFG = {
         fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
           { forma: 'wide', aoAbrir: tocarDoDestaque }));
       }
+
+      /* A fileira numerada vem logo depois do que está em
+         andamento e antes das pastas: é a única fileira em que a
+         ordem quer dizer alguma coisa, e ela se perde no meio de
+         seis fileiras iguais lá embaixo. */
+      var novidades = topNovidades(filmes.concat(series), 10);
+      if (novidades.length >= 5) {
+        fileiras.appendChild(w.UI.fileira('Top 10 novidades', novidades, {
+          forma: 'poster', numerada: true, aoAbrir: abrir,
+          subtitulo: 'o que chegou por último'
+        }));
+      }
+
       if (canais.length) {
         fileiras.appendChild(w.UI.fileira('Canais ao vivo', porHabito(canais).slice(0, 120),
           { forma: 'logo', aoAbrir: abrir, subtitulo: canais.length + ' canais' }));
@@ -5145,7 +5995,7 @@ window.CFG = {
   function naoAdulto(item) {
     return !(w.Catalog.itemAdulto && w.Catalog.itemAdulto(item));
   }
-  function comCapa(i) { return !!(i.backdrop || i.poster); }
+  function comCapa(i) { return !!(i.backdrop || i.fundo || i.poster); }
   function marcarRetomar(i) {
     var c = {}; Object.keys(i).forEach(function (k) { c[k] = i[k]; });
     c.retomar = true; return c;
@@ -5349,10 +6199,10 @@ window.CFG = {
   /* Cabeçalho comum aos dois detalhes. */
   function cabecalhoDetalhe(item, acoes) {
     var topo = el('div', { class: 'det-topo' });
-    if (item.backdrop || item.poster) {
+    var arteDet = arteLarga(item);
+    if (arteDet) {
       var arte = el('div', { class: 'det-arte' });
-      arte.style.backgroundImage = 'url("' +
-        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      arte.style.backgroundImage = 'url("' + String(arteDet).replace(/"/g, '%22') + '")';
       topo.appendChild(arte);
       topo.appendChild(el('div', { class: 'det-veu' }));
     }
@@ -5586,6 +6436,44 @@ window.CFG = {
     }
     caixa.appendChild(pAtu);
 
+    /* --- abertura --- */
+    var pIni = painel('Tela inicial',
+      'O trailer entra depois de alguns segundos de arte parada, sem som. ' +
+      'Se o vídeo não subir em nove segundos, o app desiste e a arte fica.');
+
+    var trOn = w.Store.get('hero.trailer', true) !== false;
+    var bTr = el('button', { class: 'btn ghost' + (trOn ? ' ativo' : ''), 'data-focusable': '' });
+    var pintaTr = function () {
+      bTr.innerHTML = w.icon(trOn ? 'play' : 'pause') + '<span>' +
+        (trOn ? 'Trailer no destaque: ligado' : 'Trailer no destaque: desligado') + '</span>';
+      bTr.classList.toggle('ativo', trOn);
+    };
+    pintaTr();
+    bTr.onclick = function () {
+      trOn = !trOn;
+      w.Store.set('hero.trailer', trOn);
+      pintaTr();
+      w.toast(trOn ? 'Trailer ligado — vale na próxima abertura.'
+                   : 'Trailer desligado.', 3000);
+    };
+    pIni.appendChild(bTr);
+
+    var somOn = w.Store.get('hero.som', false) === true;
+    var bSom = el('button', { class: 'btn ghost' + (somOn ? ' ativo' : ''), 'data-focusable': '' });
+    var pintaSom = function () {
+      bSom.innerHTML = w.icon(somOn ? 'volume' : 'mute') + '<span>' +
+        (somOn ? 'Trailer com som' : 'Trailer sem som') + '</span>';
+      bSom.classList.toggle('ativo', somOn);
+    };
+    pintaSom();
+    bSom.onclick = function () {
+      somOn = !somOn;
+      w.Store.set('hero.som', somOn);
+      pintaSom();
+    };
+    pIni.appendChild(bSom);
+    caixa.appendChild(pIni);
+
     /* --- conteúdo adulto --- */
     var pAd = painel('Conteúdo adulto',
       'Independentemente desta opção, nada de conteúdo adulto é gravado como ' +
@@ -5612,19 +6500,55 @@ window.CFG = {
        desligado na TV e não havia como saber olhando a tela. */
     pD.appendChild(linha('Banco de dados',
       w.Cloud.enabled() ? 'conectado' : 'desligado (sem credenciais)'));
-    pD.appendChild(linha('Fila para enviar', w.Cloud.pending()));
+
+    /* -------------------------------------------------------
+       Uma linha por tabela
+       -------------------------------------------------------
+       "Conectado" sozinho escondia o problema real: quatro das
+       cinco tabelas nunca recebiam nada, e a tela dizia que
+       estava tudo bem. Agora cada uma responde por si — o que
+       tem na TV, o que está esperando para subir e, depois do
+       teste, se ela existe mesmo lá.
+       ------------------------------------------------------- */
+    var CONTAGEM = {
+      progresso: function () { return Object.keys(w.Store.allProgress()).length; },
+      favoritos: function () { return w.Store.favorites().length; },
+      canais:    function () { return w.Store.allChannels().length; },
+      series:    function () { return w.Store.allSeries().length; },
+      ajustes:   function () { return w.Store.syncedSettings().length; }
+    };
+    var linhasTab = {};
+    (w.Cloud.chaves || []).forEach(function (k) {
+      var fila = w.Cloud.pending(k);
+      var txt = CONTAGEM[k]() + ' na TV' + (fila ? ' · ' + fila + ' na fila' : '');
+      var l = linha(w.Cloud.tabelas[k].rotulo, txt);
+      linhasTab[k] = l.querySelector('.linha-v');
+      pD.appendChild(l);
+    });
+
     if (w.Cloud.lastError && w.Cloud.lastError()) {
       pD.appendChild(linha('Último erro', w.Cloud.lastError()));
     }
 
     if (w.Cloud.enabled()) {
       var bTeste = el('button', { class: 'btn ghost', 'data-focusable': '' });
-      bTeste.innerHTML = '<span>Testar conexão com o banco</span>';
+      bTeste.innerHTML = '<span>Conferir as cinco tabelas</span>';
       bTeste.onclick = function () {
         var t = bTeste.querySelector('span');
-        t.textContent = 'Testando…';
+        t.textContent = 'Conferindo…';
         w.Cloud.test()
-          .then(function () { t.textContent = 'Conexão ok'; })
+          .then(function (res) {
+            var faltam = res.filter(function (r) { return !r.ok; });
+            res.forEach(function (r) {
+              var alvo = linhasTab[r.chave];
+              if (!alvo) return;
+              alvo.textContent = alvo.textContent.split(' · ')[0] +
+                (r.ok ? ' · tabela ok' : ' · NÃO EXISTE no banco');
+            });
+            t.textContent = faltam.length
+              ? faltam.length + ' tabela(s) faltando — rode o supabase/schema-v2.sql'
+              : 'As cinco tabelas respondem';
+          })
           .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
       };
       pD.appendChild(bTeste);
@@ -5639,20 +6563,18 @@ window.CFG = {
          Conectar depois não recupera sozinho; precisa reenviar.
          ------------------------------------------------------- */
       var bTudo = el('button', { class: 'btn ghost', 'data-focusable': '' });
-      bTudo.innerHTML = '<span>Enviar todo o histórico para o banco</span>';
+      bTudo.innerHTML = '<span>Enviar tudo o que está na TV</span>';
       bTudo.onclick = function () {
         var t = bTudo.querySelector('span');
-        var todos = w.Store.allProgress();
-        var ids = Object.keys(todos);
-        if (!ids.length) { t.textContent = 'Não há histórico para enviar'; return; }
-        t.textContent = 'Enfileirando ' + ids.length + '…';
-        ids.forEach(function (k) { w.Cloud.queue(todos[k]); });
+        var n = w.Cloud.reenviarTudo();
+        if (!n) { t.textContent = 'Não há nada para enviar'; return; }
+        t.textContent = 'Enfileirando ' + n + '…';
         Promise.resolve(w.Cloud.flush())
           .then(function () {
             var faltam = w.Cloud.pending();
             t.textContent = faltam
               ? 'Enviado — ' + faltam + ' ainda na fila'
-              : 'Enviado: ' + ids.length + ' registros';
+              : 'Enviado: ' + n + ' registros nas cinco tabelas';
           })
           .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
       };

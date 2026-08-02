@@ -480,6 +480,10 @@
           ano: String(info.releaseDate || '').slice(0, 4),
           elenco: info.cast || '',
           direcao: info.director || '',
+          /* `get_series_info` devolve o trailer no mesmo campo que
+             `get_series`, e ele estava sendo jogado fora aqui — por
+             isso o destaque de série nunca tinha o que tocar. */
+          trailer: info.youtube_trailer || '',
           temporadas: temporadas
         };
       });

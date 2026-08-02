@@ -375,10 +375,18 @@ svg.solid { fill: currentColor; stroke: none; }
    solta com nome genérico.
    ---------------------------------------------------------- */
 
-/* Fileira numerada. Sem stroke de texto animado: cor sólida. */
+/* Fileira numerada. Sem stroke de texto animado: cor sólida.
+
+   O algarismo tem LARGURA FIXA, e isso não é capricho de
+   alinhamento. A virtualização mede um cartão só para deduzir o
+   passo da fileira inteira; com "1" mais estreito que "10", tudo
+   do décimo em diante ficaria deslocado — e um defeito que só
+   começa no décimo item é o tipo que passa por três revisões. */
 .card-rank { display: flex; align-items: flex-start; width: auto; }
 .card-rank .num {
-  flex: 0 0 auto; margin: 7.5rem -1rem 0 0;
+  flex: 0 0 auto;
+  width: 4.4rem; margin: 7.5rem -.9rem 0 0;
+  text-align: right;
   font-size: 6rem; line-height: .8; font-weight: 800; letter-spacing: -.06em;
   color: var(--surface-2);
   transition: color var(--rapido) var(--curva);
@@ -750,6 +758,38 @@ svg.solid { fill: currentColor; stroke: none; }
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
 .hero-btns { display: flex; gap: .8rem; }
+
+/* -----------------------------------------------------------
+   O trailer da abertura
+   -----------------------------------------------------------
+   Um <iframe> do YouTube atrás do degradê, mudo, em laço. Entra
+   depois de alguns segundos de arte parada — nunca de cara: se
+   a TV está fria ou a rede ruim, o que a pessoa vê primeiro tem
+   de ser uma imagem inteira, não um retângulo preto carregando.
+
+   As medidas são em `vw` de propósito. A técnica usual de
+   cobertura usa `aspect-ratio`, que o Chromium da webOS antiga
+   não tem — e o modo de falhar seria o trailer aparecer
+   achatado, que é pior do que não aparecer. Com o viewport
+   travado em 1920, `56.25vw` é exatamente 16:9 e funciona em
+   qualquer versão.
+   ----------------------------------------------------------- */
+.hero-trailer {
+  position: absolute; inset: 0; overflow: hidden;
+  opacity: 0; transition: opacity .5s var(--curva);
+  pointer-events: none;
+}
+.hero-trailer.on { opacity: 1; }
+.hero-trailer iframe {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 100vw; height: 56.25vw;
+  border: 0; pointer-events: none;
+}
+/* Enquanto o trailer toca, a arte parada sai de baixo dele. Duas
+   imagens somadas com opacidade davam um cinza lavado. */
+.hero-arte { transition: opacity .5s var(--curva); }
+.hero.tocando .hero-arte { opacity: 0; }
 
 /* =========================================================
    Detalhe
