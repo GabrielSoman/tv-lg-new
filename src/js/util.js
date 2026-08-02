@@ -139,8 +139,19 @@
       xhr.onload = function () {
         if (done) return;
         done = true; clearTimeout(timer);
-        if (xhr.status >= 200 && xhr.status < 400) resolve(xhr.responseText);
-        else reject(new Error('O servidor respondeu ' + xhr.status + '.'));
+        if (xhr.status >= 200 && xhr.status < 400) { resolve(xhr.responseText); return; }
+        /* O código e o corpo viajam junto com o erro.
+           -----------------------------------------------------
+           "O servidor respondeu 400." não diz nada a quem está
+           olhando a tela, e a diferença entre 4xx e 5xx é o que
+           decide se vale a pena tentar de novo: 4xx é uma recusa
+           definitiva, 5xx é um tropeço. Sem essa distinção, uma
+           linha que o banco NUNCA vai aceitar fica sendo
+           reenviada para sempre. */
+        var err = new Error('O servidor respondeu ' + xhr.status + '.');
+        err.status = xhr.status;
+        err.corpo = String(xhr.responseText || '').slice(0, 300);
+        reject(err);
       };
       xhr.onerror = function () {
         if (done) return;

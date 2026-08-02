@@ -199,6 +199,118 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
   ok('todas receberam escrita', tabelasEscritas(),
      ['channel_usage', 'favorites', 'series_state', 'settings_sync', 'watch_progress']);
 
+  console.log('\n6-A) Uma linha impossível não pode travar a tabela inteira');
+
+  /* Este é o defeito medido no banco de verdade do Gabriel:
+     `watch_progress` VAZIO enquanto `favorites` e `channel_usage`
+     enchiam normalmente.
+
+     A causa: a versão antiga gravava progresso de canal ao vivo,
+     o `schema-v2.sql` proibiu isso com um `check`, e a linha
+     velha ficou presa na FILA — que ninguém limpava. O PostgREST
+     é tudo-ou-nada: a linha impossível derrubava o POST do lote
+     inteiro, a cada 30 segundos, para sempre e em silêncio. */
+  await page.unroute('**/rest/v1/**');
+  let recusaPorLive = 0;
+  await page.route('**/rest/v1/**', async (route) => {
+    const req = route.request();
+    const tabela = new URL(req.url()).pathname.split('/rest/v1/')[1].split('?')[0];
+    if (req.method() === 'GET') {
+      return route.fulfill({ status: 200, contentType: 'application/json',
+                             headers: { 'Access-Control-Allow-Origin': '*' }, body: '[]' });
+    }
+    let corpo = null;
+    try { corpo = JSON.parse(req.postData() || 'null'); } catch (e) { corpo = null; }
+    /* Imita a restrição do schema: qualquer lote que contenha uma
+       linha `kind:'live'` é recusado INTEIRO, com 400. */
+    if (tabela === 'watch_progress' && (corpo || []).some((r) => r.title === 'Impossível')) {
+      recusaPorLive++;
+      return route.fulfill({
+        status: 400, contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({ code: '23514',
+          message: 'new row for relation "watch_progress" violates check constraint "watch_progress_sem_ao_vivo"' })
+      });
+    }
+    registrar(tabela, req.method(), corpo);
+    return route.fulfill({ status: 200, contentType: 'application/json',
+                           headers: { 'Access-Control-Allow-Origin': '*' }, body: '' });
+  });
+
+  /* Planta o veneno do jeito que ele existe de verdade: direto na
+     fila em localStorage, como uma versão antiga teria deixado. */
+  await page.evaluate(() => {
+    const q = JSON.parse(localStorage.getItem('nebula.cloudq') || '{}');
+    q.progresso = q.progresso || {};
+    q.progresso['live:999'] = {
+      id: 'live:999', profile: 'teste', kind: 'live', title: 'Canal velho',
+      position_sec: 0, duration_sec: null, completed: false,
+      updated_at: '2026-01-01T00:00:00Z'
+    };
+    localStorage.setItem('nebula.cloudq', JSON.stringify(q));
+  });
+
+  ok('a faxina da fila remove o progresso de canal ao vivo',
+     await page.evaluate(() => { Cloud.pending(); return Cloud.pending('progresso'); }), 0);
+
+  /* Agora o caso geral, que é o que importa: uma linha que o
+     banco recusa NO MEIO de um lote bom. O veneno pode ser outro
+     amanhã — o que não pode é bloquear as demais. */
+  escritas.watch_progress = [];
+  await page.evaluate(() => {
+    const q = JSON.parse(localStorage.getItem('nebula.cloudq') || '{}');
+    q.progresso = q.progresso || {};
+    for (let i = 0; i < 6; i++) {
+      q.progresso['movie:' + (500 + i)] = {
+        id: 'movie:' + (500 + i), profile: 'teste', kind: 'movie',
+        title: 'Filme ' + i, position_sec: 10, duration_sec: 100, completed: false,
+        updated_at: '2026-02-0' + (i + 1) + 'T00:00:00Z'
+      };
+    }
+    /* A linha impossível é um filme comum aos olhos da faxina: o
+       que o banco recusa aqui é OUTRA coisa. É o caso geral — o
+       veneno de amanhã não vai ser `kind='live'`, e o app tem de
+       aguentar qualquer recusa sem travar a tabela. */
+    q.progresso['movie:666'] = {
+      id: 'movie:666', profile: 'teste', kind: 'movie', title: 'Impossível',
+      position_sec: 0, duration_sec: null, completed: false,
+      updated_at: '2026-02-09T00:00:00Z'
+    };
+    localStorage.setItem('nebula.cloudq', JSON.stringify(q));
+  });
+
+  await page.evaluate(() => Cloud.flush());
+  await espera(1200);
+
+  const subiram = (escritas.watch_progress || [])
+    .flatMap((e) => (e.corpo || []).map((r) => r.id));
+  ok('as seis linhas boas sobem mesmo com a ruim no lote',
+     [500, 501, 502, 503, 504, 505].every((n) => subiram.indexOf('movie:' + n) >= 0), true);
+  ok('a fila esvazia em vez de ficar travada',
+     await page.evaluate(() => Cloud.pending('progresso')), 0);
+  ok('e a recusa é registrada, com o motivo do banco', await page.evaluate(() => {
+    const r = (Cloud.recusados() || {}).progresso || [];
+    return r.length === 1 && /check constraint/.test(r[0].motivo) && r[0].chave === 'movie:666';
+  }), true);
+  console.log(`         o mock recusou ${recusaPorLive} lote(s) antes de a linha ficar sozinha`);
+
+  /* Uma falha 5xx é tropeço, não recusa: a fila TEM de continuar. */
+  ok('mas um erro 500 não descarta nada — a fila espera', await (async () => {
+    await page.unroute('**/rest/v1/**');
+    await page.route('**/rest/v1/**', (r) =>
+      r.request().method() === 'GET'
+        ? r.fulfill({ status: 200, contentType: 'application/json',
+                      headers: { 'Access-Control-Allow-Origin': '*' }, body: '[]' })
+        : r.fulfill({ status: 500, body: 'servidor caiu' }));
+    await page.evaluate(() => {
+      Store.saveProgress({ id: 'movie:900', kind: 'movie', title: 'Espera',
+                           position: 50, duration: 500 });
+      return Cloud.flush();
+    });
+    await espera(900);
+    return page.evaluate(() => Cloud.pending('progresso') > 0);
+  })(), true);
+
   console.log('\n6-B) O BANCO manda: o que some de lá some da TV');
 
   /* Até aqui o Supabase de mentira devolvia `[]` em todo GET, e a

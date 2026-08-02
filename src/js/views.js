@@ -1770,6 +1770,12 @@
       'favoritos nem retomada.');
     pD.appendChild(linha('Blocos em memória', w.Catalog.emMemoria()));
 
+    var alvo = w.Cloud.alvo && w.Cloud.alvo();
+    if (alvo) {
+      pD.appendChild(linha('Endereço', alvo.url));
+      pD.appendChild(linha('Perfil', alvo.perfil));
+    }
+
     var lida = w.Cloud.ultimaLeitura && w.Cloud.ultimaLeitura();
     pD.appendChild(linha('Última leitura do banco',
       lida ? new Date(lida).toLocaleTimeString('pt-BR') : 'ainda não'));
@@ -1795,13 +1801,31 @@
       series:    function () { return w.Store.allSeries().length; },
       ajustes:   function () { return w.Store.syncedSettings().length; }
     };
+    var rel = (w.Cloud.relatorio && w.Cloud.relatorio()) || {};
     var linhasTab = {};
     (w.Cloud.chaves || []).forEach(function (k) {
       var fila = w.Cloud.pending(k);
-      var txt = CONTAGEM[k]() + ' na TV' + (fila ? ' · ' + fila + ' na fila' : '');
+      var r = rel[k];
+      var txt = CONTAGEM[k]() + ' na TV';
+      if (fila) txt += ' · ' + fila + ' na fila';
+      /* O resultado da ÚLTIMA leitura, sem precisar apertar nada.
+         Uma falha aqui era invisível — o app parecia simplesmente
+         não conversar com o banco. */
+      if (r && r.erro) txt += ' · LEITURA FALHOU: ' + r.erro;
+      else if (r) txt += ' · ' + r.linhas + ' no banco';
+      else txt += ' · ainda não lida';
       var l = linha(w.Cloud.tabelas[k].rotulo, txt);
       linhasTab[k] = l.querySelector('.linha-v');
       pD.appendChild(l);
+
+      /* Descartar dado nunca é silencioso. Se o banco recusou uma
+         linha de vez, ela sai da fila para não travar as outras —
+         e o motivo aparece aqui. */
+      var rec = ((w.Cloud.recusados && w.Cloud.recusados()) || {})[k] || [];
+      if (rec.length) {
+        pD.appendChild(linha('  ↳ recusadas pelo banco',
+          rec.length + ' · ' + rec[0].chave + ' — ' + rec[0].motivo));
+      }
     });
 
     if (w.Cloud.lastError && w.Cloud.lastError()) {

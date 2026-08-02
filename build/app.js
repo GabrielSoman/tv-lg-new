@@ -175,8 +175,19 @@ window.CFG = {
       xhr.onload = function () {
         if (done) return;
         done = true; clearTimeout(timer);
-        if (xhr.status >= 200 && xhr.status < 400) resolve(xhr.responseText);
-        else reject(new Error('O servidor respondeu ' + xhr.status + '.'));
+        if (xhr.status >= 200 && xhr.status < 400) { resolve(xhr.responseText); return; }
+        /* O código e o corpo viajam junto com o erro.
+           -----------------------------------------------------
+           "O servidor respondeu 400." não diz nada a quem está
+           olhando a tela, e a diferença entre 4xx e 5xx é o que
+           decide se vale a pena tentar de novo: 4xx é uma recusa
+           definitiva, 5xx é um tropeço. Sem essa distinção, uma
+           linha que o banco NUNCA vai aceitar fica sendo
+           reenviada para sempre. */
+        var err = new Error('O servidor respondeu ' + xhr.status + '.');
+        err.status = xhr.status;
+        err.corpo = String(xhr.responseText || '').slice(0, 300);
+        reject(err);
       };
       xhr.onerror = function () {
         if (done) return;
@@ -974,6 +985,30 @@ window.CFG = {
       saveQueue(q);
     }
     CHAVES.forEach(function (k) { if (!q[k]) q[k] = {}; });
+
+    /* -----------------------------------------------------------
+       Faxina na fila: o veneno que travou tudo
+       -----------------------------------------------------------
+       A versão antiga gravava progresso de canal AO VIVO. O
+       `store.js` limpa isso do mapa local no boot, e o
+       `schema-v2.sql` limpa do banco — mas ninguém limpava da
+       FILA. E o banco tem uma restrição que recusa `kind='live'`.
+
+       O efeito, medido no banco de verdade: `watch_progress`
+       vazio, `favorites` e `channel_usage` cheios. Uma linha
+       impossível ficava na fila, o POST do lote inteiro voltava
+       400, e o progresso NUNCA subia — desde sempre, em silêncio,
+       tentando de novo a cada 30 segundos.
+       ----------------------------------------------------------- */
+    var sujo = false;
+    Object.keys(q.progresso).forEach(function (id) {
+      var r = q.progresso[id];
+      if (r && (r.kind === 'live' || /^(live|canal):/.test(id))) {
+        delete q.progresso[id]; sujo = true;
+      }
+    });
+    if (sujo) saveQueue(q);
+
     return q;
   }
 
@@ -1157,10 +1192,144 @@ window.CFG = {
     return String(linha.updated_at || linha.ultima_em || linha.created_at || '');
   }
 
+  function chaveLocal(k, linha) {
+    if (k === 'progresso' || k === 'favoritos') return String(linha.id);
+    if (k === 'series') return String(linha.series_id);
+    return String(linha.chave);
+  }
+
+  function detalhe(e) {
+    var m = (e && e.message) || String(e || '');
+    if (e && e.corpo) {
+      var extra = e.corpo;
+      try { var j = JSON.parse(e.corpo); if (j && j.message) extra = j.message; } catch (x) {}
+      m += ' ' + extra;
+    }
+    return m;
+  }
+
+  /* -----------------------------------------------------------
+     Enviar um lote sem deixar UMA linha travar a tabela
+     -----------------------------------------------------------
+     O flush manda a fila inteira num POST só, e o PostgREST é
+     tudo-ou-nada: uma linha que viola uma restrição derruba o
+     lote inteiro. Se essa linha for impossível de aceitar — e
+     havia uma, com `kind='live'`, proibida por `check` no schema
+     — o lote falha para sempre, a cada 30 segundos, em silêncio.
+     Foi por isso que `watch_progress` ficou vazio no banco
+     enquanto as outras tabelas enchiam.
+
+     A saída é distinguir recusa de tropeço:
+
+       · 5xx ou rede: tropeço. Sobe o erro, a fila fica, tenta
+         de novo mais tarde — comportamento de sempre;
+
+       · 4xx: recusa definitiva. Divide o lote em dois e tenta
+         cada metade. Em log₂(n) rodadas a linha culpada fica
+         sozinha, é DESCARTADA da fila e anotada no relatório.
+         O resto sobe.
+
+     Descartar dado é grave, então nada disso é silencioso: o que
+     foi recusado aparece nos Ajustes com o motivo que o banco
+     deu.
+     ----------------------------------------------------------- */
+  var enviados = {};      /* por tabela: chaves que subiram nesta rodada */
+  var recusados = {};     /* por tabela: [{ chave, motivo }] */
+
+  function permanente(e) {
+    return !!(e && e.status >= 400 && e.status < 500);
+  }
+
+  function postar(k, linhas) {
+    return w.fetchText(endpoint(k) + '?on_conflict=' + TABELAS[k].conflito, {
+      method: 'POST', raw: true,
+      headers: headers({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify(linhas)
+    });
+  }
+
+  function enviarLote(k, linhas) {
+    if (!linhas.length) return Promise.resolve();
+    return postar(k, linhas).then(function () {
+      linhas.forEach(function (l) { enviados[k][chaveLocal(k, l)] = true; });
+    }).catch(function (e) {
+      if (!permanente(e)) throw e;
+
+      if (linhas.length === 1) {
+        var chave = chaveLocal(k, linhas[0]);
+        recusados[k].push({ chave: chave, motivo: detalhe(e) });
+        enviados[k][chave] = true;          /* sai da fila: nunca vai ser aceita */
+        if (w.CFG && w.CFG.DEV && w.console) {
+          console.warn('[nuvem] ' + TABELAS[k].rotulo + ' RECUSOU ' + chave + ': ' + detalhe(e));
+        }
+        return;
+      }
+      var meio = Math.ceil(linhas.length / 2);
+      return enviarLote(k, linhas.slice(0, meio))
+        .then(function () { return enviarLote(k, linhas.slice(meio)); });
+    });
+  }
+
+  /* Tira da fila o que subiu — e só o que subiu, com o mesmo
+     carimbo: algo pode ter entrado enquanto a requisição estava
+     no ar. `apenas` limita à lista de chaves confirmadas. */
+  function tirarDaFila(k, enviadas, apenas) {
+    var atual = loadQueue();
+    Object.keys(enviadas).forEach(function (id) {
+      if (apenas && !apenas[id]) return;
+      var antes = enviadas[id], depois = atual[k][id];
+      if (depois && carimbo(depois) === carimbo(antes)) delete atual[k][id];
+    });
+    saveQueue(atual);
+  }
+
   function primeiraColuna(chave) {
     if (chave === 'progresso' || chave === 'favoritos') return 'id';
     if (chave === 'series') return 'series_id';
     return 'chave';
+  }
+
+  /* -----------------------------------------------------------
+     Falhar em voz alta
+     -----------------------------------------------------------
+     Até agora um `pull` que dava errado era engolido: o erro ia
+     para uma variável que ninguém lia e a tela seguia como se o
+     banco não existisse. Do lado de fora isso é indistinguível
+     de "o app não fala com o banco" — que foi exatamente a
+     conclusão a que você chegou, e era a conclusão correta a
+     partir do que dava para ver.
+
+     Agora cada leitura deixa registro: no console em modo de
+     desenvolvimento, num relatório que os Ajustes mostram, e num
+     aviso na tela na primeira vez que falha.
+     ----------------------------------------------------------- */
+  var relatorio = {};
+  var jaAvisou = false;
+
+  function registrar(chave, dados) {
+    dados.quando = agora();
+    relatorio[chave] = dados;
+    if (w.CFG && w.CFG.DEV && w.console) {
+      var t = TABELAS[chave].rotulo;
+      if (dados.erro) console.warn('[nuvem] ' + t + ' FALHOU: ' + dados.erro);
+      else console.info('[nuvem] ' + t + ': ' + dados.linhas + ' linha(s) no banco, ' +
+                        dados.mudou + ' mudança(s) na TV');
+    }
+  }
+
+  function avisarSeFalhou() {
+    var ruins = CHAVES.filter(function (k) { return relatorio[k] && relatorio[k].erro; });
+    if (!ruins.length) { jaAvisou = false; return; }
+    if (jaAvisou) return;
+    jaAvisou = true;
+    /* Com atraso: no boot este aviso competia com o "Tudo de
+       volta" da reconexão e perdia. Um aviso que aparece e é
+       apagado meio segundo depois não avisou nada. */
+    setTimeout(function () {
+      if (!w.toast) return;
+      w.toast('Não consegui ler o banco (' + TABELAS[ruins[0]].rotulo + '): ' +
+              relatorio[ruins[0]].erro + '. O app segue sem sincronizar.', 8000);
+    }, 2500);
   }
 
   w.Cloud = {
@@ -1240,30 +1409,22 @@ window.CFG = {
 
       flushing = true;
       var algumFalhou = false;
+      pendentes.forEach(function (k) { enviados[k] = {}; recusados[k] = []; });
 
       return Promise.all(pendentes.map(function (k) {
         var linhas = Object.keys(q[k]).map(function (id) { return q[k][id]; });
-        return w.fetchText(endpoint(k) + '?on_conflict=' + TABELAS[k].conflito,
-          {
-            method: 'POST', raw: true,
-            headers: headers({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-            body: JSON.stringify(linhas)
-          })
+        return enviarLote(k, linhas)
           .then(function () {
             erroDe[k] = null;
-            /* Tira da fila só o que subiu: algo pode ter entrado
-               enquanto a requisição estava no ar. */
-            var atual = loadQueue();
-            Object.keys(q[k]).forEach(function (id) {
-              var antes = q[k][id], depois = atual[k][id];
-              if (depois && carimbo(depois) === carimbo(antes)) delete atual[k][id];
-            });
-            saveQueue(atual);
+            tirarDaFila(k, q[k]);
           })
           .catch(function (e) {
             algumFalhou = true;
-            erroDe[k] = e.message;
-            lastError = TABELAS[k].rotulo + ': ' + e.message;
+            /* Sobe o que subiu antes de a falha aparecer: numa
+               divisão de lote, metade pode ter passado. */
+            tirarDaFila(k, q[k], enviados[k]);
+            erroDe[k] = detalhe(e);
+            lastError = TABELAS[k].rotulo + ': ' + erroDe[k];
           });
       })).then(function () {
         flushing = false;
@@ -1283,6 +1444,22 @@ window.CFG = {
     /* Quando a última leitura do banco deu certo. */
     ultimaLeitura: function () { return ultimaLeitura; },
 
+    /* O que aconteceu na última leitura, tabela por tabela. É o
+       que os Ajustes mostram sem precisar de botão. */
+    relatorio: function () { return relatorio; },
+
+    /* Linhas que o banco recusou de vez e foram descartadas da
+       fila. Descartar dado nunca pode ser silencioso. */
+    recusados: function () { return recusados; },
+
+    /* O endereço exato que está sendo chamado, para conferir a
+       olho quando algo não bate. */
+    alvo: function () {
+      var c = cfg();
+      if (!c) return null;
+      return { url: c.url + '/rest/v1/', perfil: profile() };
+    },
+
     pull: function () {
       var c = cfg();
       if (!c) return Promise.resolve(0);
@@ -1298,22 +1475,38 @@ window.CFG = {
                   '&order=' + ORDEM[k] + '&limit=' + LIMITE[k];
         return w.fetchJSON(url, { headers: headers(), raw: true })
           .then(function (rows) {
+            /* Corpo vazio NÃO é tabela vazia.
+               -------------------------------------------------
+               O PostgREST responde `[]` quando não há linhas. Um
+               corpo em branco é outra coisa — proxy, redirecção,
+               resposta cortada — e `fetchJSON` devolve null para
+               isso. Tratar null como "não há nada no banco"
+               apagaria o histórico inteiro por causa de uma
+               resposta malformada. É o erro mais caro que este
+               arquivo poderia cometer, então ele é explícito. */
+            if (!Array.isArray(rows)) {
+              throw new Error('resposta vazia ou fora do formato');
+            }
             erroDe[k] = null;
             ultimaLeitura = agora();
-            /* Uma tabela vazia é uma resposta legítima e precisa
-               ser aplicada: "não há nada aqui" é diferente de
-               "não consegui ler". Só o `catch` abaixo significa
-               a segunda coisa, e é o único caso em que a TV
-               mantém o que tinha. */
-            var lista = (rows || []).map(vindoDe[k]);
-            return funde[k](lista, Object.keys(fila[k] || {})) || 0;
+            /* Daqui em diante, `[]` é uma resposta legítima e é
+               aplicada: "não há nada aqui" é diferente de "não
+               consegui ler". Só o `catch` significa a segunda
+               coisa, e é o único caso em que a TV mantém o que
+               tinha. */
+            var lista = rows.map(vindoDe[k]);
+            var n = funde[k](lista, Object.keys(fila[k] || {})) || 0;
+            registrar(k, { linhas: rows.length, mudou: n });
+            return n;
           })
           .catch(function (e) {
             erroDe[k] = e.message;
             lastError = TABELAS[k].rotulo + ': ' + e.message;
+            registrar(k, { erro: e.message });
             return 0;
           });
       })).then(function (ns) {
+        avisarSeFalhou();
         return ns.reduce(function (a, b) { return a + b; }, 0);
       });
     },
@@ -7046,6 +7239,12 @@ window.CFG = {
       'favoritos nem retomada.');
     pD.appendChild(linha('Blocos em memória', w.Catalog.emMemoria()));
 
+    var alvo = w.Cloud.alvo && w.Cloud.alvo();
+    if (alvo) {
+      pD.appendChild(linha('Endereço', alvo.url));
+      pD.appendChild(linha('Perfil', alvo.perfil));
+    }
+
     var lida = w.Cloud.ultimaLeitura && w.Cloud.ultimaLeitura();
     pD.appendChild(linha('Última leitura do banco',
       lida ? new Date(lida).toLocaleTimeString('pt-BR') : 'ainda não'));
@@ -7071,13 +7270,31 @@ window.CFG = {
       series:    function () { return w.Store.allSeries().length; },
       ajustes:   function () { return w.Store.syncedSettings().length; }
     };
+    var rel = (w.Cloud.relatorio && w.Cloud.relatorio()) || {};
     var linhasTab = {};
     (w.Cloud.chaves || []).forEach(function (k) {
       var fila = w.Cloud.pending(k);
-      var txt = CONTAGEM[k]() + ' na TV' + (fila ? ' · ' + fila + ' na fila' : '');
+      var r = rel[k];
+      var txt = CONTAGEM[k]() + ' na TV';
+      if (fila) txt += ' · ' + fila + ' na fila';
+      /* O resultado da ÚLTIMA leitura, sem precisar apertar nada.
+         Uma falha aqui era invisível — o app parecia simplesmente
+         não conversar com o banco. */
+      if (r && r.erro) txt += ' · LEITURA FALHOU: ' + r.erro;
+      else if (r) txt += ' · ' + r.linhas + ' no banco';
+      else txt += ' · ainda não lida';
       var l = linha(w.Cloud.tabelas[k].rotulo, txt);
       linhasTab[k] = l.querySelector('.linha-v');
       pD.appendChild(l);
+
+      /* Descartar dado nunca é silencioso. Se o banco recusou uma
+         linha de vez, ela sai da fila para não travar as outras —
+         e o motivo aparece aqui. */
+      var rec = ((w.Cloud.recusados && w.Cloud.recusados()) || {})[k] || [];
+      if (rec.length) {
+        pD.appendChild(linha('  ↳ recusadas pelo banco',
+          rec.length + ' · ' + rec[0].chave + ' — ' + rec[0].motivo));
+      }
     });
 
     if (w.Cloud.lastError && w.Cloud.lastError()) {
