@@ -554,9 +554,13 @@
   }
 
   function destaque(item, aoTocar, aoDetalhe) {
+    /* `data-topo`: subir para o destaque traz ele INTEIRO, não o
+       tanto que faz o botão caber. Ver o comentário da rolagem no
+       nav.js — sem isto, voltar de uma fileira de baixo deixava a
+       arte cortada na metade. */
     var sec = el('div', {
       class: 'hero',
-      'data-region': 'hero', 'data-axis': 'x',
+      'data-region': 'hero', 'data-axis': 'x', 'data-topo': '',
       'data-nb-left': 'rail', 'data-nb-down': 'rows', 'data-enter': 'first'
     });
 
@@ -648,6 +652,10 @@
 
     function parar() {
       clearTimeout(relogio); clearTimeout(vigia);
+      /* Zerar as alças, e não só cancelar: `armar()` usa `relogio`
+         para saber se já há uma contagem em curso, e um número
+         velho ali faria o trailer nunca mais voltar. */
+      relogio = null; vigia = null;
       if (quadro) { try { quadro.src = 'about:blank'; } catch (e) {} }
       if (caixa && caixa.parentNode) caixa.parentNode.removeChild(caixa);
       caixa = null; quadro = null;
@@ -719,6 +727,29 @@
       }, LIMITE_TRAILER);
     }
 
+    /* -----------------------------------------------------------
+       O trailer só toca enquanto o destaque está em cena
+       -----------------------------------------------------------
+       Descer para as fileiras de baixo tira o destaque da tela, e
+       um vídeo tocando fora de vista é o pior dos dois mundos: não
+       se vê e continua gastando rede, decodificador e som. Pior
+       ainda quando o destaque troca junto com o foco — vira uma
+       sucessão de trailers de meio segundo.
+
+       Então o trailer é armado e desarmado de fora, por quem sabe
+       onde está o foco. Desarmar volta para a arte parada; armar
+       recomeça a contagem do atraso, e não o vídeo do zero no
+       mesmo instante — quem só passa de raspão não dispara nada.
+       ----------------------------------------------------------- */
+    sec._trailer = {
+      armar: function () {
+        if (morto || caixa || relogio) return;
+        relogio = setTimeout(comecar, ATRASO_TRAILER);
+      },
+      parar: function () { parar(); },
+      tocando: function () { return !!caixa; }
+    };
+
     relogio = setTimeout(comecar, ATRASO_TRAILER);
     sec._desligar = function () { morto = true; parar(); };
   }
@@ -754,10 +785,32 @@
     return s ? 's:' + s : String(item.id || '');
   }
 
+  /* O destaque está em cena? Ele fica no topo da coluna, então a
+     resposta é: o foco está nele, ou na fileira logo abaixo dele.
+     Dali para baixo o destaque já saiu da tela. */
+  function destaqueEmCena(elemento) {
+    if (!heroVivo || !elemento) return false;
+    if (heroVivo.no && heroVivo.no.contains(elemento)) return true;
+    return !!(heroVivo.fileira && heroVivo.fileira.contains(elemento));
+  }
+
   function aoFocarCartao(elemento) {
     clearTimeout(esperaHero);
     if (!heroVivo) return;
-    if (!document.body.contains(heroVivo.no)) { heroVivo = null; return; }
+    if (!heroVivo.no || !document.body.contains(heroVivo.no)) { heroVivo = null; return; }
+
+    /* O menu lateral não conta. Ele não rola a tela — o destaque
+       continua inteiro ali atrás — e cortar o trailer a cada
+       passada pelo menu, com os três segundos de espera de novo
+       na volta, seria pior do que deixar tocando. */
+    if (elemento && elemento.closest && elemento.closest('#rail')) return;
+
+    /* Liga e desliga o trailer conforme o destaque entra e sai de
+       cena, para qualquer foco dentro do palco. */
+    var perto = destaqueEmCena(elemento);
+    var tr = heroVivo.no._trailer;
+    if (tr) { if (perto) tr.armar(); else tr.parar(); }
+
     if (!elemento || !elemento._item) return;
     if (!heroVivo.fileira || !heroVivo.fileira.contains(elemento)) return;
 

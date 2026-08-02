@@ -2428,6 +2428,10 @@ window.CFG = {
 
   var atual = null;
   var escopo = null;
+  /* Levantada pela virada de página e consumida pelo `mover` logo
+     em seguida — é o único jeito de a rolagem saber que aquele
+     movimento não foi um passo, foi um salto. */
+  var virouPagina = false;
   var ouvintes = [];
   var pendente = null;
   var quadro = null;
@@ -2536,9 +2540,11 @@ window.CFG = {
         var j = i + (dir === 'right' ? passo : -passo);
         if (dir === 'right') {
           if (i >= lista.length - 1) return null;
+          virouPagina = true;
           return lista[Math.min(j, lista.length - 1)];
         }
         if (i <= 0) return null;
+        virouPagina = true;
         return lista[Math.max(j, 0)];
       }
       return null;
@@ -2736,7 +2742,17 @@ window.CFG = {
     };
   }
 
-  function garanteVisivel(el) {
+  /* `aoTopo` muda a régua: em vez de rolar o mínimo para o item
+     caber, rola o suficiente para ele ENCABEÇAR a janela.
+
+     A rolagem mínima é o certo para andar de um em um — mexer a
+     tela mais do que o necessário a cada tecla embrulha. Mas
+     numa virada de página ela produz exatamente o contrário do
+     que se espera: a pasta escolhida aparece na última linha,
+     com a página anterior inteira acima dela, e parece que o
+     salto não aconteceu. Quem vira a página quer o novo começo
+     no alto. */
+  function garanteVisivel(el, aoTopo) {
     trilhos(el).forEach(function (t) {
       var janela = t.parentElement;
       if (!janela) return;
@@ -2754,10 +2770,31 @@ window.CFG = {
         off.x = Math.max(0, Math.min(maxX, x));
       }
       if (eixo === 'y' || eixo === 'xy') {
-        var t1 = pos.y, t2 = pos.y + el.offsetHeight;
+        /* -----------------------------------------------------
+           Blocos que não podem aparecer pela metade
+           -----------------------------------------------------
+           O destaque da abertura é alto e os botões dele ficam
+           lá embaixo, encostados na borda de baixo. Com a
+           rolagem mínima, voltar para ele de uma fileira de
+           baixo trazia só o pedaço necessário para o BOTÃO
+           caber — e a arte ficava cortada no meio do caminho,
+           que é exatamente como não se olha para um destaque.
+
+           `data-topo` diz "quando o foco entrar aqui, este
+           bloco encabeça a tela", e a conta passa a ser sobre o
+           bloco inteiro, não sobre o item focado dentro dele.
+           ----------------------------------------------------- */
+        var ancora = el, forcaTopo = aoTopo;
+        if (el.closest) {
+          var bloco = el.closest('[data-topo]');
+          if (bloco && t.contains(bloco)) { ancora = bloco; forcaTopo = true; }
+        }
+        var t1 = (ancora === el) ? pos.y : posicaoEm(ancora, t).y;
+        var t2 = pos.y + el.offsetHeight;
         var maxY = Math.max(0, t.scrollHeight - util.altura);
         var y = off.y;
-        if (t1 - MARGEM.topo < y) y = t1 - MARGEM.topo;
+        if (forcaTopo) y = t1;
+        else if (t1 - MARGEM.topo < y) y = t1 - MARGEM.topo;
         else if (t2 + MARGEM.base > y + util.altura) y = t2 + MARGEM.base - util.altura;
         off.y = Math.max(0, Math.min(maxY, y));
       }
@@ -2784,7 +2821,7 @@ window.CFG = {
       var reg = regiaoDe(el);
       if (reg) reg._ultimoFoco = el;
 
-      if (!(opcoes && opcoes.semRolar)) garanteVisivel(el);
+      if (!(opcoes && opcoes.semRolar)) garanteVisivel(el, !!(opcoes && opcoes.aoTopo));
 
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
         try { el.focus(); } catch (e) {}
@@ -2812,8 +2849,9 @@ window.CFG = {
       var reg = regiaoDe(atual);
       if (!reg) return Nav.focarPrimeiro();
 
+      virouPagina = false;
       var alvo = passoInterno(reg, atual, dir);
-      if (alvo) return Nav.focar(alvo);
+      if (alvo) return Nav.focar(alvo, virouPagina ? { aoTopo: true } : null);
 
       alvo = volta(reg, atual, dir);
       if (alvo) return Nav.focar(alvo);
@@ -5671,9 +5709,13 @@ window.CFG = {
   }
 
   function destaque(item, aoTocar, aoDetalhe) {
+    /* `data-topo`: subir para o destaque traz ele INTEIRO, não o
+       tanto que faz o botão caber. Ver o comentário da rolagem no
+       nav.js — sem isto, voltar de uma fileira de baixo deixava a
+       arte cortada na metade. */
     var sec = el('div', {
       class: 'hero',
-      'data-region': 'hero', 'data-axis': 'x',
+      'data-region': 'hero', 'data-axis': 'x', 'data-topo': '',
       'data-nb-left': 'rail', 'data-nb-down': 'rows', 'data-enter': 'first'
     });
 
@@ -5765,6 +5807,10 @@ window.CFG = {
 
     function parar() {
       clearTimeout(relogio); clearTimeout(vigia);
+      /* Zerar as alças, e não só cancelar: `armar()` usa `relogio`
+         para saber se já há uma contagem em curso, e um número
+         velho ali faria o trailer nunca mais voltar. */
+      relogio = null; vigia = null;
       if (quadro) { try { quadro.src = 'about:blank'; } catch (e) {} }
       if (caixa && caixa.parentNode) caixa.parentNode.removeChild(caixa);
       caixa = null; quadro = null;
@@ -5836,6 +5882,29 @@ window.CFG = {
       }, LIMITE_TRAILER);
     }
 
+    /* -----------------------------------------------------------
+       O trailer só toca enquanto o destaque está em cena
+       -----------------------------------------------------------
+       Descer para as fileiras de baixo tira o destaque da tela, e
+       um vídeo tocando fora de vista é o pior dos dois mundos: não
+       se vê e continua gastando rede, decodificador e som. Pior
+       ainda quando o destaque troca junto com o foco — vira uma
+       sucessão de trailers de meio segundo.
+
+       Então o trailer é armado e desarmado de fora, por quem sabe
+       onde está o foco. Desarmar volta para a arte parada; armar
+       recomeça a contagem do atraso, e não o vídeo do zero no
+       mesmo instante — quem só passa de raspão não dispara nada.
+       ----------------------------------------------------------- */
+    sec._trailer = {
+      armar: function () {
+        if (morto || caixa || relogio) return;
+        relogio = setTimeout(comecar, ATRASO_TRAILER);
+      },
+      parar: function () { parar(); },
+      tocando: function () { return !!caixa; }
+    };
+
     relogio = setTimeout(comecar, ATRASO_TRAILER);
     sec._desligar = function () { morto = true; parar(); };
   }
@@ -5871,10 +5940,32 @@ window.CFG = {
     return s ? 's:' + s : String(item.id || '');
   }
 
+  /* O destaque está em cena? Ele fica no topo da coluna, então a
+     resposta é: o foco está nele, ou na fileira logo abaixo dele.
+     Dali para baixo o destaque já saiu da tela. */
+  function destaqueEmCena(elemento) {
+    if (!heroVivo || !elemento) return false;
+    if (heroVivo.no && heroVivo.no.contains(elemento)) return true;
+    return !!(heroVivo.fileira && heroVivo.fileira.contains(elemento));
+  }
+
   function aoFocarCartao(elemento) {
     clearTimeout(esperaHero);
     if (!heroVivo) return;
-    if (!document.body.contains(heroVivo.no)) { heroVivo = null; return; }
+    if (!heroVivo.no || !document.body.contains(heroVivo.no)) { heroVivo = null; return; }
+
+    /* O menu lateral não conta. Ele não rola a tela — o destaque
+       continua inteiro ali atrás — e cortar o trailer a cada
+       passada pelo menu, com os três segundos de espera de novo
+       na volta, seria pior do que deixar tocando. */
+    if (elemento && elemento.closest && elemento.closest('#rail')) return;
+
+    /* Liga e desliga o trailer conforme o destaque entra e sai de
+       cena, para qualquer foco dentro do palco. */
+    var perto = destaqueEmCena(elemento);
+    var tr = heroVivo.no._trailer;
+    if (tr) { if (perto) tr.armar(); else tr.parar(); }
+
     if (!elemento || !elemento._item) return;
     if (!heroVivo.fileira || !heroVivo.fileira.contains(elemento)) return;
 

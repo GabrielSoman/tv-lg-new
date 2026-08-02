@@ -320,6 +320,67 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
     return document.querySelector('.hero-titulo').textContent === antes;
   }), true);
 
+  console.log('\n9-C) Voltar para o destaque traz ele INTEIRO');
+
+  /* Desce até uma fileira lá embaixo e volta subindo. Com a
+     rolagem mínima, o destaque voltava cortado: só o pedaço que
+     fazia o BOTÃO dele caber na tela. */
+  const voltaAoTopo = await page.evaluate(async () => {
+    const espera = (m) => new Promise((r) => setTimeout(r, m));
+    Nav.entrar('rows');
+    for (let i = 0; i < 12; i++) { Nav.mover('down'); await espera(30); }
+    const desceu = Number(document.querySelector('.screen.home .trilho')
+      .getAttribute('data-off-y') || 0);
+    for (let i = 0; i < 12; i++) { Nav.mover('up'); await espera(30); }
+    const hero = document.querySelector('.hero');
+    const t = document.querySelector('.screen.home .trilho');
+    return {
+      desceu: desceu,
+      voltou: Number(t.getAttribute('data-off-y') || 0),
+      noHero: !!(Nav.atual() && Nav.atual().closest('.hero')),
+      alturaHero: hero ? hero.offsetHeight : 0
+    };
+  });
+  ok('a tela realmente rolou para baixo', voltaAoTopo.desceu > 200, true);
+  ok('subir de volta chega ao destaque', voltaAoTopo.noHero, true);
+  ok('e a coluna volta ao topo — destaque inteiro, não pela metade',
+     voltaAoTopo.voltou, 0);
+  console.log(`         desceu ${voltaAoTopo.desceu}px, voltou para ${voltaAoTopo.voltou}px`);
+
+  console.log('\n9-D) O trailer para quando o destaque sai de cena');
+  await page.evaluate(() => { Nav.entrar('hero'); });
+  const tocandoNoTopo = await ate(() => !!document.querySelector('.hero-trailer iframe'), null, 12000);
+  ok('com o destaque em cena, o trailer toca', tocandoNoTopo, true);
+
+  ok('descer para outra fileira devolve a arte parada', await (async () => {
+    await page.evaluate(async () => {
+      const espera = (m) => new Promise((r) => setTimeout(r, m));
+      Nav.entrar('rows');
+      for (let i = 0; i < 6; i++) { Nav.mover('down'); await espera(30); }
+    });
+    await espera(500);
+    return page.evaluate(() => ({
+      semIframe: !document.querySelector('.hero-trailer'),
+      comArte: !!document.querySelector('.hero-arte'),
+      semClasse: !document.querySelector('.hero').classList.contains('tocando')
+    }));
+  })(), { semIframe: true, comArte: true, semClasse: true });
+
+  /* E não volta a tocar enquanto está lá embaixo — era o
+     "tocando freneticamente". */
+  ok('e não ressuscita sozinho enquanto você está longe', await (async () => {
+    await espera(5000);
+    return page.evaluate(() => !document.querySelector('.hero-trailer'));
+  })(), true);
+
+  ok('voltar ao destaque religa o trailer', await (async () => {
+    await page.evaluate(async () => {
+      const espera = (m) => new Promise((r) => setTimeout(r, m));
+      for (let i = 0; i < 12; i++) { Nav.mover('up'); await espera(30); }
+    });
+    return ate(() => !!document.querySelector('.hero-trailer iframe'), null, 12000);
+  })(), true);
+
   console.log('\n10) O trailer MORRE ao trocar de tela');
   await page.evaluate(() => App.go('home', null, { replace: true }));
   await ate(() => !!document.querySelector('.hero-trailer iframe'), null, 15000);

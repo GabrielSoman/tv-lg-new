@@ -52,6 +52,10 @@
 
   var atual = null;
   var escopo = null;
+  /* Levantada pela virada de página e consumida pelo `mover` logo
+     em seguida — é o único jeito de a rolagem saber que aquele
+     movimento não foi um passo, foi um salto. */
+  var virouPagina = false;
   var ouvintes = [];
   var pendente = null;
   var quadro = null;
@@ -160,9 +164,11 @@
         var j = i + (dir === 'right' ? passo : -passo);
         if (dir === 'right') {
           if (i >= lista.length - 1) return null;
+          virouPagina = true;
           return lista[Math.min(j, lista.length - 1)];
         }
         if (i <= 0) return null;
+        virouPagina = true;
         return lista[Math.max(j, 0)];
       }
       return null;
@@ -360,7 +366,17 @@
     };
   }
 
-  function garanteVisivel(el) {
+  /* `aoTopo` muda a régua: em vez de rolar o mínimo para o item
+     caber, rola o suficiente para ele ENCABEÇAR a janela.
+
+     A rolagem mínima é o certo para andar de um em um — mexer a
+     tela mais do que o necessário a cada tecla embrulha. Mas
+     numa virada de página ela produz exatamente o contrário do
+     que se espera: a pasta escolhida aparece na última linha,
+     com a página anterior inteira acima dela, e parece que o
+     salto não aconteceu. Quem vira a página quer o novo começo
+     no alto. */
+  function garanteVisivel(el, aoTopo) {
     trilhos(el).forEach(function (t) {
       var janela = t.parentElement;
       if (!janela) return;
@@ -378,10 +394,31 @@
         off.x = Math.max(0, Math.min(maxX, x));
       }
       if (eixo === 'y' || eixo === 'xy') {
-        var t1 = pos.y, t2 = pos.y + el.offsetHeight;
+        /* -----------------------------------------------------
+           Blocos que não podem aparecer pela metade
+           -----------------------------------------------------
+           O destaque da abertura é alto e os botões dele ficam
+           lá embaixo, encostados na borda de baixo. Com a
+           rolagem mínima, voltar para ele de uma fileira de
+           baixo trazia só o pedaço necessário para o BOTÃO
+           caber — e a arte ficava cortada no meio do caminho,
+           que é exatamente como não se olha para um destaque.
+
+           `data-topo` diz "quando o foco entrar aqui, este
+           bloco encabeça a tela", e a conta passa a ser sobre o
+           bloco inteiro, não sobre o item focado dentro dele.
+           ----------------------------------------------------- */
+        var ancora = el, forcaTopo = aoTopo;
+        if (el.closest) {
+          var bloco = el.closest('[data-topo]');
+          if (bloco && t.contains(bloco)) { ancora = bloco; forcaTopo = true; }
+        }
+        var t1 = (ancora === el) ? pos.y : posicaoEm(ancora, t).y;
+        var t2 = pos.y + el.offsetHeight;
         var maxY = Math.max(0, t.scrollHeight - util.altura);
         var y = off.y;
-        if (t1 - MARGEM.topo < y) y = t1 - MARGEM.topo;
+        if (forcaTopo) y = t1;
+        else if (t1 - MARGEM.topo < y) y = t1 - MARGEM.topo;
         else if (t2 + MARGEM.base > y + util.altura) y = t2 + MARGEM.base - util.altura;
         off.y = Math.max(0, Math.min(maxY, y));
       }
@@ -408,7 +445,7 @@
       var reg = regiaoDe(el);
       if (reg) reg._ultimoFoco = el;
 
-      if (!(opcoes && opcoes.semRolar)) garanteVisivel(el);
+      if (!(opcoes && opcoes.semRolar)) garanteVisivel(el, !!(opcoes && opcoes.aoTopo));
 
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
         try { el.focus(); } catch (e) {}
@@ -436,8 +473,9 @@
       var reg = regiaoDe(atual);
       if (!reg) return Nav.focarPrimeiro();
 
+      virouPagina = false;
       var alvo = passoInterno(reg, atual, dir);
-      if (alvo) return Nav.focar(alvo);
+      if (alvo) return Nav.focar(alvo, virouPagina ? { aoTopo: true } : null);
 
       alvo = volta(reg, atual, dir);
       if (alvo) return Nav.focar(alvo);
