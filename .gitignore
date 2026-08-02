@@ -38,8 +38,15 @@ tools/catchup.js
 tools/mock-iptv.js
 tools/smoke.js
 tools/test-update.js
+tools/test-nav.js
+tools/nav-fixture.html
 tools/dev-server.js
 tools/cloudflare-worker.js
+tools/sonda-4k.js
+tools/test-player.js
+tools/test-telas.js
+tools/test-virt.js
+tools/virt-fixture.html
 
 # ---- gerados / locais -----------------------------------
 node_modules/
@@ -62,3 +69,8 @@ relatorio-api.md
 #    package.json    os comandos
 #    README.md       como reinstalar do zero
 # =========================================================
+tools/perf-fixture.html
+tools/test-perf.js
+tools/_style-antigo.css
+tools/dados-fixture.html
+tools/test-dados.js

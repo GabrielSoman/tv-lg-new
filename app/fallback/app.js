@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+f7e84ee0";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+6a464f14";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -303,6 +303,7 @@ window.CFG = {
   var K_SETTINGS  = 'nebula.settings';
   var K_PROGRESS  = 'nebula.progress';
   var K_FAVORITES = 'nebula.favorites';
+  var K_CHANNELS  = 'nebula.channels';
   var MAX_PROGRESS = 300;
 
   function read(key, fallback) {
@@ -318,7 +319,25 @@ window.CFG = {
 
   var settings  = read(K_SETTINGS, {});
   var progress  = read(K_PROGRESS, {});
+
+  /* Limpeza de uma sujeira que a versão anterior deixou: ela
+     gravava progresso de canal AO VIVO, que é um número sem
+     significado — quando você volta ao canal, o programa é
+     outro. Esses registros entupiam "continuar assistindo" e o
+     histórico. É a mesma faxina que o `schema-v2.sql` faz no
+     banco, só que aqui na TV. */
+  (function limparAoVivo() {
+    var mudou = false;
+    Object.keys(progress).forEach(function (k) {
+      var r = progress[k];
+      if (r && (r.kind === 'live' || /^(live|canal):/.test(k))) {
+        delete progress[k]; mudou = true;
+      }
+    });
+    if (mudou) write(K_PROGRESS, progress);
+  }());
   var favorites = read(K_FAVORITES, {});
+  var channels  = read(K_CHANNELS, {});
 
   w.Store = {
 
@@ -365,6 +384,29 @@ window.CFG = {
     favorites: function () {
       return Object.keys(favorites).map(function (k) { return favorites[k]; })
         .sort(function (a, b) { return (b.at || '').localeCompare(a.at || ''); });
+    },
+
+    /* ---------------- Hábito de canal ----------------
+       Ao vivo não tem "onde parei", mas TEM "o que eu vejo".
+       Guardar aberturas e a hora da última é o que deixa a lista
+       de canais em ordem de uso em vez de ordem alfabética — e é
+       o espelho local da tabela `channel_usage` do schema v2. */
+    touchChannel: function (item) {
+      if (!item || !item.id) return;
+      var r = channels[item.id] || { id: item.id, chave: item.chave || '', aberturas: 0 };
+      r.title = item.title || r.title || '';
+      r.aberturas++;
+      r.at = new Date().toISOString();
+      channels[item.id] = r;
+      write(K_CHANNELS, channels);
+    },
+
+    channelUsage: function (id) { return channels[id] || null; },
+
+    recentChannels: function (limit) {
+      return Object.keys(channels).map(function (k) { return channels[k]; })
+        .sort(function (a, b) { return (b.at || '').localeCompare(a.at || ''); })
+        .slice(0, limit || 30);
     },
 
     /* ---------------- Progresso ---------------- */
@@ -770,37 +812,318 @@ window.CFG = {
 
 /* ===== xtream.js ================================================= */
 /* =========================================================
-   Cliente da API Xtream (player_api.php).
-   Todos os metodos devolvem itens ja normalizados no formato
-   que o resto do app entende.
+   CLIENTE DA API XTREAM — ClaudeTV
+   =========================================================
+   Duas coisas descobertas medindo o painel de verdade, e que
+   definem este arquivo inteiro:
+
+   1. O painel responde HTTP 200 com CORPO VAZIO quando o
+      cliente manda `Accept-Encoding`. E no navegador esse
+      cabeçalho é PROIBIDO de alterar — nem XHR nem fetch
+      deixam removê-lo. Ou seja: por GET a API nunca
+      funcionaria na TV. Por POST funciona, mesmo com gzip
+      pedido. Por isso tudo aqui é POST.
+
+   2. `POST` com `application/x-www-form-urlencoded` é uma
+      requisição simples de CORS — não dispara preflight. E a
+      API devolve `Access-Control-Allow-Origin: *`. Então a TV
+      fala direto, sem proxy.
+
+   Tamanhos medidos no provedor: categorias 4 kB, TODOS os
+   2.846 canais 820 kB, uma categoria de filmes 85 kB, uma
+   série completa 39 kB. Contra 81,5 MB da lista M3U.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  function creds() {
+  function cred() {
     return {
-      origin:   w.Store.get('source.origin', ''),
-      username: w.Store.get('source.username', ''),
-      password: w.Store.get('source.password', '')
+      origem: String(w.Store.get('source.origin', '')).replace(/\/+$/, ''),
+      usuario: w.Store.get('source.username', ''),
+      senha: w.Store.get('source.password', '')
     };
   }
 
-  function api(action, params) {
-    var c = creds();
-    var qs = 'username=' + encodeURIComponent(c.username) +
-             '&password=' + encodeURIComponent(c.password);
-    if (action) qs += '&action=' + action;
+  /* ---------------------------------------------------------
+     Chamada crua
+     --------------------------------------------------------- */
+  function chamar(acao, params) {
+    var c = cred();
+    if (!c.origem || !c.usuario) {
+      return Promise.reject(new Error('A lista ainda não foi configurada.'));
+    }
+
+    var corpo = 'username=' + encodeURIComponent(c.usuario) +
+                '&password=' + encodeURIComponent(c.senha);
+    if (acao) corpo += '&action=' + acao;
     Object.keys(params || {}).forEach(function (k) {
-      if (params[k] !== undefined && params[k] !== null && params[k] !== '')
-        qs += '&' + k + '=' + encodeURIComponent(params[k]);
+      var v = params[k];
+      if (v !== undefined && v !== null && v !== '') {
+        corpo += '&' + k + '=' + encodeURIComponent(v);
+      }
     });
-    return w.fetchJSON(c.origin + '/player_api.php?' + qs);
+
+    return w.fetchJSON(c.origem + '/player_api.php', {
+      method: 'POST',
+      body: corpo,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      raw: true,                      /* a API tem CORS: vai direto */
+      timeout: acao === 'get_live_streams' ? 45000 : w.CFG.REQUEST_TIMEOUT_MS
+    });
   }
 
+  /* ---------------------------------------------------------
+     Normalização de nomes de canal
+     ---------------------------------------------------------
+     Separa três coisas que a lista mistura no mesmo texto:
+     a REGIÃO (feed), o NOME e a QUALIDADE.
+
+     Isto importa de verdade: `LAT | HBO` é o sinal latino em
+     espanhol e `USL- HBO` é outro feed. Agrupar os dois com o
+     `HBO` brasileiro faria a troca automática de qualidade
+     mudar o idioma do canal no meio do jogo.
+     --------------------------------------------------------- */
+  var QUALIDADES = ['4K', 'UHD', 'ULTRA HD', '2160P', 'FHD', 'FULL HD', '1080P',
+                    'HD', '720P', 'H265', 'HEVC', 'H264', 'SD', '480P', '360P', '60FPS'];
+
+  /* ---------------------------------------------------------
+     DUAS ordenações, e a diferença entre elas é proposital.
+     ---------------------------------------------------------
+     POSTO — a ordem da ESCADA, usada quando a conexão engasga.
+     Aqui o H265 fica logo abaixo do 4K, e não lá embaixo: em
+     HEVC o mesmo conteúdo cabe em cerca de metade dos bits, e
+     o problema que faz o canal travar quase sempre é banda.
+     Descer de 4K para H265 alivia a rede sem jogar a imagem
+     fora — é o degrau mais inteligente que existe.
+
+     ABERTURA — qual variante tocar ao abrir o canal. Aqui o
+     critério é resolução declarada, não economia: se o nome
+     não diz a resolução do H265 (e no painel medido não diz),
+     abrir nele seria apostar às cegas. Então abre no FHD.
+
+     Se um dia medirmos a resolução real do H265 no aparelho,
+     esta segunda tabela é o único lugar a mudar.
+     --------------------------------------------------------- */
+  var POSTO = {
+    '4K': 5, 'UHD': 5, 'ULTRA HD': 5, '2160P': 5,
+    'H265': 4, 'HEVC': 4,
+    'FHD': 3, 'FULL HD': 3, '1080P': 3,
+    'HD': 2, '720P': 2, 'H264': 2,
+    'SD': 1, '480P': 1, '360P': 1
+  };
+  var POSTO_ABERTURA = {
+    '4K': 5, 'UHD': 5, 'ULTRA HD': 5, '2160P': 5,
+    'FHD': 4, 'FULL HD': 4, '1080P': 4,
+    'HD': 3, '720P': 3,
+    'H265': 2, 'HEVC': 2, 'H264': 2,
+    'SD': 1, '480P': 1, '360P': 1
+  };
+  var POSTO_PADRAO = 2.5;             /* sem marca: fica no meio */
+
+  var REGIOES = ['LAT', 'USL', 'USA', 'US', 'PT', 'BR', 'ES', 'AR', 'MX',
+                 'UK', 'IT', 'FR', 'DE', 'CL', 'CO', 'PY', 'UY'];
+
+  function semAcento(s) {
+    var t = String(s || '');
+    return t.normalize ? t.normalize('NFD').replace(/[\u0300-\u036f]/g, '') : t;
+  }
+
+  /* HD escrito em unicode sobrescrito (ᴴᴰ) aparece na lista e
+     passava batido pelo detector. */
+  function normalizaUnicode(s) {
+    return String(s || '')
+      .replace(/ᶠ?ᴴᴰ/g, ' HD ')
+      .replace(/⁴ᴷ/g, ' 4K ')
+      .replace(/[ᴀ-ᵿʰ-˿]/g, '');
+  }
+
+  /* Palavra inteira → palavra inteira. Sempre a forma mais longa
+     como destino, para que a variante abreviada caia no grupo que
+     já tem escada, e não o contrário. */
+  var APELIDOS = [
+    [/\bDISC\b/g, 'DISCOVERY'],       /* `DISC Turbo` = `Discovery Turbo` */
+    /* o & já virou espaço na limpeza acima, então `H&H` chega
+       aqui como `H H` */
+    [/\bDISCOVERY H H\b/g, 'DISCOVERY HOME HEALTH']
+  ];
+
+  function aplicaApelidos(s) {
+    for (var i = 0; i < APELIDOS.length; i++) s = s.replace(APELIDOS[i][0], APELIDOS[i][1]);
+    return s.replace(/\s{2,}/g, ' ').trim();
+  }
+
+  function decompor(nome) {
+    var s = normalizaUnicode(semAcento(nome)).toUpperCase();
+
+    var regiao = '';
+    var m = s.match(/^\s*([A-Z]{2,4})\s*[|\-:]\s*/);
+    if (m && REGIOES.indexOf(m[1]) >= 0) { regiao = m[1]; s = s.slice(m[0].length); }
+
+    var marcas = [];
+    QUALIDADES.forEach(function (q) {
+      var re = new RegExp('(^|[\\s\\[\\(\\-|])' +
+                          q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+                          '($|[\\s\\]\\)\\-|])', 'g');
+      if (re.test(s)) { marcas.push(q); s = s.replace(re, ' '); }
+    });
+
+    /* preserva + e números: HBO+ ≠ HBO, ESPN 2 ≠ ESPN */
+    s = s.replace(/[\[\]()|·!]/g, ' ')
+         .replace(/[^A-Z0-9+\s]/g, ' ')
+         .replace(/\s{2,}/g, ' ').trim();
+
+    /* O "+" cola no nome. A sonda do 4K achou `HBO+ FHD` e
+       `HBO + UHD` virando dois canais lógicos por causa de um
+       espaço — e o segundo, sozinho, sem escada nenhuma. */
+    s = s.replace(/\s*\+/g, '+');
+
+    /* Apelidos observados na lista. É uma TABELA do que existe,
+       não um adivinhador: só entra aqui o que a sonda mostrar,
+       porque encurtar nome por conta própria mistura canais que
+       não são o mesmo. */
+    s = aplicaApelidos(s);
+
+    var posto = POSTO_PADRAO;
+    if (marcas.length) {
+      posto = 0;
+      marcas.forEach(function (q) { posto = Math.max(posto, POSTO[q] || 0); });
+      if (!posto) posto = POSTO_PADRAO;
+    }
+
+    return {
+      regiao: regiao,
+      base: s,
+      marcas: marcas,
+      posto: posto,
+      chave: (regiao ? regiao + '::' : '') + s
+    };
+  }
+
+  function postoDe(marcas, tabela) {
+    if (!marcas.length) return POSTO_PADRAO;
+    var p = 0;
+    marcas.forEach(function (q) { p = Math.max(p, tabela[q] || 0); });
+    return p || POSTO_PADRAO;
+  }
+
+  /* Rótulo curto da qualidade, para mostrar na interface. */
+  function rotuloQualidade(d) {
+    if (!d.marcas.length) return '';
+    var ordem = d.marcas.slice().sort(function (a, b) {
+      return (POSTO[b] || 0) - (POSTO[a] || 0);
+    });
+    return ordem[0];
+  }
+
+  /* ---------------------------------------------------------
+     Agrupamento: várias versões do mesmo canal viram UM canal
+     com uma escada de qualidade.
+     --------------------------------------------------------- */
+  function agrupar(canais) {
+    var mapa = {}, ordem = [];
+
+    canais.forEach(function (c) {
+      var d = decompor(c.name);
+      if (!d.base) d.base = String(c.name || '').toUpperCase();
+      var k = d.chave;
+      if (!mapa[k]) {
+        mapa[k] = {
+          id: 'canal:' + k,
+          kind: 'live',
+          chave: k,
+          regiao: d.regiao,
+          title: '',
+          poster: '',
+          groupId: String(c.category_id || ''),
+          epgId: c.epg_channel_id || '',
+          variantes: []
+        };
+        ordem.push(k);
+      }
+      var g = mapa[k];
+      g.variantes.push({
+        streamId: String(c.stream_id),
+        nome: c.name,
+        qualidade: rotuloQualidade(d),
+        posto: d.posto,                  /* ordem da escada */
+        postoAbertura: postoDe(d.marcas, POSTO_ABERTURA),
+        poster: c.stream_icon || '',
+        catId: String(c.category_id || ''),
+        num: Number(c.num) || 0
+      });
+      if (!g.poster && c.stream_icon) g.poster = c.stream_icon;
+      if (!g.epgId && c.epg_channel_id) g.epgId = c.epg_channel_id;
+    });
+
+    return ordem.map(function (k) {
+      var g = mapa[k];
+      /* a lista fica na ordem da ESCADA, que é como o player anda */
+      g.variantes.sort(function (a, b) { return b.posto - a.posto; });
+      var abrir = Xtream.variantePreferida(g);
+      g.title = (g.regiao ? g.regiao + ' ' : '') + tituloBonito(g.chave);
+      g.streamId = abrir.streamId;
+      g.qualidade = abrir.qualidade;
+      g.url = Xtream.urlAoVivo(abrir.streamId);
+      g.num = abrir.num;
+      return g;
+    });
+  }
+
+  function tituloBonito(chave) {
+    var s = chave.indexOf('::') >= 0 ? chave.split('::')[1] : chave;
+    return s.replace(/\b([A-Z])([A-Z0-9+]*)\b/g, function (_, a, b) {
+      return b.length <= 3 && b === b.toUpperCase() && b.length > 0
+        ? a + b                                   /* siglas: HBO, ESPN, TNT */
+        : a + b.toLowerCase();
+    });
+  }
+
+  /* A escada da troca automática. Inclui TUDO, inclusive o 4K:
+     quem decide travar numa qualidade é você, pelo menu do player.
+     O que impede o vai-e-volta não é excluir degraus, é a espera
+     crescente entre tentativas de subir (60s, 3min, 10min). */
+  function escada(grupo) {
+    return grupo.variantes.slice().sort(function (a, b) { return b.posto - a.posto; });
+  }
+
+  /* ---------------------------------------------------------
+     DEGRAUS — a escada agrupada por qualidade.
+     ---------------------------------------------------------
+     A sonda do 4K mostrou uma coisa que eu não esperava: existem
+     variantes REPETIDAS na mesma qualidade. `Globo SP UHD` duas
+     vezes, `Discovery Channel HD` duas vezes, `Curta! H265` duas
+     vezes — stream_ids diferentes, mesma qualidade declarada.
+
+     Isso não é lixo, é rede de segurança: são fontes distintas,
+     provavelmente servidores distintos. Então, quando o canal
+     engasga, a primeira tentativa não precisa ser perder
+     qualidade — é tentar a OUTRA fonte do mesmo degrau. Só
+     depois de esgotar as fontes é que se desce.
+
+     E isso também conserta o menu: o OSD lista DEGRAUS, não
+     variantes. Ver "UHD" duas vezes na lista não ajudaria
+     ninguém a escolher.
+     --------------------------------------------------------- */
+  function degraus(grupo) {
+    var mapa = {}, ordem = [];
+    escada(grupo).forEach(function (v) {
+      /* `4K` e `UHD` são o mesmo degrau: a sonda confirmou que
+         nenhum canal tem os dois, e quando aparecem é sempre a
+         mesma coisa escrita de dois jeitos. */
+      var rot = (v.qualidade === '4K') ? 'UHD' : (v.qualidade || '—');
+      if (!mapa[rot]) { mapa[rot] = { rotulo: rot, posto: v.posto, fontes: [] };
+                        ordem.push(rot); }
+      mapa[rot].fontes.push(v);
+    });
+    return ordem.map(function (r) { return mapa[r]; });
+  }
+
+  /* ---------------------------------------------------------
+     Conversões
+     --------------------------------------------------------- */
   function num(v) { var n = Number(v); return isFinite(n) ? n : 0; }
 
-  /* Duracao vem em formatos variados: "01:32:00", segundos, ou nada. */
-  function toSeconds(v) {
+  function segundos(v) {
     if (!v) return 0;
     if (typeof v === 'number') return v;
     var s = String(v).trim();
@@ -811,105 +1134,133 @@ window.CFG = {
     return 0;
   }
 
-  function cats(list, prefix) {
-    return (list || []).map(function (c) {
+  function primeiro(v) {
+    if (Array.isArray(v)) return v[0] || '';
+    return v || '';
+  }
+
+  function categorias(lista, tipo) {
+    return (Array.isArray(lista) ? lista : []).map(function (c) {
       return {
         id: String(c.category_id),
-        name: c.category_name || 'Sem nome',
-        kind: prefix
+        nome: String(c.category_name || 'Sem nome').trim(),
+        tipo: tipo
       };
     });
   }
 
-  w.Xtream = {
+  /* ---------------------------------------------------------
+     API
+     --------------------------------------------------------- */
+  var Xtream = {
 
-    /* Verifica as credenciais e devolve dados da conta. */
-    account: function () {
-      return api('', {}).then(function (d) {
-        if (!d || !d.user_info) throw new Error('Servidor não reconheceu o usuário e a senha.');
-        if (String(d.user_info.auth) === '0') throw new Error('Usuário ou senha recusados pelo servidor.');
-        var u = d.user_info;
+    decompor: decompor,
+    agrupar: agrupar,
+    escada: escada,
+    degraus: degraus,
+
+    /* Qual variante tocar ao abrir. Se `catId` vier, prefere a
+       variante daquela categoria — é o que faz abrir a Globo pela
+       pasta `Canais | 4K` já travar no 4K. */
+    variantePreferida: function (grupo, catId) {
+      var lista = grupo.variantes;
+      if (catId) {
+        var daPasta = lista.filter(function (v) { return v.catId === String(catId); });
+        if (daPasta.length) {
+          return daPasta.slice().sort(function (a, b) {
+            return b.postoAbertura - a.postoAbertura;
+          })[0];
+        }
+      }
+      return lista.slice().sort(function (a, b) {
+        return b.postoAbertura - a.postoAbertura;
+      })[0];
+    },
+
+    conta: function () {
+      return chamar('', {}).then(function (d) {
+        if (!d || !d.user_info) throw new Error('O servidor não reconheceu o usuário.');
+        if (String(d.user_info.auth) === '0') throw new Error('Usuário ou senha recusados.');
+        var u = d.user_info, s = d.server_info || {};
         return {
           status: u.status || '',
-          expires: u.exp_date ? new Date(num(u.exp_date) * 1000) : null,
-          maxConnections: u.max_connections || '',
-          activeConnections: u.active_cons || '',
-          server: (d.server_info && d.server_info.url) || creds().origin
+          vence: u.exp_date ? new Date(num(u.exp_date) * 1000) : null,
+          conexoes: num(u.max_connections) || 1,
+          ativas: num(u.active_cons),
+          formatos: u.allowed_output_formats || [],
+          fuso: s.timezone || '',
+          agora: s.timestamp_now ? new Date(num(s.timestamp_now) * 1000) : null
         };
       });
     },
 
-    liveCategories:   function () { return api('get_live_categories').then(function (r) { return cats(r, 'live'); }); },
-    vodCategories:    function () { return api('get_vod_categories').then(function (r) { return cats(r, 'movie'); }); },
-    seriesCategories: function () { return api('get_series_categories').then(function (r) { return cats(r, 'series'); }); },
+    catAoVivo:  function () { return chamar('get_live_categories').then(function (r) { return categorias(r, 'live'); }); },
+    catFilmes:  function () { return chamar('get_vod_categories').then(function (r) { return categorias(r, 'movie'); }); },
+    catSeries:  function () { return chamar('get_series_categories').then(function (r) { return categorias(r, 'series'); }); },
 
-    liveStreams: function (categoryId) {
-      return api('get_live_streams', { category_id: categoryId }).then(function (list) {
-        return (list || []).map(function (s) {
-          return {
-            id: 'live:' + s.stream_id,
-            streamId: String(s.stream_id),
-            kind: 'live',
-            title: s.name || 'Canal',
-            poster: s.stream_icon || '',
-            groupId: String(s.category_id || ''),
-            epgId: s.epg_channel_id || '',
-            url: w.Xtream.liveUrl(s.stream_id)
-          };
-        });
+    /* Sem categoria = todos os canais. São 820 kB; cabe. */
+    canais: function (catId) {
+      return chamar('get_live_streams', { category_id: catId }).then(function (lista) {
+        return Array.isArray(lista) ? lista : [];
       });
     },
 
-    vodStreams: function (categoryId) {
-      return api('get_vod_streams', { category_id: categoryId }).then(function (list) {
-        return (list || []).map(function (s) {
+    filmes: function (catId) {
+      return chamar('get_vod_streams', { category_id: catId }).then(function (lista) {
+        return (Array.isArray(lista) ? lista : []).map(function (f) {
           return {
-            id: 'movie:' + s.stream_id,
-            streamId: String(s.stream_id),
+            id: 'movie:' + f.stream_id,
+            streamId: String(f.stream_id),
             kind: 'movie',
-            title: s.name || 'Filme',
-            poster: s.stream_icon || s.cover || '',
-            groupId: String(s.category_id || ''),
-            rating: s.rating || '',
-            year: s.year || (s.releaseDate || '').slice(0, 4),
-            added: Number(s.added) || 0,
-            plot: s.plot || '',
-            duration: toSeconds(s.episode_run_time),
-            url: w.Xtream.movieUrl(s.stream_id, s.container_extension)
+            title: f.name || 'Filme',
+            poster: f.stream_icon || '',
+            groupId: String(f.category_id || ''),
+            rating: f.rating || '',
+            ano: String(f.year || '').slice(0, 4),
+            added: num(f.added),
+            duracao: segundos(f.episode_run_time),
+            url: Xtream.urlFilme(f.stream_id, f.container_extension)
           };
         });
       });
     },
 
-    seriesList: function (categoryId) {
-      return api('get_series', { category_id: categoryId }).then(function (list) {
-        return (list || []).map(function (s) {
+    /* `get_series` já traz sinopse, elenco, gênero e backdrop —
+       a grade de séries não precisa de chamada extra. */
+    series: function (catId) {
+      return chamar('get_series', { category_id: catId }).then(function (lista) {
+        return (Array.isArray(lista) ? lista : []).map(function (s) {
           return {
             id: 'series:' + s.series_id,
             seriesId: String(s.series_id),
             kind: 'series',
             title: s.name || 'Série',
             poster: s.cover || '',
+            fundo: primeiro(s.backdrop_path),
             groupId: String(s.category_id || ''),
             rating: s.rating || '',
-            year: (s.releaseDate || s.last_modified || '').slice(0, 4),
-            added: Number(s.last_modified) || 0,
-            plot: s.plot || ''
+            ano: String(s.releaseDate || '').slice(0, 4),
+            genero: s.genre || '',
+            sinopse: s.plot || '',
+            elenco: s.cast || '',
+            direcao: s.director || '',
+            trailer: s.youtube_trailer || '',
+            added: num(s.last_modified),
+            duracaoEp: segundos(s.episode_run_time)
           };
         });
       });
     },
 
-    /* Detalhe de uma serie: temporadas com seus episodios. */
-    seriesInfo: function (seriesId) {
-      return api('get_series_info', { series_id: seriesId }).then(function (d) {
-        if (!d) throw new Error('Série não encontrada no servidor.');
+    serie: function (seriesId) {
+      return chamar('get_series_info', { series_id: seriesId }).then(function (d) {
+        if (!d) throw new Error('Série não encontrada.');
         var info = d.info || {};
-        var raw = d.episodes || {};
-        var seasons = Object.keys(raw)
+        var cru = d.episodes || {};
+        var temporadas = Object.keys(cru)
           .sort(function (a, b) { return Number(a) - Number(b); })
-          .map(function (sn) {
-            var eps = (raw[sn] || []).map(function (e) {
+          .map(function (t) {
+            var eps = (cru[t] || []).map(function (e) {
               var ei = e.info || {};
               return {
                 id: 'ep:' + e.id,
@@ -917,17 +1268,17 @@ window.CFG = {
                 kind: 'episode',
                 seriesId: String(seriesId),
                 seriesTitle: info.name || '',
-                season: Number(sn),
-                episode: Number(e.episode_num) || 0,
+                temporada: num(e.season) || Number(t),
+                episodio: num(e.episode_num),
                 title: e.title || ('Episódio ' + e.episode_num),
                 poster: ei.movie_image || info.cover || '',
-                plot: ei.plot || '',
-                duration: toSeconds(ei.duration_secs || ei.duration),
-                url: w.Xtream.episodeUrl(e.id, e.container_extension)
+                sinopse: ei.plot || '',
+                duracao: segundos(ei.duration_secs || ei.duration),
+                url: Xtream.urlEpisodio(e.id, e.container_extension)
               };
             });
-            eps.sort(function (a, b) { return a.episode - b.episode; });
-            return { season: Number(sn), episodes: eps };
+            eps.sort(function (a, b) { return a.episodio - b.episodio; });
+            return { temporada: Number(t), episodios: eps };
           });
 
         return {
@@ -935,557 +1286,1422 @@ window.CFG = {
           seriesId: String(seriesId),
           title: info.name || 'Série',
           poster: info.cover || '',
-          plot: info.plot || '',
-          genre: info.genre || '',
+          fundo: primeiro(info.backdrop_path),
+          sinopse: info.plot || '',
+          genero: info.genre || '',
           rating: info.rating || '',
-          year: (info.releaseDate || '').slice(0, 4),
-          seasons: seasons
+          ano: String(info.releaseDate || '').slice(0, 4),
+          elenco: info.cast || '',
+          direcao: info.director || '',
+          temporadas: temporadas
         };
       });
     },
 
-    movieInfo: function (streamId) {
-      return api('get_vod_info', { vod_id: streamId }).then(function (d) {
+    filme: function (streamId) {
+      return chamar('get_vod_info', { vod_id: streamId }).then(function (d) {
         var i = (d && d.info) || {};
         var m = (d && d.movie_data) || {};
         return {
-          plot: i.plot || i.description || '',
-          genre: i.genre || '',
-          cast: i.cast || '',
-          director: i.director || '',
+          tmdb: i.tmdb_id || '',
+          sinopse: i.plot || i.description || '',
+          genero: i.genero || i.genre || '',
+          elenco: i.cast || i.actors || '',
+          direcao: i.director || '',
           rating: i.rating || '',
-          year: i.releasedate ? String(i.releasedate).slice(0, 4) : '',
-          duration: toSeconds(i.duration_secs || i.duration),
+          ano: String(i.releasedate || '').slice(0, 4),
+          duracao: segundos(i.duration_secs || i.duration),
           poster: i.movie_image || i.cover_big || '',
-          url: w.Xtream.movieUrl(streamId, m.container_extension)
+          fundo: primeiro(i.backdrop_path),
+          trailer: i.youtube_trailer || '',
+          pais: i.country || '',
+          idade: i.age || i.mpaa_rating || '',
+          url: Xtream.urlFilme(streamId, m.container_extension)
         };
       });
     },
 
-    /* Programação atual do canal (usada no rodapé do player ao vivo). */
-    shortEpg: function (streamId) {
-      return api('get_short_epg', { stream_id: streamId, limit: 2 })
+    /* O que está passando agora e a seguir, 1 kB por canal. */
+    epgCurto: function (streamId, quantos) {
+      return chamar('get_short_epg', { stream_id: streamId, limit: quantos || 2 })
         .then(function (d) {
-          var list = (d && d.epg_listings) || [];
-          return list.map(function (e) {
-            var dec = function (s) { try { return decodeURIComponent(escape(atob(s || ''))); }
-                                     catch (err) { return ''; } };
-            return { title: dec(e.title), desc: dec(e.description),
-                     start: e.start, end: e.end };
+          var lista = (d && d.epg_listings) || [];
+          return lista.map(function (e) {
+            return {
+              titulo: base64(e.title),
+              descricao: base64(e.description),
+              inicio: e.start,
+              fim: e.end,
+              inicioTs: num(e.start_timestamp) * 1000,
+              fimTs: num(e.stop_timestamp) * 1000,
+              agora: String(e.now_playing) === '1'
+            };
           });
         })
         .catch(function () { return []; });
     },
 
-    /* ---- Montagem das URLs de reproducao ---- */
-    liveUrl: function (streamId) {
-      var c = creds();
-      var ext = w.CFG.PREFER_HLS_FOR_LIVE ? '.m3u8' : '.ts';
-      return c.origin + '/live/' + enc(c.username) + '/' + enc(c.password) + '/' + streamId + ext;
+    /* ---- URLs de reprodução ---- */
+    urlAoVivo: function (streamId, formato) {
+      var c = cred();
+      var ext = formato || (w.CFG.PREFER_HLS_FOR_LIVE ? '.m3u8' : '.ts');
+      return c.origem + '/live/' + enc(c.usuario) + '/' + enc(c.senha) + '/' + streamId + ext;
     },
-    liveUrlAlt: function (streamId) {
-      var c = creds();
-      var ext = w.CFG.PREFER_HLS_FOR_LIVE ? '.ts' : '.m3u8';
-      return c.origin + '/live/' + enc(c.username) + '/' + enc(c.password) + '/' + streamId + ext;
-    },
-    movieUrl: function (streamId, ext) {
-      var c = creds();
-      return c.origin + '/movie/' + enc(c.username) + '/' + enc(c.password) + '/' +
+    urlFilme: function (streamId, ext) {
+      var c = cred();
+      return c.origem + '/movie/' + enc(c.usuario) + '/' + enc(c.senha) + '/' +
              streamId + '.' + (ext || 'mp4');
     },
-    episodeUrl: function (episodeId, ext) {
-      var c = creds();
-      return c.origin + '/series/' + enc(c.username) + '/' + enc(c.password) + '/' +
-             episodeId + '.' + (ext || 'mp4');
+    urlEpisodio: function (epId, ext) {
+      var c = cred();
+      return c.origem + '/series/' + enc(c.usuario) + '/' + enc(c.senha) + '/' +
+             epId + '.' + (ext || 'mp4');
     }
   };
 
   function enc(s) { return encodeURIComponent(s); }
+
+  function base64(s) {
+    if (!s) return '';
+    try { return decodeURIComponent(escape(w.atob(s))); }
+    catch (e) { return String(s); }
+  }
+
+  w.Xtream = Xtream;
 
 })(window);
 
 
 /* ===== catalog.js ================================================ */
 /* =========================================================
-   Camada unica de catalogo.
-   Esconde do resto do app a diferenca entre "lista M3U crua"
-   e "API Xtream", e guarda tudo em cache no IndexedDB para
-   que abrir o app nao dependa da velocidade do servidor.
+   CATÁLOGO — ClaudeTV
+   =========================================================
+   Camada única entre as telas e o servidor. Três trabalhos:
+
+     · buscar pela API, com cache por chave granular no
+       IndexedDB — nunca um blob único;
+     · agrupar canais duplicados numa escada de qualidade;
+     · filtrar conteúdo adulto NA ORIGEM, para que ele nunca
+       apareça em recomendação, busca ou histórico.
+
+   O que mudou desde a versão anterior: ela baixava uma lista
+   M3U de 81,5 MB e montava 290 mil objetos na memória da TV.
+   Aqui a maior chamada tem 820 kB, e é a única que carrega
+   tudo de uma vez.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  var memo = {};   // cache em memoria dentro da sessao
+  var memoria = {};        /* cache da sessão, por cima do IndexedDB */
 
-  function mode() { return w.Store.get('source.mode', 'm3u'); }
-
-  function cached(key, ttl, producer) {
-    if (memo[key]) return Promise.resolve(memo[key]);
-    return w.IDB.getFresh(key, ttl).then(function (hit) {
-      if (hit) { memo[key] = hit; return hit; }
-      return producer().then(function (fresh) {
-        memo[key] = fresh;
-        w.IDB.putFresh(key, fresh);
-        return fresh;
+  /* ---------------------------------------------------------
+     Cache
+     --------------------------------------------------------- */
+  function guardado(chave, produtor, validade) {
+    if (memoria[chave]) return Promise.resolve(memoria[chave]);
+    return w.IDB.getFresh(chave, validade || w.CFG.CACHE_TTL_MS).then(function (achado) {
+      if (achado) { memoria[chave] = achado; return achado; }
+      return produtor().then(function (novo) {
+        memoria[chave] = novo;
+        w.IDB.putFresh(chave, novo);
+        return novo;
       });
     });
   }
 
-  /* Carrega e interpreta a lista M3U inteira (modo de reserva). */
-  function m3uAll() {
-    return cached('m3u.all', w.CFG.CACHE_TTL_MS, function () {
-      return w.fetchText(w.Store.get('source.url')).then(function (text) {
-        var items = w.M3U.parse(text);
-        if (!items.length) throw new Error('A lista foi baixada mas está vazia.');
-        return items;
-      });
-    });
+  /* ---------------------------------------------------------
+     Conteúdo adulto
+     ---------------------------------------------------------
+     Detectado pelo nome da categoria. Nada disso é padronizado
+     entre provedores, então a lista é editável nos Ajustes.
+     No provedor medido, as oito categorias adultas foram
+     pegas corretamente.
+     --------------------------------------------------------- */
+  var ADULTO = /(^|\W)(adulto?s?|adultas?|xxx|\+?18\+?|adult|porn|erotic|eroticos?|hentai)(\W|$)/i;
+
+  function semAcento(s) {
+    var t = String(s || '');
+    return t.normalize ? t.normalize('NFD').replace(/[\u0300-\u036f]/g, '') : t;
   }
 
-  w.Catalog = {
+  function ehAdulta(nome) {
+    var extras = w.Store.get('adulto.categorias', []) || [];
+    var liberadas = w.Store.get('adulto.liberadas', []) || [];
+    var n = String(nome || '').trim();
+    if (liberadas.indexOf(n) >= 0) return false;
+    if (extras.indexOf(n) >= 0) return true;
+    return ADULTO.test(semAcento(n));
+  }
 
-    mode: mode,
+  /* Um Set com os ids das categorias adultas, para filtrar itens. */
+  var idsAdultas = null;
+  function marcarAdultas(cats) {
+    if (!idsAdultas) idsAdultas = {};
+    cats.forEach(function (c) { if (ehAdulta(c.nome)) idsAdultas[c.id] = true; });
+    return cats;
+  }
 
-    /* -----------------------------------------------------
-       Conexao inicial. Recebe a URL da lista, tenta o caminho
-       Xtream (melhor) e cai para o M3U cru se nao der.
-       ----------------------------------------------------- */
-    connect: function (url, onStep) {
-      var step = onStep || function () {};
+  function esconder() { return !!w.Store.get('adulto.ocultar', false); }
+
+  function filtraCats(cats) {
+    marcarAdultas(cats);
+    return esconder() ? cats.filter(function (c) { return !ehAdulta(c.nome); }) : cats;
+  }
+
+  /* ---------------------------------------------------------
+     Conexão
+     --------------------------------------------------------- */
+  var Catalog = {
+
+    ehAdulta: ehAdulta,
+
+    /* A categoria de um item é adulta? Usado pelo player e pelo
+       histórico para NÃO gravar nada desse conteúdo. */
+    itemAdulto: function (item) {
+      if (!item) return false;
+      if (item.adulto) return true;
+      return !!(idsAdultas && item.groupId && idsAdultas[item.groupId]);
+    },
+
+    conectar: function (url, passo) {
+      var diz = passo || function () {};
       url = String(url || '').trim();
       if (!/^https?:\/\//i.test(url)) {
         return Promise.reject(new Error('O endereço precisa começar com http:// ou https://'));
       }
 
-      w.Store.set('source.url', url);
-      memo = {};
-
       var c = w.M3U.credentialsFrom(url);
       if (!c) {
-        step('Não achei usuário e senha no link — vou ler a lista direto.');
-        return connectM3U(url, step);
+        return Promise.reject(new Error(
+          'Não consegui achar usuário e senha nesse endereço. ' +
+          'Ele precisa ser do tipo get.php?username=…&password=…'));
       }
 
+      w.Store.set('source.url', url);
       w.Store.set('source.origin', c.origin);
       w.Store.set('source.username', c.username);
       w.Store.set('source.password', c.password);
       w.Store.set('source.mode', 'xtream');
+      memoria = {}; idsAdultas = null;
 
-      step('Encontrei as credenciais. Testando a API do servidor…');
-      return w.Xtream.account()
-        .then(function (acc) {
-          step('Conectado como ' + c.username + '.');
-          w.Store.set('source.account', {
-            status: acc.status,
-            expires: acc.expires ? acc.expires.toISOString() : null,
-            maxConnections: acc.maxConnections
-          });
-          return w.IDB.clear().then(function () {
-            return { mode: 'xtream', account: acc };
-          });
-        })
-        .catch(function (e) {
-          step('A API não respondeu (' + e.message + '). Tentando ler a lista direto…');
-          return connectM3U(url, step);
+      diz('Falando com o servidor…');
+      return w.Xtream.conta().then(function (conta) {
+        w.Store.set('source.account', {
+          status: conta.status,
+          vence: conta.vence ? conta.vence.toISOString() : null,
+          conexoes: conta.conexoes,
+          fuso: conta.fuso
         });
-    },
-
-    /* ----------------------------------------------------- */
-    categories: function (kind) {
-      if (mode() === 'xtream') {
-        var fn = kind === 'live'   ? w.Xtream.liveCategories :
-                 kind === 'movie'  ? w.Xtream.vodCategories  :
-                                     w.Xtream.seriesCategories;
-        return cached('cat.' + kind, w.CFG.CACHE_TTL_MS, fn);
-      }
-      return m3uAll().then(function (items) {
-        var wanted = kind === 'series' ? 'episode' : kind;
-        var groups = w.M3U.groupsOf(items.filter(function (i) { return i.kind === wanted; }));
-        return groups.map(function (g) {
-          return { id: g.id, name: g.name, kind: kind, count: g.count };
-        });
+        diz('Conectado. ' + conta.conexoes +
+            (conta.conexoes === 1 ? ' conexão simultânea.' : ' conexões simultâneas.'));
+        return w.IDB.clear().then(function () { return conta; });
       });
     },
 
-    items: function (kind, categoryId) {
-      if (mode() === 'xtream') {
-        var fn = kind === 'live'  ? w.Xtream.liveStreams :
-                 kind === 'movie' ? w.Xtream.vodStreams  :
-                                    w.Xtream.seriesList;
-        return cached('items.' + kind + '.' + categoryId, w.CFG.CACHE_TTL_MS, function () {
-          return fn(categoryId);
+    /* ---------------------------------------------------------
+       Categorias
+       --------------------------------------------------------- */
+    categorias: function (tipo) {
+      var fn = tipo === 'live' ? w.Xtream.catAoVivo
+             : tipo === 'movie' ? w.Xtream.catFilmes
+             : w.Xtream.catSeries;
+      return guardado('cat:' + tipo, fn).then(filtraCats);
+    },
+
+    /* ---------------------------------------------------------
+       Canais: baixa TODOS uma vez (820 kB) e agrupa.
+       É o que viabiliza busca instantânea, ordenação por hábito,
+       zapping por número e a escada de qualidade.
+       --------------------------------------------------------- */
+    canais: function () {
+      return guardado('canais', function () {
+        return w.Xtream.canais('').then(function (crus) {
+          return w.Xtream.agrupar(crus);
         });
-      }
-      return m3uAll().then(function (items) {
-        var wanted = kind === 'series' ? 'episode' : kind;
-        return items.filter(function (i) {
-          return i.kind === wanted && (i.group || 'Sem categoria') === categoryId;
-        });
-      });
-    },
-
-    seriesInfo: function (seriesId) {
-      if (mode() !== 'xtream') return Promise.reject(new Error('Detalhes de série exigem um servidor Xtream.'));
-      return cached('series.' + seriesId, w.CFG.CACHE_TTL_MS, function () {
-        return w.Xtream.seriesInfo(seriesId);
-      });
-    },
-
-    movieInfo: function (streamId) {
-      if (mode() !== 'xtream') return Promise.resolve(null);
-      return cached('movie.' + streamId, w.CFG.CACHE_TTL_MS, function () {
-        return w.Xtream.movieInfo(streamId);
-      }).catch(function () { return null; });
-    },
-
-    /* -----------------------------------------------------
-       Indice de busca: baixado sob demanda e reaproveitado.
-       ----------------------------------------------------- */
-    buildSearchIndex: function (onStep) {
-      var step = onStep || function () {};
-      return cached('search.index', w.CFG.CACHE_TTL_MS, function () {
-        if (mode() !== 'xtream') {
-          return m3uAll().then(function (items) {
-            return items.map(lean);
-          });
+      }).then(function (lista) {
+        if (!idsAdultas) {
+          /* garante que as categorias já foram lidas ao menos uma vez */
+          return Catalog.categorias('live').then(function () { return lista; });
         }
-        step('Baixando filmes…');
-        return w.Xtream.vodStreams('').then(function (movies) {
-          step('Baixando séries…');
-          return w.Xtream.seriesList('').then(function (series) {
-            step('Baixando canais…');
-            return w.Xtream.liveStreams('').then(function (live) {
-              return movies.concat(series).concat(live).map(lean);
+        return lista;
+      }).then(function (lista) {
+        return esconder()
+          ? lista.filter(function (g) { return !(idsAdultas && idsAdultas[g.groupId]); })
+          : lista;
+      });
+    },
+
+    /* Canais de uma categoria. A variante de abertura passa a ser a
+       DAQUELA categoria — é o que faz abrir a Globo pela pasta
+       `Canais | 4K` já começar travada em 4K, sem menu nenhum. */
+    canaisDaCategoria: function (catId) {
+      return Catalog.canais().then(function (todos) {
+        return todos
+          .filter(function (g) {
+            return g.variantes.some(function (v) { return v.catId === String(catId); });
+          })
+          .map(function (g) {
+            var v = w.Xtream.variantePreferida(g, catId);
+            var copia = {};
+            Object.keys(g).forEach(function (k) { copia[k] = g[k]; });
+            copia.streamId = v.streamId;
+            copia.qualidade = v.qualidade;
+            copia.url = w.Xtream.urlAoVivo(v.streamId);
+            /* Abrir por uma pasta de qualidade entra travado naquela
+               qualidade até você trocar de canal.
+
+               "Travado" quer dizer apenas: comece aqui e NÃO troque
+               sozinho. Não quer dizer esconder o resto — copia.variantes
+               continua sendo a escada inteira do canal lógico, vinda de
+               todas as pastas. É de propósito: se o 4K engasgar, os
+               degraus menores estão ali no menu do player, e você não
+               precisa sair caçando o mesmo canal em outra pasta. */
+            copia.travada = ehPastaDeQualidade(catId) ? v.qualidade : '';
+            return copia;
+          });
+      });
+    },
+
+    /* Escada de qualidade, da melhor para a pior. Inclui o 4K:
+       quem trava numa qualidade é o usuário, pelo menu do player. */
+    escada: function (grupo) { return w.Xtream.escada(grupo); },
+
+    /* A mesma escada, agrupada por qualidade. É esta que o menu do
+       player mostra — e é dela que sai a regra de "tenta a outra
+       fonte do mesmo degrau antes de perder resolução". */
+    degraus: function (grupo) { return w.Xtream.degraus(grupo); },
+
+    /* ---------------------------------------------------------
+       Filmes e séries: por categoria, sob demanda
+       --------------------------------------------------------- */
+    itens: function (tipo, catId) {
+      if (tipo === 'live') return Catalog.canaisDaCategoria(catId);
+      var fn = tipo === 'movie' ? w.Xtream.filmes : w.Xtream.series;
+      return guardado('itens:' + tipo + ':' + catId, function () { return fn(catId); });
+    },
+
+    serie: function (seriesId) {
+      return guardado('serie:' + seriesId, function () { return w.Xtream.serie(seriesId); });
+    },
+
+    filme: function (streamId) {
+      return guardado('filme:' + streamId, function () { return w.Xtream.filme(streamId); })
+        .catch(function () { return null; });
+    },
+
+    epg: function (streamId) {
+      /* validade curta: o que está passando muda o tempo todo */
+      return guardado('epg:' + streamId, function () {
+        return w.Xtream.epgCurto(streamId, 2);
+      }, 5 * 60 * 1000);
+    },
+
+    /* ---------------------------------------------------------
+       Busca
+       ---------------------------------------------------------
+       Os canais já estão todos em memória. Filmes e séries entram
+       no índice conforme as categorias vão sendo abertas — e há
+       um comando para carregar tudo, que é caro e explícito.
+       --------------------------------------------------------- */
+    indice: function () {
+      var pedacos = [Catalog.canais()];
+      Object.keys(memoria).forEach(function (k) {
+        if (k.indexOf('itens:') === 0) pedacos.push(Promise.resolve(memoria[k]));
+      });
+      return Promise.all(pedacos).then(function (grupos) {
+        var saida = [];
+        grupos.forEach(function (g) {
+          (g || []).forEach(function (it) {
+            saida.push({
+              id: it.id, kind: it.kind, title: it.title, poster: it.poster,
+              url: it.url, seriesId: it.seriesId, streamId: it.streamId,
+              groupId: it.groupId, n: normaliza(it.title)
             });
           });
         });
+        return saida;
       });
     },
 
-    search: function (query, index) {
-      var q = normalize(query);
+    /* Índice completo: pede todas as categorias de filmes e séries.
+       Custa alguns megabytes, então só quando o usuário mandar. */
+    indiceCompleto: function (passo) {
+      var diz = passo || function () {};
+      return Catalog.categorias('movie').then(function (cats) {
+        return emSerie(cats, function (c, i) {
+          diz('Filmes: ' + (i + 1) + ' de ' + cats.length + ' categorias…');
+          return Catalog.itens('movie', c.id).catch(function () { return []; });
+        });
+      }).then(function () {
+        return Catalog.categorias('series');
+      }).then(function (cats) {
+        return emSerie(cats, function (c, i) {
+          diz('Séries: ' + (i + 1) + ' de ' + cats.length + ' categorias…');
+          return Catalog.itens('series', c.id).catch(function () { return []; });
+        });
+      }).then(function () {
+        diz('Índice pronto.');
+        return Catalog.indice();
+      });
+    },
+
+    buscar: function (termo, indice) {
+      var q = normaliza(termo);
       if (q.length < 2) return [];
-      var terms = q.split(/\s+/).filter(Boolean);
-      var out = [];
-      for (var i = 0; i < index.length && out.length < 200; i++) {
-        var it = index[i];
-        var hay = it.n || (it.n = normalize(it.title));
-        var ok = true;
-        for (var t = 0; t < terms.length; t++) {
-          if (hay.indexOf(terms[t]) < 0) { ok = false; break; }
+      var partes = q.split(' ').filter(Boolean);
+      var achados = [];
+      for (var i = 0; i < indice.length && achados.length < 300; i++) {
+        var it = indice[i];
+        var alvo = it.n || (it.n = normaliza(it.title));
+        var serve = true;
+        for (var p = 0; p < partes.length; p++) {
+          if (alvo.indexOf(partes[p]) < 0) { serve = false; break; }
         }
-        if (ok) out.push(it);
+        if (serve) achados.push(it);
       }
-      /* Quem começa com o termo aparece primeiro. */
-      out.sort(function (a, b) {
-        var A = a.n.indexOf(terms[0]) === 0 ? 0 : 1;
-        var B = b.n.indexOf(terms[0]) === 0 ? 0 : 1;
-        return A - B || a.title.localeCompare(b.title);
+      achados.sort(function (a, b) {
+        var A = a.n.indexOf(partes[0]) === 0 ? 0 : 1;
+        var B = b.n.indexOf(partes[0]) === 0 ? 0 : 1;
+        return A - B || a.title.length - b.title.length;
       });
-      return out;
+      return achados;
     },
 
-    /* Limpa todo o cache mas mantem os ajustes. */
-    refresh: function () {
-      memo = {};
+    /* ---------------------------------------------------------
+       Relacionados — franquia, depois semelhança, depois gênero
+       --------------------------------------------------------- */
+    relacionados: function (item, universo, quantos) {
+      var base = normaliza(item.title);
+      var meuGenero = (item.genero || '').toLowerCase();
+      var saida = [];
+
+      universo.forEach(function (o) {
+        if (o.id === item.id) return;
+        if (esconder() && idsAdultas && idsAdultas[o.groupId]) return;
+        var alvo = normaliza(o.title);
+        var nota = 0;
+
+        var pref = prefixoComum(base, alvo);
+        if (pref.length >= 8 && pref.trim().split(' ').length >= 2) nota += 100;
+
+        nota += jaroWinkler(base, alvo) * 40;
+
+        if (meuGenero && o.genero) {
+          var meus = meuGenero.split(/[,\/]/).map(trim);
+          var dele = o.genero.toLowerCase().split(/[,\/]/).map(trim);
+          var comuns = meus.filter(function (g) { return g && dele.indexOf(g) >= 0; });
+          nota += comuns.length * 12;
+        }
+        if (o.groupId && item.groupId && o.groupId === item.groupId) nota += 6;
+        if (o.ano && item.ano) nota += Math.max(0, 5 - Math.abs(Number(o.ano) - Number(item.ano)));
+
+        if (nota > 30) saida.push({ item: o, nota: nota });
+      });
+
+      saida.sort(function (a, b) { return b.nota - a.nota; });
+      return saida.slice(0, quantos || 20).map(function (x) { return x.item; });
+    },
+
+    /* ---------------------------------------------------------
+       Manutenção
+       --------------------------------------------------------- */
+    limparCache: function () {
+      memoria = {}; idsAdultas = null;
       return w.IDB.clear();
-    }
+    },
+
+    emMemoria: function () { return Object.keys(memoria).length; }
   };
 
-  function lean(it) {
-    return {
-      id: it.id, kind: it.kind, title: it.title, poster: it.poster || '',
-      url: it.url || '', seriesId: it.seriesId || '', streamId: it.streamId || '',
-      duration: it.duration || 0
-    };
+  /* ---------------------------------------------------------
+     Auxiliares
+     --------------------------------------------------------- */
+  function trim(s) { return String(s || '').trim(); }
+
+  /* Categorias que são um recorte de QUALIDADE e não de assunto,
+     tipo `Canais | 4K`. Abrir por elas é um pedido explícito. */
+  var CATS_QUALIDADE = /(^|\W)(4k|uhd|ultra ?hd|fhd|h265|hevc)(\W|$)/i;
+  function ehPastaDeQualidade(nome) {
+    var cats = memoria['cat:live'] || [];
+    var achada = cats.filter(function (c) { return c.id === String(nome); })[0];
+    return achada ? CATS_QUALIDADE.test(semAcento(achada.nome)) : false;
   }
 
-  /* Minusculas e sem acento, para que "sao paulo" ache "São Paulo". */
-  function normalize(s) {
+  /* Minúsculas, sem acento, sem marcações de qualidade e sem o
+     ano entre parênteses. Metade do trabalho de "relacionados"
+     é limpar o título antes de comparar. */
+  function normaliza(s) {
     var t = String(s || '').toLowerCase();
     if (t.normalize) t = t.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    return t.replace(/\s+/g, ' ').trim();
+    return t
+      .replace(/\b(4k|uhd|fhd|full ?hd|hd|sd|h265|hevc|h264|1080p|720p|480p|dub|dublado|leg|legendado)\b/g, ' ')
+      .replace(/\[[^\]]*\]/g, ' ')
+      .replace(/\((\d{4})\)/g, ' ')
+      .replace(/[^a-z0-9+ ]/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
   }
 
-  function connectM3U(url, step) {
-    w.Store.set('source.mode', 'm3u');
-    step('Baixando a lista… isso pode levar um minuto.');
-    return w.IDB.clear()
-      .then(m3uAll)
-      .then(function (items) {
-        step(items.length.toLocaleString('pt-BR') + ' itens encontrados.');
-        return { mode: 'm3u', count: items.length };
-      });
+  function prefixoComum(a, b) {
+    var n = Math.min(a.length, b.length), i = 0;
+    while (i < n && a[i] === b[i]) i++;
+    return a.slice(0, i);
   }
+
+  /* Jaro-Winkler favorece prefixos iguais, que é exatamente o
+     caso de franquia e continuação. */
+  function jaroWinkler(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    var alcance = Math.max(0, Math.floor(Math.max(a.length, b.length) / 2) - 1);
+    var marcaA = new Array(a.length), marcaB = new Array(b.length);
+    var iguais = 0;
+
+    for (var i = 0; i < a.length; i++) {
+      var ini = Math.max(0, i - alcance), fim = Math.min(i + alcance + 1, b.length);
+      for (var j = ini; j < fim; j++) {
+        if (marcaB[j] || a[i] !== b[j]) continue;
+        marcaA[i] = marcaB[j] = true; iguais++; break;
+      }
+    }
+    if (!iguais) return 0;
+
+    var trocas = 0, k = 0;
+    for (var x = 0; x < a.length; x++) {
+      if (!marcaA[x]) continue;
+      while (!marcaB[k]) k++;
+      if (a[x] !== b[k]) trocas++;
+      k++;
+    }
+    trocas /= 2;
+
+    var jaro = (iguais / a.length + iguais / b.length + (iguais - trocas) / iguais) / 3;
+    var pref = 0;
+    while (pref < 4 && pref < a.length && pref < b.length && a[pref] === b[pref]) pref++;
+    return jaro + pref * 0.1 * (1 - jaro);
+  }
+
+  /* Uma promessa de cada vez: o servidor tem 1 conexão e não
+     gosta de rajada. */
+  function emSerie(lista, fn) {
+    var saida = [];
+    return lista.reduce(function (p, item, i) {
+      return p.then(function () {
+        return fn(item, i).then(function (r) { saida.push(r); });
+      });
+    }, Promise.resolve()).then(function () { return saida; });
+  }
+
+  w.Catalog = Catalog;
 
 })(window);
 
 
 /* ===== nav.js ==================================================== */
 /* =========================================================
-   Navegacao por controle remoto.
+   MOTOR DE NAVEGAÇÃO — ClaudeTV
+   =========================================================
+   Substitui a busca geométrica global, que era a causa de o
+   app inteiro se comportar como uma coluna só.
 
-   Estrategia hibrida: dentro de um container com eixo definido
-   (uma fileira, uma grade, uma coluna de categorias) o movimento
-   segue a ordem dos elementos - previsivel e sem surpresas.
-   Quando nao ha para onde ir dentro do container, cai para uma
-   busca geometrica pela tela inteira, que e o que permite sair
-   de uma fileira e chegar no menu lateral, por exemplo.
+   A tela é uma árvore de REGIÕES declaradas no HTML. O foco
+   anda dentro da região conforme o eixo dela. Ao chegar na
+   borda, ou existe um vizinho declarado naquela direção, ou o
+   foco PARA. Não há busca global. "Não há para onde ir" é uma
+   resposta legítima.
+
+   ---------------------------------------------------------
+   CONTRATO DO HTML
+   ---------------------------------------------------------
+     <div data-region="cats"
+          data-axis="y"              x | y | grid | rows
+          data-nb-left="rail"        vizinho ao sair pela esquerda
+          data-nb-right="grid"
+          data-enter="last"          last | first | seletor CSS
+          data-wrap="y">             eixos em que dá a volta
+       <button data-focusable>…</button>
+     </div>
+
+   Eixo `rows`: a região contém elementos [data-row]; esquerda
+   e direita andam dentro da fileira, cima e baixo trocam de
+   fileira mantendo a posição horizontal.
+
+   Rolagem: o elemento com [data-scroll="x|y"] é o trilho que
+   se move; o pai dele é a janela. A janela precisa ter
+   `overflow: hidden`, e o trilho `position: relative`.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  var current = null;
-  var scope = null;          // elemento que limita o foco (dialogos)
-  var handlers = [];         // ouvintes extras de tecla
+  var doc = document;
 
-  function focusables() {
-    var root = scope || document;
-    return w.$$('[data-focusable]', root).filter(function (e) {
-      return e.offsetParent !== null || e === current;
-    });
+  w.KEY = w.KEY || {
+    LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40,
+    OK: 13, BACK: 461, ESC: 27, BACKSPACE: 8,
+    RED: 403, GREEN: 404, YELLOW: 405, BLUE: 406,
+    PLAY: 415, PAUSE: 19, PLAYPAUSE: 179, STOP: 413,
+    FF: 417, RW: 412, CH_UP: 33, CH_DOWN: 34, INFO: 457
+  };
+
+  var MARGEM = { topo: 120, base: 160, lado: 96 };   // px absolutos
+
+  var atual = null;
+  var escopo = null;
+  var ouvintes = [];
+  var pendente = null;
+  var quadro = null;
+
+  /* ---------------------------------------------------------
+     Consultas
+     --------------------------------------------------------- */
+  function todos(sel, raiz) {
+    return Array.prototype.slice.call((raiz || escopo || doc).querySelectorAll(sel));
   }
 
-  function rect(e) { return e.getBoundingClientRect(); }
-  function center(r) { return { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }; }
+  /* Visível = está no layout. Estar recortado por overflow NÃO
+     desqualifica: é justamente para esses que a rolagem serve. */
+  function visivel(el) {
+    if (!el || el.offsetParent === null) return false;
+    return el.offsetWidth > 0 || el.offsetHeight > 0;
+  }
 
-  /* ---------- Rolagem: move o container, nao a pagina ---------- */
-  function scrollers(el) {
+  function focaveis(raiz) {
+    return todos('[data-focusable]', raiz).filter(visivel);
+  }
+
+  function regiaoDe(el) {
+    var n = el;
+    while (n && n !== doc.body) {
+      if (n.hasAttribute && n.hasAttribute('data-region')) {
+        if (escopo && !escopo.contains(n)) return null;
+        return n;
+      }
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  function regiaoPorNome(nome) {
+    return (escopo || doc).querySelector('[data-region="' + nome + '"]');
+  }
+
+  function eixoDe(reg) { return reg.getAttribute('data-axis') || 'y'; }
+
+  function daVolta(reg, eixo) {
+    return (reg.getAttribute('data-wrap') || '').indexOf(eixo) >= 0;
+  }
+
+  function fileiraDe(el, reg) {
+    var n = el;
+    while (n && n !== reg) {
+      if (n.hasAttribute && n.hasAttribute('data-row')) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  /* ---------------------------------------------------------
+     Geometria — só dentro de uma região
+     --------------------------------------------------------- */
+  function r(el) { return el.getBoundingClientRect(); }
+  function centroX(b) { return (b.left + b.right) / 2; }
+
+  function sobreposicaoX(a, b) {
+    var ini = Math.max(a.left, b.left), fim = Math.min(a.right, b.right);
+    var base = Math.min(a.width, b.width) || 1;
+    return Math.max(0, fim - ini) / base;
+  }
+
+  function mesmaLinha(a, b) {
+    return Math.abs(a.top - b.top) < Math.max(a.height, b.height, 1) * 0.5;
+  }
+
+  /* ---------------------------------------------------------
+     Movimento dentro da região
+     --------------------------------------------------------- */
+  function passoInterno(reg, el, dir) {
+    var eixo = eixoDe(reg);
+    if (eixo === 'rows') return passoFileiras(reg, el, dir);
+
+    var lista = focaveis(reg);
+    var i = lista.indexOf(el);
+    if (i < 0) return null;
+
+    if (eixo === 'x') {
+      if (dir === 'right') return lista[i + 1] || null;
+      if (dir === 'left') return lista[i - 1] || null;
+      return null;
+    }
+    if (eixo === 'y') {
+      if (dir === 'down') return lista[i + 1] || null;
+      if (dir === 'up') return lista[i - 1] || null;
+      return null;
+    }
+    if (eixo === 'grid') {
+      if (dir === 'left' || dir === 'right') {
+        var viz = lista[i + (dir === 'right' ? 1 : -1)];
+        /* só anda para o lado dentro da MESMA linha; na ponta, para */
+        return (viz && mesmaLinha(r(viz), r(el))) ? viz : null;
+      }
+      return gradeVertical(lista, i, dir);
+    }
+    return null;
+  }
+
+  /* Cima/baixo numa grade: linha vizinha, escolhida por
+     sobreposição de projeção — não por distância em diagonal.
+     É isso que faz o foco descer em coluna. */
+  function gradeVertical(lista, i, dir) {
+    var meu = r(lista[i]);
+    var cand = [];
+    for (var k = 0; k < lista.length; k++) {
+      if (k === i) continue;
+      var b = r(lista[k]);
+      if (mesmaLinha(b, meu)) continue;
+      if (dir === 'down' && b.top <= meu.top) continue;
+      if (dir === 'up' && b.top >= meu.top) continue;
+      cand.push({ el: lista[k], b: b });
+    }
+    if (!cand.length) return null;
+
+    var alvo = cand[0].b.top;
+    cand.forEach(function (c) {
+      if (dir === 'down' ? c.b.top < alvo : c.b.top > alvo) alvo = c.b.top;
+    });
+    var linha = cand.filter(function (c) {
+      return Math.abs(c.b.top - alvo) < Math.max(c.b.height, 1) * 0.5;
+    });
+
+    var melhor = null, nota = -1;
+    linha.forEach(function (c) {
+      var s = sobreposicaoX(meu, c.b);
+      if (s > nota) { nota = s; melhor = c.el; }
+    });
+    if (nota >= 0.3) return melhor;
+
+    var perto = null, dist = Infinity;
+    linha.forEach(function (c) {
+      var d = Math.abs(centroX(c.b) - centroX(meu));
+      if (d < dist) { dist = d; perto = c.el; }
+    });
+    return perto || melhor;
+  }
+
+  function passoFileiras(reg, el, dir) {
+    var fileiras = todos('[data-row]', reg).filter(function (f) {
+      return focaveis(f).length > 0;
+    });
+    var minha = fileiraDe(el, reg);
+    var fi = fileiras.indexOf(minha);
+    if (fi < 0) return null;
+
+    if (dir === 'left' || dir === 'right') {
+      var itens = focaveis(minha);
+      var i = itens.indexOf(el);
+      return itens[i + (dir === 'right' ? 1 : -1)] || null;
+    }
+
+    var prox = fileiras[fi + (dir === 'down' ? 1 : -1)];
+    if (!prox) return null;
+    var alvos = focaveis(prox);
+    if (!alvos.length) return null;
+
+    /* mantém a posição horizontal ao trocar de fileira */
+    var cx = centroX(r(el));
+    var melhor = alvos[0], dist = Infinity;
+    alvos.forEach(function (a) {
+      var d = Math.abs(centroX(r(a)) - cx);
+      if (d < dist) { dist = d; melhor = a; }
+    });
+    return melhor;
+  }
+
+  function volta(reg, el, dir) {
+    var eixo = eixoDe(reg);
+    var horizontal = (dir === 'left' || dir === 'right');
+    if (!daVolta(reg, horizontal ? 'x' : 'y')) return null;
+
+    var lista;
+    if (eixo === 'rows') {
+      if (!horizontal) return null;
+      var minha = fileiraDe(el, reg);
+      if (!minha) return null;
+      lista = focaveis(minha);
+    } else {
+      if (eixo === 'x' && !horizontal) return null;
+      if (eixo === 'y' && horizontal) return null;
+      lista = focaveis(reg);
+    }
+    if (lista.length < 2 || lista.indexOf(el) < 0) return null;
+    return (dir === 'right' || dir === 'down') ? lista[0] : lista[lista.length - 1];
+  }
+
+  /* ---------------------------------------------------------
+     Entrar numa região vizinha
+     --------------------------------------------------------- */
+  function entrarNa(nome) {
+    return entrarNaRegiao(regiaoPorNome(nome));
+  }
+
+  function entrarNaRegiao(reg) {
+    if (!reg) return null;
+    var lista = focaveis(reg);
+    if (!lista.length) return null;
+
+    var modo = reg.getAttribute('data-enter') || 'last';
+    if (modo === 'first') return lista[0];
+    if (modo !== 'last') {
+      var alvo = reg.querySelector(modo);
+      return (alvo && visivel(alvo)) ? alvo : lista[0];
+    }
+    var lembrado = reg._ultimoFoco;
+    if (lembrado && doc.contains(lembrado) && lista.indexOf(lembrado) >= 0) return lembrado;
+    return lista[0];
+  }
+
+  var OPOSTO = { left: 'right', right: 'left', up: 'down', down: 'up' };
+
+  /* Grava, na região de destino, o caminho de volta. */
+  function marcarRetorno(destino, dir, origem) {
+    if (!destino || destino === origem) return;
+    destino._retorno = { dir: OPOSTO[dir], reg: origem };
+  }
+
+  /* ---------------------------------------------------------
+     Rolagem — determinística
+     ---------------------------------------------------------
+     Mede por offsetTop/offsetLeft, que não mudam durante uma
+     transição. O motor antigo media com getBoundingClientRect
+     no meio da animação e acumulava erro a cada tecla.
+     --------------------------------------------------------- */
+  function trilhos(el) {
     var out = [], n = el.parentElement;
-    while (n && n !== document.body) {
+    while (n && n !== doc.body) {
       if (n.hasAttribute && n.hasAttribute('data-scroll')) out.push(n);
       n = n.parentElement;
     }
     return out;
   }
 
-  function offsetOf(sc) {
-    return { x: Number(sc.getAttribute('data-off-x') || 0),
-             y: Number(sc.getAttribute('data-off-y') || 0) };
+  function posicaoEm(el, ancestral) {
+    var x = 0, y = 0, n = el, guarda = 0;
+    while (n && n !== ancestral && n !== doc.body && guarda++ < 50) {
+      x += n.offsetLeft; y += n.offsetTop;
+      n = n.offsetParent;
+    }
+    return { x: x, y: y };
   }
 
-  function applyOffset(sc, x, y) {
-    sc.setAttribute('data-off-x', x);
-    sc.setAttribute('data-off-y', y);
-    sc.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
+  function desloc(t) {
+    return { x: Number(t.getAttribute('data-off-x') || 0),
+             y: Number(t.getAttribute('data-off-y') || 0) };
   }
 
-  function ensureVisible(el) {
-    scrollers(el).forEach(function (sc) {
-      var vp = sc.parentElement;
-      if (!vp) return;
-      var axis = sc.getAttribute('data-scroll');
-      var off = offsetOf(sc);
-      var er = rect(el), vr = rect(vp);
+  function aplicaDesloc(t, x, y) {
+    x = Math.round(x); y = Math.round(y);
+    t.setAttribute('data-off-x', x);
+    t.setAttribute('data-off-y', y);
+    t.style.transform = 'translate3d(' + (-x) + 'px,' + (-y) + 'px,0)';
+  }
 
-      if (axis === 'x' || axis === 'xy') {
-        var mx = vr.width * 0.08, dx = 0;
-        if (er.left  < vr.left  + mx) dx = (vr.left + mx) - er.left;
-        else if (er.right > vr.right - mx) dx = (vr.right - mx) - er.right;
-        if (dx) {
-          var minX = Math.min(0, vp.clientWidth - sc.scrollWidth - 8);
-          off.x = Math.max(minX, Math.min(0, off.x + dx));
-        }
+  function areaUtil(janela) {
+    var cs = w.getComputedStyle(janela);
+    return {
+      largura: janela.clientWidth - parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0),
+      altura:  janela.clientHeight - parseFloat(cs.paddingTop || 0) - parseFloat(cs.paddingBottom || 0)
+    };
+  }
+
+  function garanteVisivel(el) {
+    trilhos(el).forEach(function (t) {
+      var janela = t.parentElement;
+      if (!janela) return;
+      var eixo = t.getAttribute('data-scroll');
+      var util = areaUtil(janela);
+      var pos = posicaoEm(el, t);
+      var off = desloc(t);
+
+      if (eixo === 'x' || eixo === 'xy') {
+        var e1 = pos.x, e2 = pos.x + el.offsetWidth;
+        var maxX = Math.max(0, t.scrollWidth - util.largura);
+        var x = off.x;
+        if (e1 - MARGEM.lado < x) x = e1 - MARGEM.lado;
+        else if (e2 + MARGEM.lado > x + util.largura) x = e2 + MARGEM.lado - util.largura;
+        off.x = Math.max(0, Math.min(maxX, x));
       }
-      if (axis === 'y' || axis === 'xy') {
-        var mTop = vr.height * 0.22, mBot = vr.height * 0.26, dy = 0;
-        if (er.top < vr.top + mTop) dy = (vr.top + mTop) - er.top;
-        else if (er.bottom > vr.bottom - mBot) dy = (vr.bottom - mBot) - er.bottom;
-        if (dy) {
-          var minY = Math.min(0, vp.clientHeight - sc.scrollHeight - 8);
-          off.y = Math.max(minY, Math.min(0, off.y + dy));
-        }
+      if (eixo === 'y' || eixo === 'xy') {
+        var t1 = pos.y, t2 = pos.y + el.offsetHeight;
+        var maxY = Math.max(0, t.scrollHeight - util.altura);
+        var y = off.y;
+        if (t1 - MARGEM.topo < y) y = t1 - MARGEM.topo;
+        else if (t2 + MARGEM.base > y + util.altura) y = t2 + MARGEM.base - util.altura;
+        off.y = Math.max(0, Math.min(maxY, y));
       }
-      applyOffset(sc, off.x, off.y);
+      aplicaDesloc(t, off.x, off.y);
     });
   }
 
-  /* ---------- Container e eixo ---------- */
-  function containerOf(el) {
-    var n = el.parentElement;
-    while (n && n !== document.body) {
-      if (n.hasAttribute && n.hasAttribute('data-nav-axis')) return n;
-      n = n.parentElement;
-    }
-    return null;
-  }
+  /* ---------------------------------------------------------
+     API
+     --------------------------------------------------------- */
+  var Nav = {
 
-  function siblingsIn(container) {
-    return w.$$('[data-focusable]', container).filter(function (e) {
-      return e.offsetParent !== null;
-    });
-  }
+    MARGEM: MARGEM,
 
-  function stepInContainer(el, dir) {
-    var c = containerOf(el);
-    if (!c) return null;
-    var axis = c.getAttribute('data-nav-axis');
-    var list = siblingsIn(c);
-    var i = list.indexOf(el);
-    if (i < 0) return null;
+    focar: function (el, opcoes) {
+      if (!el || !visivel(el)) return false;
+      if (escopo && !escopo.contains(el)) return false;
+      if (atual === el) { garanteVisivel(el); return true; }
 
-    if (axis === 'x' && (dir === 'left' || dir === 'right'))
-      return list[i + (dir === 'right' ? 1 : -1)] || null;
-
-    if (axis === 'y' && (dir === 'up' || dir === 'down'))
-      return list[i + (dir === 'down' ? 1 : -1)] || null;
-
-    if (axis === 'grid') {
-      if (dir === 'left' || dir === 'right')
-        return list[i + (dir === 'right' ? 1 : -1)] || null;
-      /* Cima/baixo numa grade: elemento mais alinhado na linha vizinha. */
-      return gridVertical(list, i, dir);
-    }
-    return null;
-  }
-
-  function gridVertical(list, i, dir) {
-    var cr = rect(list[i]), cc = center(cr);
-    var best = null, bestScore = Infinity;
-    for (var k = 0; k < list.length; k++) {
-      if (k === i) continue;
-      var r = rect(list[k]);
-      var sameLine = Math.abs(r.top - cr.top) < cr.height * 0.5;
-      if (sameLine) continue;
-      if (dir === 'down' && r.top <= cr.top) continue;
-      if (dir === 'up'   && r.top >= cr.top) continue;
-      var s = Math.abs(r.top - cr.top) * 2 + Math.abs(center(r).x - cc.x);
-      if (s < bestScore) { bestScore = s; best = list[k]; }
-    }
-    return best;
-  }
-
-  /* ---------- Busca geometrica global ---------- */
-  function geometric(el, dir) {
-    var cr = rect(el), cc = center(cr);
-    var best = null, bestScore = Infinity;
-
-    focusables().forEach(function (t) {
-      if (t === el) return;
-      var r = rect(t);
-      if (!r.width || !r.height) return;
-      var tc = center(r), main, cross;
-
-      if (dir === 'right')      { if (r.left   < cr.right - 2) return; main = r.left - cr.right;   cross = Math.abs(tc.y - cc.y); }
-      else if (dir === 'left')  { if (r.right  > cr.left + 2)  return; main = cr.left - r.right;   cross = Math.abs(tc.y - cc.y); }
-      else if (dir === 'down')  { if (r.top    < cr.bottom - 2) return; main = r.top - cr.bottom;  cross = Math.abs(tc.x - cc.x); }
-      else                      { if (r.bottom > cr.top + 2)   return; main = cr.top - r.bottom;   cross = Math.abs(tc.x - cc.x); }
-
-      var s = Math.max(0, main) + cross * 2.2;
-      if (s < bestScore) { bestScore = s; best = t; }
-    });
-    return best;
-  }
-
-  /* ---------- API ---------- */
-  w.Nav = {
-
-    focus: function (el, opts) {
-      if (!el) return false;
-      if (current === el) { ensureVisible(el); return true; }
-      if (current) current.classList.remove('focused');
-      current = el;
+      if (atual) atual.classList.remove('focused');
+      atual = el;
       el.classList.add('focused');
-      if (!(opts && opts.noScroll)) ensureVisible(el);
-      if (el.tagName === 'INPUT') { try { el.focus(); } catch (e) {} }
-      else if (document.activeElement && document.activeElement.blur) {
-        try { document.activeElement.blur(); } catch (e) {}
+
+      var reg = regiaoDe(el);
+      if (reg) reg._ultimoFoco = el;
+
+      if (!(opcoes && opcoes.semRolar)) garanteVisivel(el);
+
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+        try { el.focus(); } catch (e) {}
+      } else if (doc.activeElement && doc.activeElement.blur &&
+                 doc.activeElement !== doc.body) {
+        try { doc.activeElement.blur(); } catch (e) {}
       }
-      if (w.Nav.onFocusHook) w.Nav.onFocusHook(el);
+      if (Nav.aoFocar) Nav.aoFocar(el, reg);
       return true;
     },
 
-    current: function () { return current; },
+    atual: function () { return atual; },
+    regiaoAtual: function () { return atual ? regiaoDe(atual) : null; },
 
-    /* Foca o primeiro elemento disponivel (ou um seletor especifico). */
-    focusFirst: function (selector) {
-      var list = selector ? w.$$(selector, scope || document) : focusables();
-      list = list.filter(function (e) { return e.offsetParent !== null; });
-      return w.Nav.focus(list[0]);
+    focarPrimeiro: function (seletor) {
+      var lista = seletor ? todos(seletor).filter(visivel) : focaveis();
+      return Nav.focar(lista[0]);
     },
 
-    move: function (dir) {
-      if (!current || current.offsetParent === null) return w.Nav.focusFirst();
-      var next = stepInContainer(current, dir) || geometric(current, dir);
-      if (next) { w.Nav.focus(next); return true; }
-      return false;
-    },
+    entrar: function (nome) { return Nav.focar(entrarNa(nome)); },
 
-    /* Limita o foco a um pedaco da tela (dialogos, erro do player). */
-    setScope: function (root, firstSelector) {
-      scope = root || null;
-      if (root) {
-        if (current) current.classList.remove('focused');
-        current = null;
-        w.Nav.focusFirst(firstSelector);
+    /* O coração. true = moveu; false = a borda parou. */
+    mover: function (dir) {
+      if (!atual || !doc.contains(atual) || !visivel(atual)) return Nav.focarPrimeiro();
+      var reg = regiaoDe(atual);
+      if (!reg) return Nav.focarPrimeiro();
+
+      var alvo = passoInterno(reg, atual, dir);
+      if (alvo) return Nav.focar(alvo);
+
+      alvo = volta(reg, atual, dir);
+      if (alvo) return Nav.focar(alvo);
+
+      /* Voltar por onde se veio.
+         Se você saiu da grade para o menu apertando ←, então →
+         tem de devolver você à grade — mesmo que o menu declare
+         outro vizinho à direita. É o que todo app de TV faz, e a
+         falta disso é o tipo de coisa que faz a pessoa perder o
+         lugar e desistir de procurar. O vizinho declarado é o
+         padrão; o retorno é a exceção que vale mais. */
+      if (reg._retorno && reg._retorno.dir === dir &&
+          doc.contains(reg._retorno.reg) && reg._retorno.reg !== reg) {
+        alvo = entrarNaRegiao(reg._retorno.reg);
+        if (alvo) { marcarRetorno(regiaoDe(alvo), dir, reg); return Nav.focar(alvo); }
       }
+
+      var vizinho = reg.getAttribute('data-nb-' + dir);
+      if (vizinho) {
+        var destino = regiaoPorNome(vizinho);
+        alvo = entrarNaRegiao(destino);
+        if (alvo) { marcarRetorno(destino, dir, reg); return Nav.focar(alvo); }
+      }
+      return false;          /* borda: isto é sucesso, não falha */
     },
 
-    clearScope: function (restoreTo) {
-      scope = null;
-      if (restoreTo) w.Nav.focus(restoreTo);
-    },
-
-    scoped: function () { return scope; },
-
-    /* Zera as rolagens de um container (ao trocar de tela). */
-    resetScroll: function (root) {
-      w.$$('[data-scroll]', root || document).forEach(function (sc) {
-        applyOffset(sc, 0, 0);
+    /* No máximo um movimento por quadro. O auto-repeat do
+       controle dispara 10 a 15 eventos por segundo. */
+    pedirMovimento: function (dir) {
+      pendente = dir;
+      if (quadro) return;
+      quadro = w.requestAnimationFrame(function () {
+        quadro = null;
+        var d = pendente; pendente = null;
+        if (d) Nav.mover(d);
       });
     },
 
-    /* Ouvintes extras: recebem (keyCode, event) e devolvem true se trataram. */
-    addKeyHandler: function (fn) { handlers.unshift(fn); },
-    removeKeyHandler: function (fn) {
-      handlers = handlers.filter(function (h) { return h !== fn; });
+    definirEscopo: function (raiz, primeiro) {
+      escopo = raiz || null;
+      if (raiz) {
+        if (atual) atual.classList.remove('focused');
+        atual = null;
+        Nav.focarPrimeiro(primeiro);
+      }
+    },
+    limparEscopo: function (voltarPara) {
+      escopo = null;
+      if (voltarPara) Nav.focar(voltarPara);
+    },
+    escopo: function () { return escopo; },
+
+    zerarRolagem: function (raiz) {
+      todos('[data-scroll]', raiz || doc).forEach(function (t) { aplicaDesloc(t, 0, 0); });
+    },
+
+    reiniciar: function () {
+      if (atual) atual.classList.remove('focused');
+      atual = null; pendente = null;
+    },
+
+    /* Se o elemento em foco sumiu, cai no vizinho da mesma
+       região — nunca no menu. */
+    revalidar: function () {
+      if (atual && doc.contains(atual) && visivel(atual)) return true;
+      var reg = atual ? regiaoDe(atual) : null;
+      atual = null;
+      if (reg && doc.contains(reg)) {
+        var lista = focaveis(reg);
+        if (lista.length) return Nav.focar(lista[0]);
+      }
+      return false;
+    },
+
+    adicionarTecla: function (fn) { ouvintes.unshift(fn); },
+    removerTecla: function (fn) {
+      ouvintes = ouvintes.filter(function (h) { return h !== fn; });
+    },
+
+    aoFocar: null
+  };
+
+  /* ---------------------------------------------------------
+     Ponte com os nomes antigos.
+     As telas ainda chamam Nav.focus, Nav.move e companhia. Estes
+     apelidos evitam que o app estoure enquanto a camada 4 —
+     reescrita das telas — não declara as regiões. Some quando
+     `views.js` e `app.js` estiverem convertidos.
+     --------------------------------------------------------- */
+  Nav.focus            = Nav.focar;
+  Nav.move             = Nav.mover;
+  Nav.current          = Nav.atual;
+  Nav.focusFirst       = Nav.focarPrimeiro;
+  Nav.resetScroll      = Nav.zerarRolagem;
+  Nav.setScope         = Nav.definirEscopo;
+  Nav.clearScope       = Nav.limparEscopo;
+  Nav.scoped           = Nav.escopo;
+  Nav.addKeyHandler    = Nav.adicionarTecla;
+  Nav.removeKeyHandler = Nav.removerTecla;
+  Object.defineProperty(Nav, 'onFocusHook', {
+    get: function () { return Nav.aoFocar; },
+    set: function (fn) { Nav.aoFocar = fn; },
+    configurable: true
+  });
+
+  w.Nav = Nav;
+
+  /* ---------------------------------------------------------
+     Teclado
+     --------------------------------------------------------- */
+  var DIR = {};
+  DIR[w.KEY.LEFT] = 'left'; DIR[w.KEY.RIGHT] = 'right';
+  DIR[w.KEY.UP] = 'up';     DIR[w.KEY.DOWN] = 'down';
+
+  doc.addEventListener('keydown', function (ev) {
+    var k = ev.keyCode;
+
+    for (var i = 0; i < ouvintes.length; i++) {
+      if (ouvintes[i](k, ev) === true) { ev.preventDefault(); return; }
+    }
+
+    /* Com campo de texto em foco, as setas horizontais pertencem
+       ao cursor — MAS só enquanto houver texto e o cursor não
+       estiver na ponta. Com o campo vazio, ou com o cursor no
+       fim, a seta volta a ser navegação.
+
+       Sem esta regra o campo virava uma armadilha: os botões ao
+       lado dele (a ordenação da pasta) eram inalcançáveis pelo
+       controle, porque a seta nunca saía do texto. */
+    var alvo = doc.activeElement;
+    var campo = alvo && (alvo.tagName === 'INPUT' || alvo.tagName === 'TEXTAREA');
+    var digitando = false;
+    if (campo) {
+      var texto = String(alvo.value || '');
+      var cursor = typeof alvo.selectionStart === 'number' ? alvo.selectionStart : texto.length;
+      if (texto.length) {
+        if (k === w.KEY.LEFT) digitando = cursor > 0;
+        else if (k === w.KEY.RIGHT) digitando = cursor < texto.length;
+        else digitando = true;              /* Backspace continua sendo do campo */
+      }
+    }
+
+    if (DIR[k]) {
+      if (digitando && (k === w.KEY.LEFT || k === w.KEY.RIGHT)) return;
+      Nav.pedirMovimento(DIR[k]);
+      ev.preventDefault();
+      return;
+    }
+    if (k === w.KEY.OK) {
+      if (digitando) return;
+      if (atual) atual.click();
+      ev.preventDefault();
+    }
+  }, true);
+
+})(window);
+
+
+/* ===== virt.js =================================================== */
+/* =========================================================
+   VIRTUALIZAÇÃO — fileiras e grades
+   =========================================================
+   O problema, em números da lista real: 20.478 filmes,
+   266.823 episódios, 1.910 canais lógicos. A versão anterior
+   criava um nó de DOM para cada item da categoria aberta e
+   deixava o navegador se virar. Uma categoria de 1.650 filmes
+   virava 1.650 cartões, 1.650 <img>, e a TV engasgava antes
+   mesmo de você apertar a primeira tecla.
+
+   Aqui só existe no DOM o que cabe na tela, mais uma margem
+   de segurança. O resto são números.
+
+   ---------------------------------------------------------
+   COMO CONVIVE COM O MOTOR DE NAVEGAÇÃO
+
+   O `nav.js` anda entre os elementos que EXISTEM. Se o
+   próximo cartão não estiver montado, a tecla não tem para
+   onde ir e a borda para — o que seria um bug cruel, porque
+   pareceria "a lista acabou".
+
+   A garantia é a margem: a janela montada sempre passa
+   MARGEM itens além do que se vê, dos dois lados. Como uma
+   tecla move exatamente um item, o alvo sempre existe. E o
+   `nav.js` chama `Nav.aoFocar` depois de rolar, que é onde
+   a gente remonta a janela — então a margem se renova antes
+   de acabar.
+
+   ---------------------------------------------------------
+   POR QUE POSIÇÃO ABSOLUTA
+
+   Duas razões, as duas medidas:
+
+     · o trilho precisa manter o tamanho TOTAL da lista, senão
+       o `scrollWidth`/`scrollHeight` que o nav.js usa para
+       limitar a rolagem encolhe quando os itens são reciclados
+       e a lista "trava" no meio;
+
+     · com posição absoluta, criar e remover um cartão não
+       reposiciona os vizinhos. Em fluxo normal, cada reciclagem
+       custaria um refluxo da fileira inteira.
+
+   O trilho recebe largura e altura explícitas — o tamanho que
+   a lista TERIA inteira. É a única mentira necessária, e é
+   uma mentira consistente.
+   ========================================================= */
+(function (w) {
+  'use strict';
+
+  var doc = w.document;
+
+  /* Quantos itens montar além do que se vê, de cada lado.
+     Precisa ser ≥ 2 para a navegação nunca ficar sem alvo;
+     4 dá folga para o auto-repeat do controle, que dispara
+     de 10 a 15 teclas por segundo. */
+  var MARGEM = 4;
+
+  function px(n) { return Math.round(n) + 'px'; }
+
+  /* -----------------------------------------------------------
+     Medida do passo
+     -----------------------------------------------------------
+     Não dá para chutar o tamanho do cartão: ele vem do CSS, em
+     rem, e a raiz é calculada a partir da largura da tela. Então
+     monta-se UM cartão de verdade, mede-se, e joga-se fora.
+     Uma vez por fileira, não por item.
+     ----------------------------------------------------------- */
+  function medir(trilho, desenhar, item) {
+    var sonda = desenhar(item, 0);
+    sonda.style.position = 'absolute';
+    sonda.style.left = '0px';
+    sonda.style.top = '0px';
+    sonda.style.visibility = 'hidden';
+    trilho.appendChild(sonda);
+    var m = { largura: sonda.offsetWidth, altura: sonda.offsetHeight };
+    trilho.removeChild(sonda);
+    return m;
+  }
+
+  /* -----------------------------------------------------------
+     Base comum
+     ----------------------------------------------------------- */
+  function Controlador(cfg) {
+    this.janela = cfg.janela;
+    this.itens = cfg.itens || [];
+    this.desenhar = cfg.desenhar;
+    this.colunas = cfg.colunas || 0;      /* 0 = fileira; 'auto' = grade calculada */
+    this.gap = cfg.gap || 0;
+    this.nos = {};                        /* índice → elemento montado */
+    this.fixo = null;                     /* nó que não pode ser reciclado */
+    this.faixa = null;                    /* última janela montada */
+
+    var trilho = doc.createElement('div');
+    trilho.className = 'trilho';
+    trilho.setAttribute('data-scroll', this.colunas ? 'y' : 'x');
+    trilho.style.position = 'relative';
+    this.trilho = trilho;
+    trilho._virt = this;
+
+    this.janela.appendChild(trilho);
+    this.medida = this.itens.length
+      ? medir(trilho, this.desenhar, this.itens[0])
+      : { largura: 0, altura: 0 };
+
+    this.passoX = this.medida.largura + this.gap;
+    this.passoY = this.medida.altura + this.gap;
+
+    /* -------------------------------------------------------
+       Colunas calculadas, não chutadas
+       -------------------------------------------------------
+       Eu tinha fixado 7 colunas para cartaz e 6 para logo. Deu
+       no que tinha de dar: a grade vazava pela direita, porque
+       a conta certa depende da largura DAQUELA janela, que muda
+       conforme a tela tem ou não coluna de categorias, e do
+       padding interno.
+
+       Com `colunas: 'auto'`, a conta é feita aqui, depois de
+       medir o cartão de verdade. Um número a menos para eu
+       errar.
+       ------------------------------------------------------- */
+    if (this.colunas === 'auto') {
+      var cs = w.getComputedStyle(this.janela);
+      var util = this.janela.clientWidth -
+                 parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0);
+      this.colunas = Math.max(1, Math.floor((util + this.gap) / this.passoX));
+    }
+
+    if (this.colunas) {
+      this.linhas = Math.ceil(this.itens.length / this.colunas);
+      trilho.style.width = px(this.colunas * this.passoX - this.gap);
+      trilho.style.height = px(Math.max(0, this.linhas * this.passoY - this.gap));
+    } else {
+      trilho.style.width = px(Math.max(0, this.itens.length * this.passoX - this.gap));
+      trilho.style.height = px(this.medida.altura);
+    }
+
+    this.atualizar();
+  }
+
+  /* Deslocamento atual do trilho, escrito pelo nav.js. */
+  Controlador.prototype.desloc = function () {
+    return {
+      x: Number(this.trilho.getAttribute('data-off-x') || 0),
+      y: Number(this.trilho.getAttribute('data-off-y') || 0)
+    };
+  };
+
+  /* Qual faixa de índices precisa existir agora. */
+  Controlador.prototype.faixaNecessaria = function () {
+    var off = this.desloc();
+    var total = this.itens.length;
+    if (!total) return { de: 0, ate: -1 };
+
+    if (this.colunas) {
+      var altura = this.janela.clientHeight || 0;
+      var lin1 = Math.floor(off.y / this.passoY) - MARGEM;
+      var lin2 = Math.ceil((off.y + altura) / this.passoY) + MARGEM;
+      return {
+        de: Math.max(0, lin1 * this.colunas),
+        ate: Math.min(total - 1, lin2 * this.colunas + this.colunas - 1)
+      };
+    }
+    var largura = this.janela.clientWidth || 0;
+    return {
+      de: Math.max(0, Math.floor(off.x / this.passoX) - MARGEM),
+      ate: Math.min(total - 1, Math.ceil((off.x + largura) / this.passoX) + MARGEM)
+    };
+  };
+
+  Controlador.prototype.posicaoDe = function (i) {
+    if (this.colunas) {
+      return { x: (i % this.colunas) * this.passoX,
+               y: Math.floor(i / this.colunas) * this.passoY };
+    }
+    return { x: i * this.passoX, y: 0 };
+  };
+
+  /* -----------------------------------------------------------
+     Inserção EM ORDEM — não é capricho, é requisito.
+     -----------------------------------------------------------
+     O `nav.js` anda de um item para o vizinho usando a posição
+     na lista de focáveis, e essa lista sai de `querySelectorAll`,
+     ou seja, na ordem do DOM. Se um cartão reciclado voltasse com
+     `appendChild`, ele entraria no fim e a seta para a direita
+     saltaria para o outro extremo da fileira.
+
+     Um bug desses só aparece depois de rolar bastante — que é
+     exatamente quando ninguém está mais olhando o código.
+     ----------------------------------------------------------- */
+  Controlador.prototype.inserir = function (no, i) {
+    var proximo = null, menor = Infinity;
+    for (var k in this.nos) {
+      var j = Number(k);
+      if (j > i && j < menor) { menor = j; proximo = this.nos[j]; }
+    }
+    this.nos[i] = no;
+    if (proximo) this.trilho.insertBefore(no, proximo);
+    else this.trilho.appendChild(no);
+  };
+
+  Controlador.prototype.montar = function (i) {
+    var no = this.desenhar(this.itens[i], i);
+    var p = this.posicaoDe(i);
+    no.style.position = 'absolute';
+    no.style.left = px(p.x);
+    no.style.top = px(p.y);
+    no.setAttribute('data-i', i);
+    this.inserir(no, i);
+    return no;
+  };
+
+  Controlador.prototype.atualizar = function () {
+    var f = this.faixaNecessaria();
+    if (this.faixa && this.faixa.de === f.de && this.faixa.ate === f.ate) return;
+    this.faixa = f;
+
+    var self = this;
+
+    /* recicla o que saiu — menos o nó em foco, que sumir por
+       baixo do pé é a pior coisa que uma lista pode fazer */
+    Object.keys(this.nos).forEach(function (k) {
+      var i = Number(k);
+      if (i >= f.de && i <= f.ate) return;
+      var no = self.nos[i];
+      if (no === self.fixo) return;
+      if (no.parentNode) no.parentNode.removeChild(no);
+      delete self.nos[i];
+    });
+
+    /* monta o que entrou */
+    for (var i = f.de; i <= f.ate; i++) {
+      if (!this.nos[i]) this.montar(i);
     }
   };
 
-  /* ---------- Teclado ---------- */
-  document.addEventListener('keydown', function (ev) {
-    var k = ev.keyCode;
-
-    for (var i = 0; i < handlers.length; i++) {
-      if (handlers[i](k, ev) === true) { ev.preventDefault(); return; }
+  /* O nó em foco vira intocável até outro tomar o lugar. É o que
+     faz `data-enter="last"` continuar funcionando: o nav.js guarda
+     a REFERÊNCIA do último foco da região, e uma referência para
+     um nó reciclado não serve para nada. */
+  Controlador.prototype.fixar = function (no) {
+    if (this.fixo === no) return;
+    var antigo = this.fixo;
+    this.fixo = no;
+    if (antigo && this.faixa) {
+      var i = Number(antigo.getAttribute('data-i'));
+      if ((i < this.faixa.de || i > this.faixa.ate) && antigo.parentNode) {
+        antigo.parentNode.removeChild(antigo);
+        delete this.nos[i];
+      }
     }
+  };
 
-    /* Enquanto digita num campo de texto, as setas pertencem ao campo -
-       exceto cima/baixo, que continuam navegando entre os campos. */
-    var typing = current && current.tagName === 'INPUT';
+  Controlador.prototype.no = function (i) { return this.nos[i] || null; };
 
-    switch (k) {
-      case w.KEY.LEFT:  if (typing) return; w.Nav.move('left');  break;
-      case w.KEY.RIGHT: if (typing) return; w.Nav.move('right'); break;
-      case w.KEY.UP:    w.Nav.move('up');    break;
-      case w.KEY.DOWN:  w.Nav.move('down');  break;
-      case w.KEY.OK:
-        if (current) {
-          if (current.tagName === 'INPUT') return;   // deixa o teclado da TV abrir
-          current.click();
-        }
-        break;
-      default: return;
+  /* Traz um índice para o DOM mesmo fora da faixa — usado para
+     restaurar o foco ao voltar de uma tela. */
+  Controlador.prototype.garantir = function (i) {
+    if (i < 0 || i >= this.itens.length) return null;
+    return this.nos[i] || this.montar(i);
+  };
+
+  Controlador.prototype.destruir = function () {
+    this.nos = {}; this.fixo = null; this.faixa = null;
+    if (this.trilho.parentNode) this.trilho.parentNode.removeChild(this.trilho);
+    this.trilho._virt = null;
+  };
+
+  /* -----------------------------------------------------------
+     API
+     ----------------------------------------------------------- */
+  var Virt = {
+
+    MARGEM: MARGEM,
+
+    /* Fileira horizontal. `janela` é o elemento com overflow
+       escondido; o trilho é criado aqui dentro. */
+    fileira: function (janela, itens, desenhar, gap) {
+      return new Controlador({ janela: janela, itens: itens,
+                               desenhar: desenhar, gap: gap || 0 });
+    },
+
+    /* Grade. `colunas` é fixo — em TV a largura não muda no meio
+       do uso, então não há motivo para recalcular. */
+    grade: function (janela, itens, desenhar, colunas, gap) {
+      return new Controlador({ janela: janela, itens: itens, desenhar: desenhar,
+                               colunas: colunas, gap: gap || 0 });
+    },
+
+    /* Chamado a cada mudança de foco. Sobe até achar o trilho
+       virtualizado que contém o elemento, remonta a janela e
+       fixa o nó em foco. */
+    aoFocar: function (el) {
+      var n = el;
+      while (n && n !== doc.body) {
+        if (n._virt) { n._virt.fixar(el); n._virt.atualizar(); return n._virt; }
+        n = n.parentElement;
+      }
+      return null;
+    },
+
+    /* Todos os controladores vivos dentro de uma raiz. */
+    dentroDe: function (raiz) {
+      return Array.prototype.slice
+        .call((raiz || doc).querySelectorAll('.trilho'))
+        .map(function (t) { return t._virt; })
+        .filter(Boolean);
     }
-    ev.preventDefault();
-  }, true);
+  };
+
+  w.Virt = Virt;
 
 })(window);
 
 
 /* ===== dom.js ==================================================== */
 /* =========================================================
-   Monta a estrutura fixa da tela dentro de #root.
-   Fica no pacote (e não na casca) para que qualquer mudança
-   de layout chegue pela atualização do GitHub, sem reinstalar
-   o aplicativo na TV.
+   A CASCA
+   =========================================================
+   Tudo o que existe antes de qualquer tela: o menu lateral,
+   o palco onde as telas entram, o player com seu OSD, e os
+   dois diálogos.
+
+   Fica no pacote (e não na casca do .ipk) para que qualquer
+   mudança de layout chegue pela atualização do GitHub, sem
+   reinstalar o aplicativo na TV.
+
+   O que mudou em relação à versão anterior:
+
+     · o fundo ambiente foi embora (decisão 2 da spec de
+       experiência). Era o culpado número 1 da queda de
+       quadros: uma imagem grande trocando e desfocando a
+       cada movimento de foco;
+
+     · o menu deixou de mudar de largura. Ele é estreito e
+       fixo; os rótulos aparecem por opacidade quando o foco
+       entra. Animar largura reflui a tela inteira a cada
+       vez — animar opacidade não custa nada;
+
+     · toda região de navegação agora se declara. Nada de
+       `data-nav-group` improvisado: `data-region`, `data-axis`,
+       `data-nb-*` e `data-enter`, que é o contrato que o
+       `nav.js` entende;
+
+     · o OSD do player passou a existir de verdade: linha de
+       transporte, linha de contexto, painel sobreposto e o
+       painel de aferição da §4.2-A.
    ========================================================= */
 (function (w) {
   'use strict';
 
   /* Biblioteca de ícones. Traço fino, para não pesar de longe. */
   var ICON = {
-    logo:     '<path d="M8 5.5v13l11-6.5z"/>',
+    logo:     '<path d="M8 5.5v13l11-6.5z"/><path d="M3 8.5v7M20.5 8.5v7" opacity=".55"/>',
     home:     '<path d="M4 11 12 4l8 7v9h-5v-6H9v6H4z"/>',
     live:     '<rect x="3" y="6" width="18" height="11" rx="1.5"/><path d="M8 20h8"/>',
     movie:    '<rect x="3" y="5" width="18" height="14" rx="1.5"/><path d="M7 5v14M17 5v14M3 12h18"/>',
@@ -1493,7 +2709,17 @@ window.CFG = {
     search:   '<circle cx="11" cy="11" r="6"/><path d="m16 16 4.5 4.5"/>',
     settings: '<circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/>',
     play:     '<path d="M8 5.5v13l11-6.5z"/>',
+    pause:    '<rect x="7" y="5" width="3.5" height="14" rx="1"/><rect x="13.5" y="5" width="3.5" height="14" rx="1"/>',
+    restart:  '<path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v5h5"/>',
+    prev:     '<path d="M17 5.5v13l-9-6.5z"/><rect x="5" y="5.5" width="2.4" height="13" rx="1"/>',
+    next:     '<path d="M7 5.5v13l9-6.5z"/><rect x="16.6" y="5.5" width="2.4" height="13" rx="1"/>',
+    back10:   '<path d="M12 6a6 6 0 1 1-5.7 4.1"/><path d="M6 4v3.4h3.4"/>',
+    fwd10:    '<path d="M12 6a6 6 0 1 0 5.7 4.1"/><path d="M18 4v3.4h-3.4"/>',
     star:     '<path d="m12 4 2.4 5 5.6.8-4 3.9 1 5.5-5-2.6-5 2.6 1-5.5-4-3.9 5.6-.8z"/>',
+    list:     '<path d="M4 7h16M4 12h16M4 17h10"/>',
+    layers:   '<path d="m12 4 8 4.5-8 4.5-8-4.5z"/><path d="m4 13 8 4.5 8-4.5"/>',
+    audio:    '<path d="M5 9v6h3l4.5 3.5v-13L8 9z"/><path d="M16 9.5a4 4 0 0 1 0 5"/>',
+    cc:       '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M10 10.5a2.2 2.2 0 1 0 0 3M16.5 10.5a2.2 2.2 0 1 0 0 3"/>',
     refresh:  '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
     check:    '<path d="m5 12.5 4.5 4.5L19 7"/>',
     down:     '<path d="M12 4v13"/><path d="m6.5 11.5 5.5 5.5 5.5-5.5"/><path d="M5 20h14"/>',
@@ -1506,78 +2732,136 @@ window.CFG = {
   };
 
   var MENU = [
-    { route: 'home',     icon: 'home',     label: 'Início'  },
-    { route: 'live',     icon: 'live',     label: 'Ao Vivo' },
-    { route: 'movies',   icon: 'movie',    label: 'Filmes'  },
-    { route: 'series',   icon: 'series',   label: 'Séries'  },
-    { route: 'search',   icon: 'search',   label: 'Buscar'  }
+    { route: 'home',   icon: 'home',   label: 'Início'  },
+    { route: 'live',   icon: 'live',   label: 'Ao Vivo' },
+    { route: 'movies', icon: 'movie',  label: 'Filmes'  },
+    { route: 'series', icon: 'series', label: 'Séries'  },
+    { route: 'search', icon: 'search', label: 'Buscar'  }
   ];
 
+  /* Um botão do OSD. Fica aqui porque o player e os testes
+     precisam da mesma forma. */
+  function botaoOSD(id, ic, rotulo) {
+    return '<button class="osd-btn" data-focusable id="' + id + '" ' +
+           'aria-label="' + rotulo + '" title="' + rotulo + '">' +
+           w.icon(ic) + '</button>';
+  }
+
   w.buildDOM = function () {
-    var railItems = MENU.map(function (m) {
-      return '<li><button class="rail-item" data-focusable data-nav-group="rail" ' +
-             'data-route="' + m.route + '">' + w.icon(m.icon) +
-             '<span>' + m.label + '</span></button></li>';
+
+    var itensMenu = MENU.map(function (m) {
+      return '<button class="rail-item" data-focusable data-route="' + m.route + '">' +
+             w.icon(m.icon) + '<span class="rail-label">' + m.label + '</span></button>';
     }).join('');
 
     document.getElementById('root').innerHTML =
-      '<div id="ambient"></div>' +
-      '<div id="ambient-veil"></div>' +
 
-      '<nav id="rail">' +
+      /* ---------- menu lateral ----------
+         Largura fixa. `data-enter="last"` faz o menu lembrar em
+         qual item você estava; voltar para a tela é o motor que
+         resolve, gravando o caminho de volta ao pular de região. */
+      '<nav id="rail" data-region="rail" data-axis="y" data-enter="last">' +
         '<div class="rail-logo">' + w.icon('logo', 'solid') + '</div>' +
-        '<ul class="rail-items" data-nav-axis="y">' + railItems + '</ul>' +
-        '<ul class="rail-items rail-bottom" data-nav-axis="y">' +
-          '<li><button class="rail-item" data-focusable data-nav-group="rail" ' +
-          'data-route="settings">' + w.icon('settings') + '<span>Ajustes</span></button></li>' +
-        '</ul>' +
+        '<div class="rail-items">' + itensMenu + '</div>' +
+        '<div class="rail-items rail-bottom">' +
+          '<button class="rail-item" data-focusable data-route="settings">' +
+          w.icon('settings') + '<span class="rail-label">Ajustes</span></button>' +
+        '</div>' +
       '</nav>' +
 
       '<main id="stage"></main>' +
       '<div id="clock"></div>' +
 
+      /* ---------- player ---------- */
       '<div id="player-layer" class="hidden">' +
         '<video id="video" playsinline></video>' +
         '<div id="player-spinner" class="spinner hidden"><i></i></div>' +
-        '<div id="player-ui">' +
+
+        '<div id="player-ui" class="hidden">' +
+
+          /* painel de aferição — spec de experiência §4.2-A */
+          '<div class="afer" id="afer">' +
+            '<div class="afer-l1">' +
+              '<span id="afer-decl">—</span>' +
+              '<span class="afer-sep">·</span>' +
+              '<span id="afer-real">—</span>' +
+            '</div>' +
+            '<div class="afer-l2">' +
+              '<span id="afer-fonte">—</span>' +
+              '<span class="afer-sep">·</span>' +
+              '<span id="afer-buf">—</span>' +
+              '<span class="afer-sep">·</span>' +
+              '<span id="afer-quedas">—</span>' +
+            '</div>' +
+            '<div class="afer-hora" id="afer-hora">--:--</div>' +
+          '</div>' +
+
           '<div class="pl-top">' +
             '<div class="pl-title" id="pl-title"></div>' +
             '<div class="pl-sub" id="pl-sub"></div>' +
           '</div>' +
+
           '<div class="pl-bottom">' +
-            '<div class="pl-bar">' +
-              '<div class="pl-bar-buf" id="pl-buf"></div>' +
-              '<div class="pl-bar-fill" id="pl-fill"><span class="pl-knob"></span></div>' +
+            /* A linha do tempo é FOCÁVEL e é uma região própria.
+               Sem isso não havia como arrastar a posição com o
+               controle: com o menu aberto, ←/→ pertenciam à linha
+               de botões, e a timeline ficava fora de alcance. */
+            '<div class="pl-linha" data-region="timeline" data-axis="x" ' +
+                 'data-enter="first" data-nb-down="transport">' +
+              '<button class="pl-bar" id="pl-bar" data-focusable ' +
+                      'aria-label="Linha do tempo">' +
+                '<span class="pl-bar-buf" id="pl-buf"></span>' +
+                '<span class="pl-bar-fill" id="pl-fill"><i class="pl-knob"></i></span>' +
+                '<span class="pl-fantasma hidden" id="pl-fantasma"></span>' +
+              '</button>' +
             '</div>' +
             '<div class="pl-times">' +
               '<span id="pl-cur">00:00</span>' +
               '<span id="pl-badge" class="pl-badge hidden">AO VIVO</span>' +
               '<span id="pl-dur">00:00</span>' +
             '</div>' +
-            '<div class="pl-hint">' +
-              '<span><b>OK</b> pausar</span>' +
-              '<span><b>◀ ▶</b> 10 segundos</span>' +
-              '<span><b>▲ ▼</b> 5 minutos</span>' +
-              '<span><b>CH +/−</b> próximo</span>' +
-              '<span><b>Voltar</b> sair</span>' +
+
+            /* linha 1 — transporte */
+            '<div class="osd-row" id="osd-transport" data-region="transport" ' +
+                 'data-axis="x" data-enter="#osd-play" data-nb-down="context" ' +
+                 'data-nb-up="timeline">' +
+              botaoOSD('osd-restart', 'restart', 'Reiniciar') +
+              botaoOSD('osd-prev', 'prev', 'Anterior') +
+              botaoOSD('osd-back10', 'back10', 'Voltar 10 segundos') +
+              botaoOSD('osd-play', 'play', 'Reproduzir ou pausar') +
+              botaoOSD('osd-fwd10', 'fwd10', 'Avançar 10 segundos') +
+              botaoOSD('osd-next', 'next', 'Próximo') +
             '</div>' +
+
+            /* linha 2 — contexto. O conteúdo é montado pelo player:
+               em série entram Episódios/Áudio/Legendas; ao vivo
+               entram os degraus de qualidade. */
+            '<div class="osd-row osd-ctx" id="osd-context" data-region="context" ' +
+                 'data-axis="x" data-enter="first" data-nb-up="transport"></div>' +
+
+            '<div class="pl-hint" id="pl-hint"></div>' +
           '</div>' +
+
+          /* painel sobreposto: episódios, faixas, degraus */
+          '<div id="osd-panel" class="osd-panel hidden"></div>' +
         '</div>' +
+
         '<div id="player-error" class="pl-error hidden">' +
           '<h2>Não consegui reproduzir</h2>' +
           '<p id="pl-error-msg"></p>' +
-          '<div class="row-btns" data-nav-axis="x">' +
+          '<div class="row-btns" data-region="plerr" data-axis="x" data-enter="first">' +
             '<button class="btn" data-focusable id="pl-retry">Tentar de novo</button>' +
             '<button class="btn ghost" data-focusable id="pl-back">Voltar</button>' +
           '</div>' +
         '</div>' +
       '</div>' +
 
+      /* ---------- diálogos ---------- */
       '<div id="resume-layer" class="overlay hidden">' +
         '<div class="dialog">' +
           '<h2>Continuar de onde parou?</h2>' +
           '<p id="resume-desc"></p>' +
-          '<div class="row-btns" data-nav-axis="x">' +
+          '<div class="row-btns" data-region="resume" data-axis="x" data-enter="first">' +
             '<button class="btn primary" data-focusable id="resume-yes">Continuar</button>' +
             '<button class="btn ghost" data-focusable id="resume-no">Começar do início</button>' +
           '</div>' +
@@ -1588,7 +2872,7 @@ window.CFG = {
         '<div class="dialog">' +
           '<h2 id="confirm-title"></h2>' +
           '<p id="confirm-desc"></p>' +
-          '<div class="row-btns" data-nav-axis="x">' +
+          '<div class="row-btns" data-region="confirm" data-axis="x" data-enter="first">' +
             '<button class="btn primary" data-focusable id="confirm-yes">Confirmar</button>' +
             '<button class="btn ghost" data-focusable id="confirm-no">Cancelar</button>' +
           '</div>' +
@@ -1598,62 +2882,439 @@ window.CFG = {
       '<div id="toast" class="toast hidden"></div>';
   };
 
-  /* Relógio discreto, como nos apps nativos da TV. */
+  /* -----------------------------------------------------------
+     Relógio
+     -----------------------------------------------------------
+     O desenho mostra só hora e minuto, então 20 segundos de
+     intervalo garante que a virada nunca atrase mais que isso,
+     sem custar nada. O painel do player tem o seu próprio, que
+     só roda com o OSD aberto.
+     ----------------------------------------------------------- */
+  function horaAgora() {
+    var d = new Date();
+    var hh = d.getHours(), mm = d.getMinutes();
+    return (hh < 10 ? '0' + hh : hh) + ':' + (mm < 10 ? '0' + mm : mm);
+  }
+  w.horaAgora = horaAgora;
+
   w.startClock = function () {
     function tick() {
       var n = document.getElementById('clock');
       if (!n) return;
-      var d = new Date();
-      var hh = d.getHours(), mm = d.getMinutes();
-      n.innerHTML = (hh < 10 ? '0' + hh : hh) + ':' + (mm < 10 ? '0' + mm : mm) +
-        '<small>' + d.toLocaleDateString('pt-BR', { weekday: 'short', day: '2-digit', month: 'short' }) + '</small>';
+      n.innerHTML = horaAgora() + '<small>' +
+        new Date().toLocaleDateString('pt-BR',
+          { weekday: 'short', day: '2-digit', month: 'short' }) + '</small>';
     }
     tick();
     setInterval(tick, 20000);
   };
 
-  /* ---------------------------------------------------------
-     Fundo ambiente: acompanha o item em foco com um atraso
-     curto, para não piscar quando se percorre a fileira rápido.
-     --------------------------------------------------------- */
-  var ambientTimer = null, ambientSrc = '';
-
-  w.setAmbient = function (url) {
-    clearTimeout(ambientTimer);
-    ambientTimer = setTimeout(function () {
-      var n = document.getElementById('ambient');
-      if (!n) return;
-      if (!url) { n.classList.remove('on'); ambientSrc = ''; return; }
-      if (url === ambientSrc) return;
-      ambientSrc = url;
-      n.style.backgroundImage = 'url("' + url.replace(/"/g, '%22') + '")';
-      n.classList.add('on');
-    }, 260);
+  /* -----------------------------------------------------------
+     Regiões: ligar e desligar
+     -----------------------------------------------------------
+     Uma região escondida ainda é uma região declarada, e o motor
+     tentaria entrar nela ao seguir um vizinho. Trocar o nome do
+     atributo a tira do mapa sem perder a declaração — e devolvê-la
+     é só desfazer a troca.
+     ----------------------------------------------------------- */
+  w.desligarRegiao = function (el) {
+    if (el && el.hasAttribute && el.hasAttribute('data-region')) {
+      el.setAttribute('data-region-off', el.getAttribute('data-region'));
+      el.removeAttribute('data-region');
+    }
+  };
+  w.ligarRegiao = function (el) {
+    if (el && el.hasAttribute && el.hasAttribute('data-region-off')) {
+      el.setAttribute('data-region', el.getAttribute('data-region-off'));
+      el.removeAttribute('data-region-off');
+    }
   };
 
-  /* ---------------------------------------------------------
-     Diálogo de confirmação genérico.
-     --------------------------------------------------------- */
+  /* -----------------------------------------------------------
+     Diálogo de confirmação
+     ----------------------------------------------------------- */
   w.confirmDialog = function (title, desc, okLabel) {
     return new Promise(function (resolve) {
       var layer = w.$('#confirm-layer');
-      var prev = w.Nav.current();
+      var anterior = w.Nav.atual();
       w.$('#confirm-title').textContent = title;
       w.$('#confirm-desc').textContent = desc || '';
       w.$('#confirm-yes').textContent = okLabel || 'Confirmar';
       layer.classList.remove('hidden');
-      w.Nav.setScope(layer);
+      w.Nav.definirEscopo(layer);
 
-      function finish(value) {
+      function fim(valor) {
         layer.classList.add('hidden');
         w.$('#confirm-yes').onclick = null;
         w.$('#confirm-no').onclick = null;
-        w.Nav.clearScope(prev);
-        resolve(value);
+        w.Nav.limparEscopo(anterior);
+        resolve(valor);
       }
-      w.$('#confirm-yes').onclick = function () { finish(true); };
-      w.$('#confirm-no').onclick  = function () { finish(false); };
+      w.$('#confirm-yes').onclick = function () { fim(true); };
+      w.$('#confirm-no').onclick  = function () { fim(false); };
     });
+  };
+
+})(window);
+
+
+/* ===== ui.js ===================================================== */
+/* =========================================================
+   PEÇAS DE INTERFACE
+   =========================================================
+   O vocabulário visual do app: cartão, fileira, grade, tela
+   vazia, tela de erro, esqueleto de carregamento.
+
+   Está separado das telas por um motivo prático: quase todo
+   bug de foco e de rolagem que a versão anterior teve nasceu
+   de uma fileira montada de um jeito aqui e de outro ali. Com
+   uma peça só, corrigir uma vez corrige em todo lugar.
+
+   Duas regras que valem para tudo neste arquivo:
+
+     · nenhuma lista longa é montada inteira — tudo passa pelo
+       `virt.js`;
+
+     · nada de conteúdo adulto marcado como assistido, em
+       andamento ou recente. A decisão 5 da spec de experiência
+       diz que "desbloqueado" é sobre visibilidade, não sobre
+       registro. Aqui isso vira código: `marcasDe()` devolve
+       vazio para item adulto, sempre.
+   ========================================================= */
+(function (w) {
+  'use strict';
+
+  var doc = w.document;
+
+  /* -----------------------------------------------------------
+     Imagens: só carrega quando o cartão é montado
+     -----------------------------------------------------------
+     Com virtualização isso já é quase automático — o cartão só
+     existe perto da tela. O que falta é não deixar uma imagem
+     quebrada estragar o cartão: no erro, cai para as iniciais.
+     ----------------------------------------------------------- */
+  function poster(url, nome, classe) {
+    var casca = doc.createElement('div');
+    casca.className = 'shell ' + (classe || '');
+    if (url) {
+      var img = doc.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.alt = '';
+      img.onerror = function () {
+        img.remove();
+        casca.appendChild(iniciais(nome));
+      };
+      /* Cartaz em pé dentro de moldura deitada.
+         -----------------------------------------------------
+         Medido no app real: em "continuar assistindo" a moldura
+         é 285×160 e quase todos os cartazes chegam 600×900. Com
+         `cover`, o que aparece é uma faixa do meio do cartaz —
+         sem título, sem rosto, sem nada. O provedor só manda a
+         arte deitada em parte do acervo.
+
+         Quando a imagem chega em pé, o cartão passa a mostrá-la
+         inteira, centrada, com fundo sólido. Cabe menos, mas o
+         que cabe se entende. */
+      img.onload = function () {
+        if (img.naturalHeight > img.naturalWidth * 1.1) casca.classList.add('retrato');
+      };
+      img.src = url;
+      casca.appendChild(img);
+    } else {
+      casca.appendChild(iniciais(nome));
+    }
+    return casca;
+  }
+
+  function iniciais(nome) {
+    var d = doc.createElement('div');
+    d.className = 'card-fallback';
+    d.textContent = w.initials ? w.initials(nome || '') : (nome || '?').slice(0, 2);
+    return d;
+  }
+
+  /* -----------------------------------------------------------
+     Marcas na capa
+     -----------------------------------------------------------
+     Você pediu faixa ou etiqueta em cima da capa do que está
+     assistindo ou já assistiu. São três estados, e o quarto —
+     adulto — é a ausência deliberada de todos eles.
+     ----------------------------------------------------------- */
+  function marcasDe(item) {
+    if (!item || item.kind === 'live') return null;
+    if (w.Catalog && w.Catalog.itemAdulto && w.Catalog.itemAdulto(item)) return null;
+
+    var p = w.Store.progressOf(item.id);
+    if (!p) return null;
+
+    var frac = p.duration > 0 ? Math.min(1, p.position / p.duration) : 0;
+    if (p.completed || frac >= 0.95) return { tipo: 'visto', frac: 1 };
+
+    /* ---------------------------------------------------------
+       O limiar de "comecei a assistir"
+       ---------------------------------------------------------
+       Era só percentual: 2% da duração. Medido no aparelho de
+       verdade, isso NUNCA marcava nada — num filme de 2h26, 2%
+       são quase 3 minutos, e os registros reais tinham 4, 11,
+       16, 31 segundos. A etiqueta existia no código e não
+       aparecia na tela por causa de uma conta, não de um bug de
+       desenho.
+
+       Agora vale o que vier primeiro: 30 segundos de relógio ou
+       2% do filme. Trinta segundos é tempo de já ter passado da
+       abertura e ter decidido ficar; abaixo disso foi só espiar.
+       --------------------------------------------------------- */
+    if (p.position >= 30 || frac > 0.02) {
+      return { tipo: 'andamento', frac: Math.max(frac, 0.01), rotulo: p.label || '' };
+    }
+    return null;
+  }
+
+  /* -----------------------------------------------------------
+     Cartão
+     -----------------------------------------------------------
+     `forma` decide a proporção: 'poster' (retrato, filmes e
+     séries), 'wide' (paisagem, destaques) e 'logo' (canais).
+     ----------------------------------------------------------- */
+  function cartao(item, forma, extra) {
+    forma = forma || 'poster';
+    var b = doc.createElement('button');
+    b.className = 'card card-' + forma;
+    b.setAttribute('data-focusable', '');
+    b.setAttribute('data-id', item.id);
+    b._item = item;
+
+    var casca = poster(item.poster || item.backdrop || '', item.title, '');
+
+    var m = marcasDe(item);
+    if (m) {
+      if (m.tipo === 'visto') {
+        var tag = doc.createElement('span');
+        tag.className = 'card-tag visto';
+        tag.innerHTML = w.icon('check') + '<span>Assistido</span>';
+        casca.appendChild(tag);
+      } else {
+        var barra = doc.createElement('div');
+        barra.className = 'card-progress';
+        var i = doc.createElement('i');
+        i.style.width = Math.round(m.frac * 100) + '%';
+        barra.appendChild(i);
+        casca.appendChild(barra);
+        var et = doc.createElement('span');
+        et.className = 'card-tag andamento';
+        et.textContent = m.rotulo ? 'Continuar · ' + m.rotulo : 'Continuar';
+        casca.appendChild(et);
+      }
+    }
+
+    /* Estrela de favorito: sinal de que segurar OK funcionou, e
+       de que este canal está na pasta Favoritos. */
+    if (w.Store.isFavorite(item.id)) {
+      b.classList.add('favorito');
+      var fav = doc.createElement('span');
+      fav.className = 'card-fav';
+      fav.innerHTML = w.icon('star', 'solid');
+      casca.appendChild(fav);
+    }
+
+    /* Qualidade do canal: útil e barato, sai do próprio nome. */
+    if (item.kind === 'live' && item.qualidade) {
+      var q = doc.createElement('span');
+      q.className = 'card-qual' + (item.travada ? ' travada' : '');
+      q.textContent = item.qualidade;
+      casca.appendChild(q);
+    }
+
+    b.appendChild(casca);
+
+    var meta = doc.createElement('div');
+    meta.className = 'card-meta';
+    var nome = doc.createElement('div');
+    nome.className = 'card-name';
+    nome.textContent = item.title || '';
+    meta.appendChild(nome);
+    if (extra && extra.nota) {
+      var n = doc.createElement('div');
+      n.className = 'card-note';
+      n.textContent = extra.nota;
+      meta.appendChild(n);
+    }
+    b.appendChild(meta);
+    return b;
+  }
+
+  /* -----------------------------------------------------------
+     Fileira horizontal virtualizada
+     -----------------------------------------------------------
+     Devolve a <section data-row>, com o controlador pendurado
+     em `.ctrl` para quem precisar mexer depois.
+     ----------------------------------------------------------- */
+  function fileira(titulo, itens, opts) {
+    opts = opts || {};
+    var sec = doc.createElement('section');
+    sec.className = 'row';
+    sec.setAttribute('data-row', '');
+
+    if (titulo) {
+      var h = doc.createElement('h2');
+      h.className = 'row-title';
+      h.textContent = titulo;
+      if (opts.subtitulo) {
+        var s = doc.createElement('span');
+        s.className = 'row-sub';
+        s.textContent = opts.subtitulo;
+        h.appendChild(s);
+      }
+      sec.appendChild(h);
+    }
+
+    var janela = doc.createElement('div');
+    janela.className = 'janela fileira forma-' + (opts.forma || 'poster');
+    sec.appendChild(janela);
+
+    /* O controlador precisa da janela já medida, então a fileira
+       só é ligada depois de entrar no documento. Quem monta a tela
+       chama `UI.ligar(sec)`. */
+    sec._ligar = function () {
+      sec.ctrl = w.Virt.fileira(janela, itens, function (item, i) {
+        var c = cartao(item, opts.forma, { nota: opts.nota ? opts.nota(item, i) : '' });
+        if (opts.aoAbrir) c.onclick = function () { opts.aoAbrir(item, i); };
+        return c;
+      }, opts.gap || 16);
+    };
+    return sec;
+  }
+
+  /* -----------------------------------------------------------
+     Grade virtualizada
+     ----------------------------------------------------------- */
+  function grade(itens, opts) {
+    opts = opts || {};
+    var janela = doc.createElement('div');
+    janela.className = 'janela cheia grade forma-' + (opts.forma || 'poster');
+    janela._ligar = function () {
+      janela.ctrl = w.Virt.grade(janela, itens, function (item, i) {
+        var c = cartao(item, opts.forma, { nota: opts.nota ? opts.nota(item, i) : '' });
+        if (opts.aoAbrir) c.onclick = function () { opts.aoAbrir(item, i); };
+        return c;
+      }, opts.colunas || 6, opts.gap || 16);
+    };
+    return janela;
+  }
+
+  /* -----------------------------------------------------------
+     Blocos de estado
+     ----------------------------------------------------------- */
+  function vazio(titulo, texto) {
+    var d = doc.createElement('div');
+    d.className = 'empty';
+    d.innerHTML = '<h2>' + w.esc(titulo) + '</h2>' +
+                  (texto ? '<p>' + w.esc(texto) + '</p>' : '');
+    return d;
+  }
+
+  function erro(e, tentar) {
+    var d = doc.createElement('div');
+    d.className = 'empty erro';
+    d.innerHTML = '<h2>Não consegui carregar</h2>' +
+                  '<p>' + w.esc((e && e.message) || String(e || '')) + '</p>';
+    if (tentar) {
+      var box = doc.createElement('div');
+      box.className = 'row-btns';
+      box.setAttribute('data-region', 'erro');
+      box.setAttribute('data-axis', 'x');
+      box.setAttribute('data-enter', 'first');
+      var b = doc.createElement('button');
+      b.className = 'btn';
+      b.setAttribute('data-focusable', '');
+      b.textContent = 'Tentar de novo';
+      b.onclick = tentar;
+      box.appendChild(b);
+      d.appendChild(box);
+    }
+    return d;
+  }
+
+  /* Esqueleto: ocupa o espaço certo enquanto a lista não chega,
+     para a tela não pular quando ela chegar. */
+  function esqueleto(quantos, forma) {
+    var sec = doc.createElement('section');
+    sec.className = 'row esqueleto';
+    var janela = doc.createElement('div');
+    janela.className = 'janela fileira forma-' + (forma || 'poster');
+    var trilho = doc.createElement('div');
+    trilho.className = 'trilho';
+    for (var i = 0; i < (quantos || 8); i++) {
+      var c = doc.createElement('div');
+      c.className = 'card card-' + (forma || 'poster') + ' vazio';
+      c.innerHTML = '<div class="shell"></div>';
+      trilho.appendChild(c);
+    }
+    janela.appendChild(trilho);
+    sec.appendChild(janela);
+    return sec;
+  }
+
+  /* -----------------------------------------------------------
+     Montagem
+     -----------------------------------------------------------
+     Tudo o que for virtualizado precisa estar no documento antes
+     de ser medido. Esta função percorre o que foi montado e liga
+     os controladores na ordem certa.
+     ----------------------------------------------------------- */
+  function ligar(raiz) {
+    if (raiz._ligar) raiz._ligar();
+    w.$$('*', raiz).forEach(function (n) { if (n._ligar) n._ligar(); });
+  }
+
+  function tela(cls) {
+    var s = doc.createElement('div');
+    s.className = 'screen enter ' + (cls || '');
+    return s;
+  }
+
+  /* -----------------------------------------------------------
+     Troca o conteúdo do palco — e diz ao menu para onde ir
+     -----------------------------------------------------------
+     O menu lateral não tem vizinho à direita fixo: depende da
+     tela. Sem declarar isso, a seta para a direita não saía do
+     menu — o motor procurava `data-nb-right` no `#rail`, não
+     achava, e parava na borda. Corretíssimo do ponto de vista
+     do algoritmo, e péssimo para quem está com o controle na
+     mão.
+
+     Cada tela informa aqui qual é a sua região principal.
+     ----------------------------------------------------------- */
+  function trocar(elemento, regiaoPrincipal) {
+    var palco = w.$('#stage');
+    w.Virt.dentroDe(palco).forEach(function (c) { c.destruir(); });
+    w.clear(palco);
+    palco.appendChild(elemento);
+    ligar(elemento);
+    apontarMenu(regiaoPrincipal);
+    return elemento;
+  }
+
+  function apontarMenu(regiao) {
+    var rail = w.$('#rail');
+    if (!rail) return;
+    if (regiao) rail.setAttribute('data-nb-right', regiao);
+    else rail.removeAttribute('data-nb-right');
+  }
+
+  w.UI = {
+    cartao: cartao,
+    fileira: fileira,
+    grade: grade,
+    vazio: vazio,
+    erro: erro,
+    esqueleto: esqueleto,
+    tela: tela,
+    ligar: ligar,
+    trocar: trocar,
+    apontarMenu: apontarMenu,
+    marcasDe: marcasDe
   };
 
 })(window);
@@ -1661,224 +3322,440 @@ window.CFG = {
 
 /* ===== player.js ================================================= */
 /* =========================================================
-   Player em tela cheia.
+   O PLAYER
+   =========================================================
+   Reescrito para resolver, em ordem, o que você apontou:
 
-   Ordem de escolha do motor de video:
-   1. Se a TV souber tocar o formato nativamente, usa o <video>
-      puro - e o caminho com aceleracao de hardware e menos
-      travadas na LG.
-   2. Se nao souber (caso do Chrome no Mac com HLS), usa hls.js.
+     · "ao terminar um episódio de uma série não vai pra
+       próxima, simplesmente para tudo";
+
+     · "ao apertar pra baixo no player não tem um menu pra
+       pausar/play, voltar ao início, ir para o próximo
+       episódio ou o anterior, ver lista de episódios e
+       temporadas daquela série ou até idioma";
+
+     · a escada de qualidade dos canais, com as versões
+       listadas para você travar uma à mão;
+
+     · o painel de aferição no topo (§4.2-A da spec de
+       experiência), que responde "o que está chegando aqui,
+       de verdade?".
+
+   ---------------------------------------------------------
+   TRÊS DECISÕES QUE VALE LER ANTES DE MEXER
+
+   1. O FIM DO CONTEÚDO É ESTADO DERIVADO, NÃO O EVENTO
+      `ended`. O Chromium não emite `ended` de forma confiável
+      em stream progressivo — foi por isso que o episódio
+      "simplesmente parava". Aqui o fim é uma conta: passou de
+      COMPLETED_RATIO da duração E o relógio parou de andar por
+      mais de 1,5 s sem estar pausado. O `ended`, quando vem,
+      é só mais um gatilho para a mesma conta.
+
+   2. TODA TROCA É FECHAR-E-ABRIR. A conta tem
+      `max_connections: 1` — uma transmissão por vez. Não dá
+      para pré-carregar o próximo episódio nem a variante de
+      qualidade antes de encerrar a atual: o servidor recusaria.
+      Por isso `desligar()` é chamado antes de qualquer
+      abertura, e não só na saída.
+
+   3. O PAINEL DE AFERIÇÃO SÓ MEDE COM O OSD ABERTO. Fechou,
+      o cronômetro para. Durante o filme não existe nada
+      contando quadros por trás.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  var layer, video, ui, spinner, errBox, errMsg;
+  var layer, video, ui, spinner, errBox, errMsg, painel;
   var hls = null;
-  var item = null;          // item em reproducao
-  var queue = [], qIndex = -1;
-  var saveTimer = null, hideTimer = null;
-  var startAt = 0;          // segundo em que devemos começar
-  var seeking = 0;          // acumulador de seek pelas setas
-  var seekTimer = null;
-  var triedAlternate = false;
-  var onClose = null;
-  var live = false;
 
-  function init() {
+  var item = null;              /* o que está tocando */
+  var fila = [], iFila = -1;    /* episódios da temporada */
+  var serie = null;
+
+  var aoVivo = false;
+  var grupo = null;             /* canal lógico, com a escada */
+  var degraus = [];             /* [{rotulo, fontes:[variante]}] */
+  var iDegrau = 0, iFonte = 0;
+  var travado = false;          /* qualidade fixada à mão */
+
+  var comecarEm = 0;
+  var salvar = null, esconder = null, medidor = null;
+  var pulo = 0, relogioPulo = null;
+  var arrastando = false, alvoArraste = 0;   /* estado do arraste da timeline */
+  var ultimoToque = 0, nivelPasso = 0;
+  var aoFechar = null;
+  var osdAberto = false;
+
+  /* -----------------------------------------------------------
+     Detecção de engasgo — os números e o porquê deles
+     -----------------------------------------------------------
+     Ficam aqui e não no config.js porque só fazem sentido
+     juntos: mexer num sem os outros desregula a escada.
+     ----------------------------------------------------------- */
+  var JANELA_MS      = 30000;  /* memória da contagem de travadas */
+  var TRAVA_TOTAL_MS = 4000;   /* somando mais que isso na janela → age */
+  var CARENCIA_MS    = 8000;   /* silêncio no começo: é buffer normal de abertura */
+  var INTERVALO_MS   = 20000;  /* nunca troca duas vezes seguidas mais rápido */
+  var SUBIR_MS       = 60000;  /* estável por isso → tenta subir um degrau */
+  var TETO_ESPERA_MS = 600000; /* recuo progressivo, com teto de 10 min */
+
+  var travadas = [];           /* [{em, ms, aberta}] */
+  var abriuEm = 0, trocouEm = 0;
+  var esperaSubida = SUBIR_MS;
+  var estavelDesde = 0;
+  var parouEm = 0, ultimoTempo = -1;
+
+  /* -----------------------------------------------------------
+     Montagem
+     ----------------------------------------------------------- */
+  function iniciar() {
     layer   = w.$('#player-layer');
     video   = w.$('#video');
     ui      = w.$('#player-ui');
     spinner = w.$('#player-spinner');
     errBox  = w.$('#player-error');
     errMsg  = w.$('#pl-error-msg');
+    painel  = w.$('#osd-panel');
 
-    video.addEventListener('loadedmetadata', onMeta);
-    video.addEventListener('timeupdate', onTick);
-    video.addEventListener('progress', onBuffer);
-    video.addEventListener('waiting', function () { spinner.classList.remove('hidden'); });
+    video.addEventListener('loadedmetadata', aoTerMeta);
+    video.addEventListener('timeupdate', aoAndar);
+    video.addEventListener('progress', aoBufferizar);
+    video.addEventListener('waiting', comecouAEngasgar);
+    video.addEventListener('stalled', comecouAEngasgar);
     video.addEventListener('playing', function () {
       spinner.classList.add('hidden');
       errBox.classList.add('hidden');
+      terminouDeEngasgar();
     });
-    video.addEventListener('ended', onEnded);
-    video.addEventListener('error', function () { fail(describeMediaError()); });
+    video.addEventListener('ended', function () { conferirFim(true); });
+    video.addEventListener('error', function () { falhar(descreverErro()); });
 
     w.$('#pl-retry').addEventListener('click', function () {
       errBox.classList.add('hidden');
-      w.Nav.clearScope();
-      load(item.url, startAt);
+      w.Nav.limparEscopo();
+      abrirFonte(comecarEm);
     });
     w.$('#pl-back').addEventListener('click', function () { w.Player.close(); });
+
+    ligarTransporte();
   }
 
-  /* ---------------------------------------------------------
+  /* -----------------------------------------------------------
      Abertura
-     --------------------------------------------------------- */
-  function open(target, opts) {
+     ----------------------------------------------------------- */
+  function abrir(alvo, opts) {
     opts = opts || {};
-    if (!layer) init();
+    if (!layer) iniciar();
 
-    item    = target;
-    queue   = opts.queue || [];
-    qIndex  = typeof opts.index === 'number' ? opts.index : -1;
-    onClose = opts.onClose || null;
-    live    = item.kind === 'live';
-    triedAlternate = false;
+    item     = alvo;
+    fila     = opts.queue || [];
+    iFila    = typeof opts.index === 'number' ? opts.index : -1;
+    serie    = opts.serie || null;
+    aoFechar = opts.onClose || null;
+    aoVivo   = item.kind === 'live';
+
+    /* A escada só existe para canal, e só quando o item veio do
+       catálogo agrupado — um canal achado pela busca também traz
+       as variantes, porque é o mesmo objeto. */
+    grupo   = aoVivo && item.variantes ? item : null;
+    degraus = grupo ? w.Catalog.degraus(grupo) : [];
+    travado = !!item.travada;
+    iDegrau = degrauDe(item.qualidade);
+    iFonte  = 0;
+    zerarMedidas();
 
     layer.classList.remove('hidden');
     errBox.classList.add('hidden');
     spinner.classList.remove('hidden');
-    ui.classList.remove('hidden', 'fade');
 
     w.$('#pl-title').textContent = w.cleanName(item.title);
     w.$('#pl-sub').textContent = item.subtitle || '';
-    w.$('#pl-badge').classList.toggle('hidden', !live);
-    w.$('#pl-dur').textContent = live ? '' : '00:00';
+    w.$('#pl-badge').classList.toggle('hidden', !aoVivo);
+    w.$('#pl-dur').textContent = aoVivo ? '' : '00:00';
     w.$('#pl-cur').textContent = '00:00';
-    setBar(0, 0);
+    barra(0, 0);
 
-    w.Nav.addKeyHandler(keys);
-    scheduleHide();
+    /* Ao vivo não grava progresso, mas grava hábito: é o que
+       leva os canais que você usa para a frente da lista. */
+    if (aoVivo && w.Store.touchChannel) w.Store.touchChannel(item);
 
-    var saved = w.Store.progressOf(item.id);
-    var canResume = !live && saved && !saved.completed &&
-                    saved.position >= w.CFG.RESUME_MIN_SEC &&
-                    (!saved.duration || saved.duration - saved.position > w.CFG.RESUME_TAIL_SEC);
+    montarContexto();
+    fecharOSD();
+    ui.classList.remove('hidden', 'fade');
+    w.Nav.adicionarTecla(teclas);
+    adiarSumico();
 
-    if (canResume && !opts.forceStart) askResume(saved);
-    else load(item.url, opts.startAt || 0);
+    var guardado = w.Store.progressOf(item.id);
+    var podeRetomar = !aoVivo && guardado && !guardado.completed &&
+      guardado.position >= w.CFG.RESUME_MIN_SEC &&
+      (!guardado.duration || guardado.duration - guardado.position > w.CFG.RESUME_TAIL_SEC);
+
+    if (podeRetomar && !opts.forceStart) perguntarRetomada(guardado);
+    else abrirFonte(opts.startAt || 0);
   }
 
-  function askResume(saved) {
-    var overlay = w.$('#resume-layer');
-    var prev = w.Nav.current();
+  function degrauDe(qualidade) {
+    var q = qualidade === '4K' ? 'UHD' : qualidade;
+    for (var i = 0; i < degraus.length; i++) if (degraus[i].rotulo === q) return i;
+    return 0;
+  }
+
+  function perguntarRetomada(guardado) {
+    var caixa = w.$('#resume-layer');
+    var antes = w.Nav.atual();
     w.$('#resume-desc').textContent =
       w.cleanName(item.title) + (item.subtitle ? ' · ' + item.subtitle : '') +
-      ' — você parou em ' + w.fmtTime(saved.position) +
-      (saved.duration ? ' de ' + w.fmtTime(saved.duration) : '') + '.';
-    overlay.classList.remove('hidden');
-    w.Nav.setScope(overlay);
+      ' — você parou em ' + w.fmtTime(guardado.position) +
+      (guardado.duration ? ' de ' + w.fmtTime(guardado.duration) : '') + '.';
+    caixa.classList.remove('hidden');
+    w.Nav.definirEscopo(caixa);
 
-    function done(from) {
-      overlay.classList.add('hidden');
-      w.Nav.clearScope(prev);
+    function fim(de) {
+      caixa.classList.add('hidden');
+      w.Nav.limparEscopo(antes);
       w.$('#resume-yes').onclick = null;
       w.$('#resume-no').onclick = null;
-      load(item.url, from);
+      abrirFonte(de);
     }
-    w.$('#resume-yes').onclick = function () { done(Math.max(0, saved.position - 5)); };
-    w.$('#resume-no').onclick  = function () { done(0); };
+    w.$('#resume-yes').onclick = function () { fim(Math.max(0, guardado.position - 5)); };
+    w.$('#resume-no').onclick  = function () { fim(0); };
   }
 
-  /* ---------------------------------------------------------
-     Carregamento da midia
-     --------------------------------------------------------- */
-  function nativeCanPlay(url) {
+  /* -----------------------------------------------------------
+     Carregamento
+     ----------------------------------------------------------- */
+  function urlAtual() {
+    if (!grupo || !degraus[iDegrau]) return item.url;
+    var d = degraus[iDegrau];
+    var v = d.fontes[iFonte % d.fontes.length];
+    return w.Xtream.urlAoVivo(v.streamId);
+  }
+
+  function nativoTocaria(url) {
     if (/\.m3u8(\?|$)/i.test(url)) {
       var t = video.canPlayType('application/vnd.apple.mpegurl') ||
               video.canPlayType('application/x-mpegURL');
       return t === 'probably' || t === 'maybe';
     }
-    return true;   // mp4/mkv/ts vao direto para o motor da TV
+    return true;   /* mp4/mkv/ts vão direto para o motor da TV */
   }
 
-  function load(url, from) {
-    startAt = from || 0;
-    detach();
+  function abrirFonte(de) {
+    comecarEm = de || 0;
+    desligar();                      /* max_connections: 1 — sempre fecha antes */
     spinner.classList.remove('hidden');
 
-    /* O elemento <video> nao passa por CORS, entao vai sempre direto. */
-    var src = url;
+    var url = urlAtual();
 
-    if (nativeCanPlay(url)) {
-      video.src = src;
+    if (nativoTocaria(url)) {
+      video.src = url;
       video.load();
     } else if (w.Hls && w.Hls.isSupported()) {
       hls = new w.Hls({
-        maxBufferLength: live ? 12 : 30,
+        maxBufferLength: aoVivo ? 12 : 30,
         liveSyncDurationCount: 3,
         manifestLoadingTimeOut: 15000,
         fragLoadingTimeOut: 30000
       });
-      hls.on(w.Hls.Events.ERROR, function (e, data) {
-        if (!data || !data.fatal) return;
-        if (data.type === w.Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); return; }
-        if (data.type === w.Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
-        fail('O fluxo de vídeo falhou (' + (data.details || 'erro desconhecido') + ').');
+      hls.on(w.Hls.Events.ERROR, function (e, d) {
+        if (!d || !d.fatal) return;
+        if (d.type === w.Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); return; }
+        if (d.type === w.Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
+        falhar('O fluxo de vídeo falhou (' + (d.details || 'erro desconhecido') + ').');
       });
-      hls.loadSource(src);
+      hls.loadSource(url);
       hls.attachMedia(video);
     } else {
-      video.src = src;
+      video.src = url;
       video.load();
     }
 
     var p = video.play();
     if (p && p.catch) p.catch(function () { /* autoplay bloqueado no navegador */ });
-    startSaving();
+
+    abriuEm = Date.now();
+    estavelDesde = abriuEm;
+    parouEm = 0; ultimoTempo = -1;
+    comecarASalvar();
+    atualizarContexto();
   }
 
-  function detach() {
-    stopSaving();
+  /* Encerra de verdade: solta a conexão com o servidor. Com uma
+     transmissão por vez, deixar o <video> segurando o socket faz
+     a próxima abertura ser recusada. */
+  function desligar() {
+    pararDeSalvar();
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
     try { video.pause(); } catch (e) {}
     try { video.removeAttribute('src'); video.load(); } catch (e) {}
   }
 
-  /* ---------------------------------------------------------
-     Eventos de reproducao
-     --------------------------------------------------------- */
-  function onMeta() {
+  /* -----------------------------------------------------------
+     Eventos
+     ----------------------------------------------------------- */
+  function aoTerMeta() {
     spinner.classList.add('hidden');
-    if (startAt > 0 && isFinite(video.duration) && video.duration > startAt) {
-      try { video.currentTime = startAt; } catch (e) {}
+    if (comecarEm > 0 && isFinite(video.duration) && video.duration > comecarEm) {
+      try { video.currentTime = comecarEm; } catch (e) {}
     }
-    if (!live && isFinite(video.duration)) {
+    if (!aoVivo && isFinite(video.duration)) {
       w.$('#pl-dur').textContent = w.fmtTime(video.duration);
     }
   }
 
-  function onTick() {
-    if (live || !isFinite(video.duration) || !video.duration) {
-      w.$('#pl-cur').textContent = w.fmtTime(video.currentTime);
+  function aoAndar() {
+    /* Enquanto você arrasta, quem manda na barra é o arraste.
+       Sem esta guarda o `timeupdate` reescrevia a posição a cada
+       quarto de segundo e a barra piscava entre onde o vídeo está
+       e para onde você está indo — a oscilação que você viu. */
+    if (arrastando) { conferirEscada(); return; }
+
+    w.$('#pl-cur').textContent = w.fmtTime(video.currentTime);
+    if (!aoVivo && isFinite(video.duration) && video.duration) {
+      barra(video.currentTime / video.duration, null);
+    }
+    conferirFim(false);
+    conferirEscada();
+  }
+
+  function aoBufferizar() {
+    if (arrastando) return;
+    if (!video.buffered || !video.buffered.length || !isFinite(video.duration)) return;
+    var fim = video.buffered.end(video.buffered.length - 1);
+    barra(null, fim / video.duration);
+  }
+
+  function barra(preenche, buffer) {
+    if (preenche != null)
+      w.$('#pl-fill').style.width = Math.min(100, Math.max(0, preenche * 100)) + '%';
+    if (buffer != null)
+      w.$('#pl-buf').style.width = Math.min(100, Math.max(0, buffer * 100)) + '%';
+  }
+
+  /* -----------------------------------------------------------
+     O FIM DO CONTEÚDO — estado derivado
+     -----------------------------------------------------------
+     Duas condições, e as duas precisam valer:
+
+       a) já passou de COMPLETED_RATIO da duração;
+       b) o relógio parou de andar há mais de 1,5 s sem que o
+          vídeo esteja pausado.
+
+     A (a) sozinha não serve: faltando 5% ainda há vídeo. A (b)
+     sozinha também não: um engasgo no meio do filme trava o
+     relógio e não é fim de nada.
+
+     Juntas, pegam o caso que o `ended` deixava passar — o que
+     fazia o episódio "simplesmente parar tudo".
+     ----------------------------------------------------------- */
+  function conferirFim(veioDoEvento) {
+    if (aoVivo || !item) return;
+    var dur = isFinite(video.duration) ? video.duration : 0;
+    var pos = video.currentTime || 0;
+    if (!dur) return;
+
+    var perto = pos / dur >= w.CFG.COMPLETED_RATIO;
+
+    if (!veioDoEvento) {
+      if (video.paused) { parouEm = 0; ultimoTempo = pos; return; }
+      if (Math.abs(pos - ultimoTempo) < 0.05) {
+        if (!parouEm) parouEm = Date.now();
+      } else {
+        parouEm = 0; ultimoTempo = pos;
+      }
+      if (!perto || !parouEm || Date.now() - parouEm < 1500) return;
+    } else if (!perto) {
+      /* `ended` cedo demais é sinal de arquivo truncado, não de
+         episódio terminado. Não avança sozinho nisso. */
       return;
     }
-    var pct = video.currentTime / video.duration;
-    setBar(pct, null);
-    w.$('#pl-cur').textContent = w.fmtTime(video.currentTime);
+
+    gravar(true);
+    proximoDaFila(1, true);
   }
 
-  function onBuffer() {
-    if (!video.buffered || !video.buffered.length || !isFinite(video.duration)) return;
-    var end = video.buffered.end(video.buffered.length - 1);
-    setBar(null, end / video.duration);
+  /* -----------------------------------------------------------
+     A ESCADA DE QUALIDADE
+     -----------------------------------------------------------
+     Regra de descida, na ordem: outra FONTE do mesmo degrau
+     primeiro; só quando as fontes acabam é que se perde
+     resolução. A sonda mostrou que a lista tem canais com duas
+     fontes na mesma qualidade — servidores diferentes — e trocar
+     de servidor é a correção mais barata que existe.
+     ----------------------------------------------------------- */
+  function comecouAEngasgar() {
+    spinner.classList.remove('hidden');
+    travadas.push({ em: Date.now(), ms: 0, aberta: true });
+  }
+  function terminouDeEngasgar() {
+    var t = travadas[travadas.length - 1];
+    if (t && t.aberta) { t.aberta = false; t.ms = Date.now() - t.em; }
+  }
+  function zerarMedidas() {
+    travadas = []; trocouEm = 0; esperaSubida = SUBIR_MS;
   }
 
-  function setBar(fill, buf) {
-    if (fill !== null && fill !== undefined)
-      w.$('#pl-fill').style.width = Math.min(100, Math.max(0, fill * 100)) + '%';
-    if (buf !== null && buf !== undefined)
-      w.$('#pl-buf').style.width = Math.min(100, Math.max(0, buf * 100)) + '%';
+  function msTravadosNaJanela() {
+    var agora = Date.now(), total = 0;
+    travadas = travadas.filter(function (t) { return agora - t.em < JANELA_MS; });
+    travadas.forEach(function (t) { total += t.aberta ? (agora - t.em) : t.ms; });
+    return total;
   }
 
-  function onEnded() {
-    save(true);
-    if (queue.length && qIndex >= 0 && qIndex + 1 < queue.length) {
-      qIndex++;
-      var nxt = queue[qIndex];
-      w.toast('A seguir: ' + w.cleanName(nxt.title), 3000);
-      item = nxt;
-      live = nxt.kind === 'live';
-      w.$('#pl-title').textContent = w.cleanName(nxt.title);
-      w.$('#pl-sub').textContent = nxt.subtitle || '';
-      load(nxt.url, 0);
-      showUI();
-    } else {
-      w.Player.close();
+  function temOutraFonte() {
+    var d = degraus[iDegrau];
+    return !!(d && d.fontes.length > 1 && iFonte < d.fontes.length - 1);
+  }
+
+  function conferirEscada() {
+    if (!aoVivo || travado) return;
+    if (degraus.length < 2 && !temOutraFonte()) return;
+
+    var agora = Date.now();
+    if (agora - abriuEm < CARENCIA_MS) return;
+    if (trocouEm && agora - trocouEm < INTERVALO_MS) return;
+
+    if (msTravadosNaJanela() > TRAVA_TOTAL_MS) {
+      estavelDesde = agora;
+      if (temOutraFonte()) {
+        iFonte++;
+        w.toast('Conexão engasgou — tentando outra fonte do mesmo ' +
+                degraus[iDegrau].rotulo + '.', 3500);
+      } else if (iDegrau < degraus.length - 1) {
+        iDegrau++; iFonte = 0;
+        w.toast('Conexão engasgou — mudei para ' + degraus[iDegrau].rotulo + '.', 3500);
+      } else {
+        return;                     /* já está no degrau mais baixo */
+      }
+      trocouEm = agora;
+      travadas = [];
+      abrirFonte(0);
+      return;
+    }
+
+    /* Subir de volta, com recuo progressivo: um canal cronicamente
+       instável ficaria pulando de qualidade a cada minuto, e o
+       corte da troca incomoda mais que a resolução menor. */
+    if (iDegrau > 0 && agora - estavelDesde > esperaSubida) {
+      iDegrau--; iFonte = 0;
+      estavelDesde = agora; trocouEm = agora;
+      esperaSubida = Math.min(TETO_ESPERA_MS, esperaSubida * 3);
+      travadas = [];
+      abrirFonte(0);
     }
   }
 
-  function describeMediaError() {
+  /* Escolha manual: fixa e desliga o automático até trocar de canal. */
+  function fixarDegrau(i) {
+    iDegrau = i; iFonte = 0; travado = true;
+    zerarMedidas();
+    w.toast('Fixado em ' + degraus[i].rotulo + ' até você trocar de canal.', 3500);
+    abrirFonte(0);
+    atualizarContexto();
+  }
+
+  function descreverErro() {
     var e = video.error;
     if (!e) return 'O vídeo parou sem dizer o motivo.';
     switch (e.code) {
@@ -1890,35 +3767,41 @@ window.CFG = {
     }
   }
 
-  function fail(msg) {
-    /* Canais ao vivo: tenta o outro formato (.ts <-> .m3u8) antes de desistir. */
-    if (live && !triedAlternate && item.streamId && w.Catalog.mode() === 'xtream') {
-      triedAlternate = true;
-      w.toast('Tentando outro formato deste canal…');
-      load(w.Xtream.liveUrlAlt(item.streamId), 0);
-      return;
+  function falhar(msg) {
+    /* Antes de mostrar erro, a escada tem uma carta na manga:
+       outra fonte, ou um degrau abaixo. */
+    if (aoVivo && !travado) {
+      if (temOutraFonte()) { iFonte++; abrirFonte(0); return; }
+      if (iDegrau < degraus.length - 1) { iDegrau++; iFonte = 0; abrirFonte(0); return; }
     }
     spinner.classList.add('hidden');
     errMsg.textContent = msg;
     errBox.classList.remove('hidden');
-    showUI();
-    w.Nav.setScope(errBox);
+    ui.classList.remove('fade');
+    w.Nav.definirEscopo(errBox);
   }
 
-  /* ---------------------------------------------------------
-     Gravacao de progresso
-     --------------------------------------------------------- */
-  function startSaving() {
-    stopSaving();
-    saveTimer = setInterval(function () { save(false); }, w.CFG.SAVE_EVERY_MS);
+  /* -----------------------------------------------------------
+     Progresso
+     ----------------------------------------------------------- */
+  function comecarASalvar() {
+    pararDeSalvar();
+    salvar = setInterval(function () { gravar(false); }, w.CFG.SAVE_EVERY_MS);
   }
-  function stopSaving() { if (saveTimer) { clearInterval(saveTimer); saveTimer = null; } }
+  function pararDeSalvar() { if (salvar) { clearInterval(salvar); salvar = null; } }
 
-  function save(force) {
+  function gravar(forcar) {
     if (!item) return;
+
+    /* Ao vivo não tem "onde parei": quando você volta, o programa
+       é outro. E conteúdo adulto não é gravado em lugar nenhum —
+       nem aqui, nem na nuvem, nem como recente. */
+    if (aoVivo) return;
+    if (w.Catalog.itemAdulto && w.Catalog.itemAdulto(item)) return;
+
     var pos = video.currentTime || 0;
     var dur = isFinite(video.duration) ? video.duration : 0;
-    if (!force && !live && pos < 5) return;   // ignora os primeiros segundos
+    if (!forcar && pos < 5) return;
 
     w.Store.saveProgress({
       id: item.id,
@@ -1927,112 +3810,557 @@ window.CFG = {
       subtitle: item.subtitle || '',
       poster: item.poster || '',
       stream_url: item.url || '',
-      position: live ? 0 : pos,
-      duration: live ? 0 : dur,
-      completed: live ? false : (dur > 0 && pos / dur >= w.CFG.COMPLETED_RATIO),
-      series_id: item.seriesId || '',
-      series_title: item.seriesTitle || '',
-      season: item.season || 0,
-      episode: item.episode || 0
+      position: pos,
+      duration: dur,
+      completed: dur > 0 && pos / dur >= w.CFG.COMPLETED_RATIO,
+      series_id: item.seriesId || (serie && serie.seriesId) || '',
+      series_title: item.seriesTitle || (serie && serie.title) || '',
+      season: item.temporada || item.season || 0,
+      episode: item.episodio || item.episode || 0
     });
   }
 
-  /* ---------------------------------------------------------
-     Interface e teclas
-     --------------------------------------------------------- */
-  function showUI() {
-    ui.classList.remove('fade');
-    scheduleHide();
+  /* -----------------------------------------------------------
+     OSD
+     -----------------------------------------------------------
+     ↑ e ↓ ABREM o menu, sem pausar. Com ele aberto, trocam de
+     linha. Era o que faltava: antes ↑/↓ pulavam 5 minutos, e não
+     havia como chegar a coisa nenhuma.
+     ----------------------------------------------------------- */
+  function mostrarOSD() {
+    ui.classList.remove('hidden', 'fade');
+    adiarSumico();
   }
-  function scheduleHide() {
-    clearTimeout(hideTimer);
-    hideTimer = setTimeout(function () {
+
+  function abrirOSD() {
+    if (osdAberto) return;
+    osdAberto = true;
+    ui.classList.remove('hidden', 'fade');
+    ui.classList.add('osd-on');
+    /* Em filme e episódio o menu abre na LINHA DO TEMPO: é o
+       controle mais pedido, e ficar a uma tecla dele seria um
+       degrau a mais sem motivo. Ao vivo abre no transporte,
+       porque não há linha do tempo para arrastar. */
+    w.Nav.entrar(aoVivo ? 'transport' : 'timeline');
+    comecarAMedir();
+    adiarSumico();
+  }
+
+  function fecharOSD() {
+    osdAberto = false;
+    if (ui) ui.classList.remove('osd-on');
+    if (painel) {
+      painel.classList.add('hidden');
+      painel.removeAttribute('data-region');
+    }
+    if (ui) ui.classList.remove('com-painel');
+    pararDeMedir();
+  }
+
+  function adiarSumico() {
+    clearTimeout(esconder);
+    esconder = setTimeout(function () {
       if (!errBox.classList.contains('hidden')) return;
+      if (!painel.classList.contains('hidden')) return;
       ui.classList.add('fade');
+      fecharOSD();
     }, w.CFG.UI_HIDE_MS);
   }
 
-  function togglePlay() {
-    if (video.paused) { video.play(); w.toast('Reproduzindo'); }
-    else { video.pause(); save(true); w.toast('Pausado'); }
-    showUI();
+  function ligarTransporte() {
+    w.$('#osd-restart').onclick = function () { irPara(0); };
+    w.$('#osd-back10').onclick  = function () { pularSegundos(-w.CFG.SEEK_SMALL_SEC); };
+    w.$('#osd-fwd10').onclick   = function () { pularSegundos(w.CFG.SEEK_SMALL_SEC); };
+    w.$('#osd-play').onclick    = alternarPausa;
+    w.$('#osd-prev').onclick    = function () { proximoDaFila(-1); };
+    w.$('#osd-next').onclick    = function () { proximoDaFila(1); };
   }
 
-  /* Acumula os pulos das setas e aplica uma vez so, para nao
-     engasgar o buffer quando se aperta a seta varias vezes. */
-  function seekBy(sec) {
-    if (live || !isFinite(video.duration) || !video.duration) return;
-    seeking += sec;
-    var target = Math.max(0, Math.min(video.duration - 1,
-                 (video.currentTime || 0) + seeking));
-    setBar(target / video.duration, null);
-    w.$('#pl-cur').textContent = w.fmtTime(target);
-    showUI();
+  /* Linha de contexto: muda conforme o que está tocando. */
+  function montarContexto() {
+    var ctx = w.$('#osd-context');
+    ctx.innerHTML = '';
 
-    clearTimeout(seekTimer);
-    seekTimer = setTimeout(function () {
-      try { video.currentTime = target; } catch (e) {}
-      seeking = 0;
-    }, 380);
-  }
+    function chip(id, rotulo, ic, acao, ativo) {
+      var b = document.createElement('button');
+      b.className = 'osd-chip' + (ativo ? ' ativo' : '');
+      b.id = id;
+      b.setAttribute('data-focusable', '');
+      b.innerHTML = (ic ? w.icon(ic) : '') + '<span>' + w.esc(rotulo) + '</span>';
+      b.onclick = acao;
+      ctx.appendChild(b);
+      return b;
+    }
 
-  function keys(k) {
-    if (layer.classList.contains('hidden')) return false;
-    if (!errBox.classList.contains('hidden')) return false;   // dialogo de erro navega normal
-    if (!w.$('#resume-layer').classList.contains('hidden')) return false;
-
-    switch (k) {
-      case w.KEY.OK:
-      case w.KEY.PLAYPAUSE: togglePlay(); return true;
-      case w.KEY.PLAY:  video.play();  showUI(); return true;
-      case w.KEY.PAUSE: video.pause(); save(true); showUI(); return true;
-      case w.KEY.STOP:
-      case w.KEY.BACK:  w.Player.close(); return true;
-      case w.KEY.LEFT:  seekBy(-w.CFG.SEEK_SMALL_SEC); return true;
-      case w.KEY.RIGHT: seekBy( w.CFG.SEEK_SMALL_SEC); return true;
-      case w.KEY.RW:    seekBy(-w.CFG.SEEK_BIG_SEC);   return true;
-      case w.KEY.FF:    seekBy( w.CFG.SEEK_BIG_SEC);   return true;
-      case w.KEY.UP:    seekBy( w.CFG.SEEK_BIG_SEC);   return true;
-      case w.KEY.DOWN:  seekBy(-w.CFG.SEEK_BIG_SEC);   return true;
-      case w.KEY.CH_UP:   nextInQueue(1);  return true;
-      case w.KEY.CH_DOWN: nextInQueue(-1); return true;
-      default: showUI(); return false;
+    if (aoVivo) {
+      /* Os degraus daquele canal, o ativo marcado. Escolher fixa.
+         O número entre parênteses é quantas fontes o degrau tem —
+         é a informação que explica por que um "UHD" às vezes
+         se recupera sozinho sem perder resolução. */
+      degraus.forEach(function (d, i) {
+        chip('osd-q-' + i,
+             d.rotulo + (d.fontes.length > 1 ? ' (' + d.fontes.length + ')' : ''),
+             null, function () { fixarDegrau(i); }, i === iDegrau);
+      });
+      if (degraus.length) {
+        chip('osd-auto', travado ? 'Automático desligado' : 'Automático', 'layers',
+             function () {
+               travado = !travado;
+               zerarMedidas();
+               w.toast(travado ? 'Qualidade fixa.' : 'Qualidade automática de volta.');
+               atualizarContexto();
+             }, !travado);
+      }
+      chip('osd-fav', w.Store.isFavorite(item.id) ? 'Nos favoritos' : 'Favoritar', 'star',
+           function () {
+             var agora = w.Store.toggleFavorite(item);
+             w.toast(agora ? '★ nos favoritos' : 'fora dos favoritos');
+             montarContexto();
+             w.Nav.entrar('context');
+           }, w.Store.isFavorite(item.id));
+    } else {
+      if (fila.length > 1) chip('osd-eps', 'Episódios', 'list', abrirListaEpisodios);
+      var alvoFav = serie || item;
+      chip('osd-fav', w.Store.isFavorite(alvoFav.id) ? 'Nos favoritos' : 'Favoritar', 'star',
+           function () {
+             var agora = w.Store.toggleFavorite(alvoFav);
+             w.toast(agora ? '★ nos favoritos' : 'fora dos favoritos');
+             montarContexto();
+             w.Nav.entrar('context');
+           }, w.Store.isFavorite(alvoFav.id));
     }
   }
 
-  function nextInQueue(delta) {
-    if (!queue.length || qIndex < 0) return;
-    var i = qIndex + delta;
-    if (i < 0 || i >= queue.length) return;
-    save(false);
-    qIndex = i;
-    item = queue[i];
-    live = item.kind === 'live';
-    w.$('#pl-title').textContent = w.cleanName(item.title);
-    w.$('#pl-sub').textContent = item.subtitle || '';
-    w.$('#pl-badge').classList.toggle('hidden', !live);
-    triedAlternate = false;
-    load(item.url, 0);
-    showUI();
+  function atualizarContexto() {
+    if (!aoVivo) return;
+    degraus.forEach(function (d, i) {
+      var b = w.$('#osd-q-' + i);
+      if (b) b.classList.toggle('ativo', i === iDegrau);
+    });
+    var a = w.$('#osd-auto');
+    if (a) {
+      a.classList.toggle('ativo', !travado);
+      a.querySelector('span').textContent = travado ? 'Automático desligado' : 'Automático';
+    }
   }
 
-  /* ---------------------------------------------------------
-     API publica
-     --------------------------------------------------------- */
+  /* Painel sobreposto com os episódios. O vídeo continua atrás. */
+  /* -----------------------------------------------------------
+     Painel de episódios
+     -----------------------------------------------------------
+     Duas correções em relação à primeira versão, as duas visíveis
+     na tela:
+
+       · a lista precisa de TRILHO. Sem um elemento com
+         `data-scroll="x"`, o `nav.js` não tem o que deslocar e os
+         episódios além do sexto ficavam fora da tela, sem jeito
+         de alcançar;
+
+       · e precisa dizer a TEMPORADA. A fila é a temporada inteira
+         achatada, então "Episódios" sozinho não localiza ninguém.
+     ----------------------------------------------------------- */
+  function abrirListaEpisodios() {
+    painel.innerHTML = '';
+
+    /* Agrupa a fila por temporada. A fila é a série achatada — sem
+       isto ela vira uma tripa única de 60 episódios, que foi o que
+       você viu. Com o agrupamento, a lista mostra uma temporada de
+       cada vez, e as outras ficam a uma tecla. */
+    var porTemp = {}, ordem = [];
+    fila.forEach(function (ep, i) {
+      var t = ep.temporada || 1;
+      if (!porTemp[t]) { porTemp[t] = []; ordem.push(t); }
+      porTemp[t].push({ ep: ep, i: i });
+    });
+    ordem.sort(function (a, b) { return a - b; });
+    var atualT = (fila[iFila] && fila[iFila].temporada) || ordem[0] || 1;
+
+    var titulo = document.createElement('h3');
+    titulo.textContent = 'Episódios';
+    var conta = document.createElement('span');
+    conta.className = 'osd-conta';
+    conta.textContent = ordem.length > 1
+      ? ordem.length + ' temporadas · ' + fila.length + ' episódios'
+      : fila.length + ' episódios';
+    titulo.appendChild(conta);
+    painel.appendChild(titulo);
+
+    /* Linha das temporadas. Só aparece quando há mais de uma —
+       um seletor com uma opção só é ruído. */
+    var linhaT = document.createElement('div');
+    linhaT.className = 'osd-temps';
+    if (ordem.length > 1) {
+      linhaT.setAttribute('data-region', 'ptemp');
+      linhaT.setAttribute('data-axis', 'x');
+      linhaT.setAttribute('data-enter', '.osd-temp.ativo');
+      linhaT.setAttribute('data-nb-down', 'peps');
+      painel.appendChild(linhaT);
+    }
+
+    var janela = document.createElement('div');
+    janela.className = 'osd-janela';
+    janela.setAttribute('data-region', 'peps');
+    janela.setAttribute('data-axis', 'x');
+    janela.setAttribute('data-enter', '.osd-ep.ativo');
+    if (ordem.length > 1) janela.setAttribute('data-nb-up', 'ptemp');
+    var trilho = document.createElement('div');
+    trilho.className = 'trilho osd-lista';
+    trilho.setAttribute('data-scroll', 'x');
+    janela.appendChild(trilho);
+    painel.appendChild(janela);
+
+    var dica = document.createElement('div');
+    dica.className = 'osd-dica';
+    dica.innerHTML = '<b>▲</b> volta para o player  ·  <b>OK</b> assiste este episódio';
+    painel.appendChild(dica);
+
+    function pintarEpisodios(t) {
+      atualT = t;
+      Array.prototype.slice.call(linhaT.children).forEach(function (b) {
+        b.classList.toggle('ativo', Number(b.getAttribute('data-t')) === t);
+      });
+      trilho.innerHTML = '';
+      (porTemp[t] || []).forEach(function (par) {
+        var b = document.createElement('button');
+        b.className = 'osd-ep' + (par.i === iFila ? ' ativo' : '');
+        b.setAttribute('data-focusable', '');
+        b.innerHTML = '<b>T' + (par.ep.temporada || t) + ' E' +
+                      (par.ep.episodio || (par.i + 1)) + '</b>' +
+                      '<span>' + w.esc(w.cleanName(par.ep.title || '')) + '</span>';
+        b.onclick = function () { fecharPainel(); irParaIndice(par.i); };
+        trilho.appendChild(b);
+      });
+    }
+
+    ordem.forEach(function (t) {
+      var b = document.createElement('button');
+      b.className = 'osd-temp';
+      b.setAttribute('data-focusable', '');
+      b.setAttribute('data-t', t);
+      b.textContent = 'T' + t;
+      b.onclick = function () { pintarEpisodios(t); w.Nav.entrar('peps'); };
+      linhaT.appendChild(b);
+    });
+
+    pintarEpisodios(atualT);
+
+    painel.classList.remove('hidden');
+    ui.classList.add('com-painel');
+    w.Nav.entrar('peps');
+    clearTimeout(esconder);
+  }
+
+  function fecharPainel() {
+    painel.classList.add('hidden');
+    ui.classList.remove('com-painel');
+    painel.removeAttribute('data-region');
+    /* as regiões internas somem com o conteúdo */
+    painel.innerHTML = '';
+    w.Nav.entrar('context');
+    adiarSumico();
+  }
+
+  /* -----------------------------------------------------------
+     Painel de aferição — §4.2-A
+     -----------------------------------------------------------
+     1 Hz, e só enquanto o OSD está aberto. Nada de
+     requestAnimationFrame: medir não pode competir com decodificar.
+     ----------------------------------------------------------- */
+  function comecarAMedir() {
+    pararDeMedir();
+    medir();
+    medidor = setInterval(medir, 1000);
+  }
+  function pararDeMedir() { if (medidor) { clearInterval(medidor); medidor = null; } }
+
+  function medir() {
+    if (!item) return;
+    var decl = (aoVivo && degraus[iDegrau]) ? degraus[iDegrau].rotulo : (item.qualidade || '');
+    var lw = video.videoWidth || 0, lh = video.videoHeight || 0;
+
+    w.$('#afer-decl').textContent = decl ? decl + ' declarado' : 'sem marcador';
+    w.$('#afer-real').textContent = lw && lh ? lw + '×' + lh + ' real' : 'medindo…';
+
+    /* A comparação que denuncia canal mentiroso: "UHD" que chega
+       abaixo de 1440 linhas não é UHD coisa nenhuma. */
+    var prometeuAlto = /UHD|4K|2160/.test(decl);
+    w.$('#afer').querySelector('.afer-l1')
+      .classList.toggle('mentiu', prometeuAlto && lh > 0 && lh < 1440);
+
+    var d = degraus[iDegrau];
+    w.$('#afer-fonte').textContent = (d && d.fontes.length > 1)
+      ? 'fonte ' + ((iFonte % d.fontes.length) + 1) + ' de ' + d.fontes.length
+      : (travado ? 'fixo' : 'automático');
+
+    var buf = 0;
+    try {
+      if (video.buffered && video.buffered.length) {
+        buf = Math.max(0, video.buffered.end(video.buffered.length - 1) - video.currentTime);
+      }
+    } catch (e) {}
+    w.$('#afer-buf').textContent = 'buffer ' + Math.round(buf) + 's';
+
+    var q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+    var perdidos = q ? q.droppedVideoFrames : (video.webkitDroppedFrameCount || 0);
+    var total = q ? q.totalVideoFrames : 0;
+    w.$('#afer-quedas').textContent = total
+      ? perdidos + ' quedas em ' + total
+      : perdidos + ' quedas';
+    w.$('#afer').querySelector('.afer-l2')
+      .classList.toggle('ruim', total > 0 && perdidos / total > 0.02);
+
+    w.$('#afer-hora').textContent = w.horaAgora();
+  }
+
+  /* -----------------------------------------------------------
+     Transporte
+     ----------------------------------------------------------- */
+  function alternarPausa() {
+    if (video.paused) video.play();
+    else { video.pause(); gravar(true); }
+    var b = w.$('#osd-play');
+    if (b) b.innerHTML = w.icon(video.paused ? 'play' : 'pause');
+    mostrarOSD();
+  }
+
+  function irPara(seg) {
+    if (aoVivo || !isFinite(video.duration)) return;
+    try { video.currentTime = Math.max(0, Math.min(video.duration - 1, seg)); } catch (e) {}
+    mostrarOSD();
+  }
+
+  /* -----------------------------------------------------------
+     ARRASTAR A LINHA DO TEMPO
+     -----------------------------------------------------------
+     Isto não existia direito, e você sentiu: com o menu aberto,
+     ←/→ pertenciam à linha de botões; com ele fechado, davam
+     saltos fixos de 10 s que não davam para acompanhar. Não
+     havia como percorrer um filme.
+
+     Agora são duas coisas distintas:
+
+       · com a LINHA DO TEMPO em foco, ←/→ arrastam um cursor
+         fantasma. O vídeo não sai do lugar enquanto você
+         arrasta — só quando você para ou confirma com OK. Isso
+         importa muito aqui: cada `currentTime` novo derruba o
+         buffer e reabre a conexão, e com `max_connections: 1`
+         reabrir dez vezes seguidas é a receita para o servidor
+         recusar;
+
+       · o passo ACELERA enquanto você segura. Uma tecla isolada
+         anda 10 s; segurando, vira 30, 60, 120 e 300 s. Sem
+         isso, atravessar um filme de duas horas custaria 720
+         toques.
+     ----------------------------------------------------------- */
+  var PASSOS = [10, 30, 60, 120, 300];
+
+  function passoAtual() {
+    var agora = Date.now();
+    /* toques em sequência (menos de 400 ms) sobem o degrau; uma
+       pausa devolve o passo curto, que é o de precisão */
+    if (agora - ultimoToque < 400) nivelPasso = Math.min(PASSOS.length - 1, nivelPasso + 1);
+    else nivelPasso = 0;
+    ultimoToque = agora;
+    return PASSOS[nivelPasso];
+  }
+
+  function arrastar(direcao) {
+    if (aoVivo || !isFinite(video.duration) || !video.duration) return;
+    if (!arrastando) { arrastando = true; alvoArraste = video.currentTime || 0; }
+
+    var passo = passoAtual();
+    alvoArraste = Math.max(0, Math.min(video.duration - 1, alvoArraste + direcao * passo));
+    pintarArraste(passo);
+    mostrarOSD();
+
+    clearTimeout(relogioPulo);
+    relogioPulo = setTimeout(aplicarArraste, 700);
+  }
+
+  function pintarArraste(passo) {
+    var frac = alvoArraste / video.duration;
+    var f = w.$('#pl-fantasma');
+    f.classList.remove('hidden');
+    f.style.left = Math.min(100, Math.max(0, frac * 100)) + '%';
+    f.setAttribute('data-t', w.fmtTime(alvoArraste) +
+      (passo > 10 ? '  ·  ' + passo + 's' : ''));
+    w.$('#pl-cur').textContent = w.fmtTime(alvoArraste);
+    w.$('#pl-bar').classList.add('arrastando');
+  }
+
+  function aplicarArraste() {
+    if (!arrastando) return;
+    arrastando = false;
+    nivelPasso = 0;
+    clearTimeout(relogioPulo);
+    w.$('#pl-fantasma').classList.add('hidden');
+    w.$('#pl-bar').classList.remove('arrastando');
+    try { video.currentTime = alvoArraste; } catch (e) {}
+    barra(alvoArraste / video.duration, null);
+  }
+
+  /* Salto rápido, sem entrar no modo de arraste — é o que ←/→
+     fazem com o menu fechado. */
+  function pularSegundos(seg) {
+    if (aoVivo || !isFinite(video.duration) || !video.duration) return;
+    pulo += seg;
+    var alvo = Math.max(0, Math.min(video.duration - 1, (video.currentTime || 0) + pulo));
+    barra(alvo / video.duration, null);
+    w.$('#pl-cur').textContent = w.fmtTime(alvo);
+    mostrarOSD();
+
+    clearTimeout(relogioPulo);
+    relogioPulo = setTimeout(function () {
+      try { video.currentTime = alvo; } catch (e) {}
+      pulo = 0;
+    }, 380);
+  }
+
+  function irParaIndice(i) {
+    if (i < 0 || i >= fila.length) return;
+    gravar(false);
+    iFila = i;
+    item = fila[i];
+    aoVivo = item.kind === 'live';
+    w.$('#pl-title').textContent = w.cleanName(item.title);
+    w.$('#pl-sub').textContent = item.subtitle || '';
+    w.$('#pl-badge').classList.toggle('hidden', !aoVivo);
+    montarContexto();
+    abrirFonte(0);
+    mostrarOSD();
+  }
+
+  function proximoDaFila(passo, automatico) {
+    if (!fila.length || iFila < 0) { if (automatico) w.Player.close(); return; }
+    var i = iFila + passo;
+    if (i < 0 || i >= fila.length) { if (automatico) w.Player.close(); return; }
+    if (automatico) w.toast('A seguir: ' + w.cleanName(fila[i].title), 4000);
+    irParaIndice(i);
+  }
+
+  /* -----------------------------------------------------------
+     Teclas
+     ----------------------------------------------------------- */
+  function teclas(k) {
+    if (!layer || layer.classList.contains('hidden')) return false;
+    if (!errBox.classList.contains('hidden')) return false;
+    if (!w.$('#resume-layer').classList.contains('hidden')) return false;
+
+    /* Com o painel de episódios aberto, a navegação é dele. */
+    if (!painel.classList.contains('hidden')) {
+      /* Sair da lista de episódios: Voltar, ou ↑, que é o
+         movimento intuitivo — a lista está por cima do player,
+         então subir é sair dela. Sem isto a pessoa ficava presa
+         percorrendo episódios sem caminho de volta. */
+      if (k === w.KEY.BACK || k === w.KEY.ESC) { fecharPainel(); return true; }
+
+      /* ↑ sobe um nível de cada vez: dos episódios para as
+         temporadas, e das temporadas para o player. Se não houver
+         seletor de temporada, ↑ já sai direto. */
+      if (k === w.KEY.UP) {
+        var noTopo = w.Nav.atual() && w.Nav.atual().classList.contains('osd-temp');
+        var temSeletor = !!painel.querySelector('.osd-temp');
+        if (noTopo || !temSeletor) { fecharPainel(); return true; }
+        return false;                       /* nav leva aos botões de temporada */
+      }
+      adiarSumico();
+      return false;
+    }
+
+    if (osdAberto) {
+      if (k === w.KEY.BACK || k === w.KEY.ESC) {
+        if (arrastando) { aplicarArraste(); return true; }
+        fecharOSD(); return true;
+      }
+
+      /* Com a linha do tempo em foco, ←/→ são dela — não da
+         navegação. É o que devolve o controle do filme. */
+      var naLinha = w.Nav.atual() && w.Nav.atual().id === 'pl-bar';
+      if (naLinha && (k === w.KEY.LEFT || k === w.KEY.RIGHT)) {
+        arrastar(k === w.KEY.RIGHT ? 1 : -1);
+        return true;
+      }
+      if (naLinha && k === w.KEY.OK) { aplicarArraste(); return true; }
+      if (naLinha && (k === w.KEY.UP || k === w.KEY.DOWN) && arrastando) aplicarArraste();
+
+      if (k === w.KEY.UP || k === w.KEY.DOWN || k === w.KEY.LEFT ||
+          k === w.KEY.RIGHT || k === w.KEY.OK) {
+        adiarSumico();
+        return false;                                   /* navegação normal do OSD */
+      }
+    } else {
+      switch (k) {
+        case w.KEY.UP:
+        case w.KEY.DOWN: abrirOSD(); return true;        /* ABRE o menu, não pula */
+        case w.KEY.OK:
+        case w.KEY.PLAYPAUSE: alternarPausa(); return true;
+        case w.KEY.LEFT:  pularSegundos(-w.CFG.SEEK_SMALL_SEC); return true;
+        case w.KEY.RIGHT: pularSegundos(w.CFG.SEEK_SMALL_SEC);  return true;
+        default: break;
+      }
+    }
+
+    switch (k) {
+      case w.KEY.PLAY:  video.play();  mostrarOSD(); return true;
+      case w.KEY.PAUSE: video.pause(); gravar(true); mostrarOSD(); return true;
+      case w.KEY.STOP:
+      case w.KEY.BACK:  w.Player.close(); return true;
+      case w.KEY.RW:    pularSegundos(-w.CFG.SEEK_BIG_SEC); return true;
+      case w.KEY.FF:    pularSegundos(w.CFG.SEEK_BIG_SEC);  return true;
+      case w.KEY.CH_UP:   proximoDaFila(1);  return true;
+      case w.KEY.CH_DOWN: proximoDaFila(-1); return true;
+      default: mostrarOSD(); return false;
+    }
+  }
+
+  /* -----------------------------------------------------------
+     API
+     ----------------------------------------------------------- */
   w.Player = {
-    open: open,
-    isOpen: function () { return layer && !layer.classList.contains('hidden'); },
+    open: abrir,
+
+    /* Booleano de verdade: antes de o player ser usado uma vez,
+       `layer` é indefinido e isto devolvia `undefined` — que é
+       falso o bastante para um `if`, e veneno para um teste. */
+    isOpen: function () { return !!(layer && !layer.classList.contains('hidden')); },
+
+    /* Expostos para o banco de provas dirigir o player sem
+       depender de vídeo real tocando em tempo real. */
+    _estado: function () {
+      return {
+        aoVivo: aoVivo, osd: osdAberto, travado: travado,
+        degrau: degraus[iDegrau] ? degraus[iDegrau].rotulo : null,
+        degraus: degraus.map(function (d) { return d.rotulo; }),
+        fontes: degraus[iDegrau] ? degraus[iDegrau].fontes.length : 0,
+        iFonte: iFonte, iFila: iFila, titulo: item ? item.title : null
+      };
+    },
+    _engasgar: function (ms) {
+      abriuEm = Date.now() - CARENCIA_MS - 1000;
+      trocouEm = 0;
+      travadas.push({ em: Date.now() - ms, ms: ms, aberta: false });
+      conferirEscada();
+    },
+    _fixar: fixarDegrau,
+    _arraste: function () {
+      return { ativo: arrastando, alvo: Math.round(alvoArraste), passo: PASSOS[nivelPasso] };
+    },
+    _abrirOSD: abrirOSD,
 
     close: function () {
       if (!layer || layer.classList.contains('hidden')) return;
-      save(true);
-      detach();
-      clearTimeout(hideTimer);
-      w.Nav.removeKeyHandler(keys);
-      if (w.Nav.scoped() === errBox) w.Nav.clearScope();
+      if (arrastando) { arrastando = false; }
+      gravar(true);
+      desligar();
+      clearTimeout(esconder);
+      fecharOSD();
+      w.Nav.removerTecla(teclas);
+      if (w.Nav.escopo() === errBox) w.Nav.limparEscopo();
       errBox.classList.add('hidden');
       layer.classList.add('hidden');
-      var cb = onClose; onClose = null; item = null; queue = []; qIndex = -1;
+      var cb = aoFechar;
+      aoFechar = null; item = null; fila = []; iFila = -1; serie = null;
+      grupo = null; degraus = []; travado = false;
       if (cb) cb();
     }
   };
@@ -2042,1173 +4370,1253 @@ window.CFG = {
 
 /* ===== views.js ================================================== */
 /* =========================================================
-   Telas do aplicativo.
-   Cada função monta uma tela dentro de #stage e devolve uma
-   Promise que resolve quando o conteúdo essencial já apareceu.
+   AS TELAS
+   =========================================================
+   Reescritas sobre três coisas que não existiam antes: o motor
+   de regiões (`nav.js`), a virtualização (`virt.js`) e a camada
+   de dados por POST com cache granular (`catalog.js`).
+
+   O defeito que motivou tudo isto, nas suas palavras: "as
+   colunas visuais do sidebar era na realidade tudo uma única
+   grande coluna". A causa principal era o motor antigo, mas as
+   telas ajudavam — nenhuma declarava onde uma região terminava
+   e a outra começava, então não havia o que respeitar.
+
+   Aqui toda tela declara suas regiões e seus vizinhos.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  /* ---------------------------------------------------------
-     Carregamento preguiçoso de imagens
-     --------------------------------------------------------- */
-  var io = null;
-  function lazyInit() {
-    if (io || !w.IntersectionObserver) return;
-    io = new w.IntersectionObserver(function (entries) {
-      entries.forEach(function (e) {
-        if (!e.isIntersecting) return;
-        var img = e.target;
-        io.unobserve(img);
-        var src = img.getAttribute('data-src');
-        if (src) img.src = src;
-      });
-    }, { rootMargin: '300px 600px' });
+  var el = w.el;
+
+  /* A grade calcula as próprias colunas a partir da largura da
+     janela — ver o comentário no `virt.js`. Números fixos aqui
+     foram o motivo de a grade vazar pela direita. */
+  var COLUNAS = 'auto';
+
+  /* -----------------------------------------------------------
+     Abrir conteúdo
+     ----------------------------------------------------------- */
+  function tocar(item, opts) { w.Player.open(item, opts || {}); }
+
+  /* -----------------------------------------------------------
+     Tomar o foco só quando ele é nosso
+     -----------------------------------------------------------
+     As telas montam em duas etapas: o esqueleto entra na hora, o
+     conteúdo chega depois da rede. Se a segunda etapa chamasse
+     `Nav.entrar` sem perguntar, ela arrancaria o foco de onde a
+     pessoa já tivesse levado nesse meio tempo — quase sempre o
+     menu lateral, que é o primeiro lugar para onde se anda.
+
+     Regra: só assume o foco se ninguém tem, se quem tinha saiu do
+     documento (é o caso quando o palco é trocado), ou se o foco
+     ainda está dentro do palco. Foco no menu é do menu.
+     ----------------------------------------------------------- */
+  function podeAssumir() {
+    var atual = w.Nav.atual();
+    return !(atual && document.body.contains(atual) && !atual.closest('#stage'));
   }
-  function lazy(img) {
-    lazyInit();
-    if (io) io.observe(img);
-    else img.src = img.getAttribute('data-src') || '';
+  function assumirFoco(regiao) {
+    return podeAssumir() ? w.Nav.entrar(regiao) : false;
+  }
+  function assumirFocoEm(elemento) {
+    return (elemento && podeAssumir()) ? w.Nav.focar(elemento) : false;
   }
 
-  /* ---------------------------------------------------------
-     Blocos reutilizáveis
-     --------------------------------------------------------- */
-  function screen(cls) {
-    var stage = w.$('#stage');
-    w.clear(stage);
-    var s = w.el('div', { class: 'screen enter ' + (cls || '') });
-    stage.appendChild(s);
-    return s;
+  function abrir(item) {
+    if (!item) return;
+    if (item.kind === 'live')   return tocar(item);
+    if (item.kind === 'movie')  return w.App.go('movie-detail',  { id: item.streamId, item: item });
+    if (item.kind === 'series') return w.App.go('series-detail', { id: item.seriesId, item: item });
+    return tocar(item);
   }
 
-  function scroller(parent) {
-    var wrap = w.el('div', { class: 'screen-scroll' });
-    var inner = w.el('div', { class: 'screen-inner', 'data-scroll': 'y' });
-    wrap.appendChild(inner);
-    parent.appendChild(wrap);
-    return inner;
-  }
+  /* -----------------------------------------------------------
+     Coluna de categorias
+     -----------------------------------------------------------
+     Comum a Ao Vivo, Filmes e Séries. A categoria é carregada
+     quando o foco DESCANSA nela — não a cada tecla. Sem essa
+     espera, atravessar 50 categorias dispara 50 carregamentos,
+     e era isso que fazia a lista engasgar ao rolar rápido.
+     ----------------------------------------------------------- */
+  var esperaCat = null;
+  var ESPERA = 320;
 
-  function thumb(item, shape) {
-    var shell = w.el('div', { class: 'shell' });
-    var url = item.poster || '';
-    if (url) {
-      var img = w.el('img', {
-        class: 'thumb' + (shape === 'logo' ? ' contain' : ''),
-        'data-src': url, alt: ''
-      });
-      img.onerror = function () {
-        img.style.display = 'none';
-        shell.appendChild(w.el('div', { class: 'card-fallback', text: w.initials(item.title) }));
-      };
-      shell.appendChild(img);
-      lazy(img);
-    } else {
-      shell.appendChild(w.el('div', { class: 'card-fallback', text: w.initials(item.title) }));
-    }
-    return shell;
-  }
+  /* Id reservado da pasta de mentira. Começa com dois sublinhados
+     porque nenhum category_id do provedor é assim. */
+  var FAVORITOS = '__favoritos__';
 
-  /* Um card. shape: poster | wide | logo */
-  function card(item, opts) {
-    opts = opts || {};
-    var shape = opts.shape || 'poster';
-    var b = w.el('button', {
-      class: 'card card-' + shape + (opts.rank ? ' card-rank' : ''),
-      'data-focusable': true
+  /* "Todos": a pasta que faltava. Entrar em Filmes e cair numa
+     pasta arbitrária do provedor é uma escolha que ninguém pediu;
+     o natural é ver o acervo inteiro e afunilar depois, com o
+     filtro ou com as pastas. Custa uma chamada maior (o painel
+     devolve o catálogo inteiro do tipo), mas ela é cacheada e a
+     grade é virtualizada — 20 mil itens no ar dão 50 nós no DOM. */
+  var TODOS = '__todos__';
+
+  /* "Histórico": os últimos assistidos daquele tipo. Nunca inclui
+     adulto — o filtro é o mesmo da tela inicial, e a origem é o
+     Store, que já não grava adulto nenhum. */
+  var HISTORICO = '__historico__';
+
+  function historicoDe(tipo) {
+    var alvo = tipo === 'series' ? 'episode' : tipo === 'movie' ? 'movie' : 'live';
+    var vistos = {};
+    var lista = w.Store.historyList(200).filter(function (r) {
+      if (!r || r.kind !== alvo) return false;
+      if (w.Catalog.itemAdulto && w.Catalog.itemAdulto(r)) return false;
+      /* uma série entra uma vez só, pelo episódio mais recente */
+      var chave = (tipo === 'series' && r.series_id) ? 's:' + r.series_id : r.id;
+      if (vistos[chave]) return false;
+      vistos[chave] = true;
+      return true;
     });
-
-    if (opts.rank) b.appendChild(w.el('span', { class: 'num', text: String(opts.rank) }));
-
-    var stack = opts.rank ? w.el('div', {}) : b;
-    if (opts.rank) b.appendChild(stack);
-
-    var shell = thumb(item, shape);
-
-    if (opts.live) shell.appendChild(w.el('span', { class: 'tag', text: 'AO VIVO' }));
-    if (opts.tag)  shell.appendChild(w.el('span', { class: 'tag soft', text: opts.tag }));
-
-    shell.appendChild(w.el('div', { class: 'play-hint', html: w.icon('play', 'solid') }));
-
-    if (opts.overlayTitle) {
-      shell.appendChild(w.el('div', { class: 'card-scrim' }));
-      shell.appendChild(w.el('div', { class: 'card-overlay', text: w.cleanName(item.title) }));
-    }
-
-    if (opts.progress > 0) {
-      var bar = w.el('div', { class: 'card-progress' });
-      bar.appendChild(w.el('i', { style: 'width:' + Math.min(100, opts.progress * 100) + '%' }));
-      shell.appendChild(bar);
-    }
-
-    stack.appendChild(shell);
-
-    if (!opts.overlayTitle) {
-      var meta = w.el('div', { class: 'card-meta' });
-      meta.appendChild(w.el('div', { class: 'card-name', text: w.cleanName(item.title) }));
-      if (opts.note) meta.appendChild(w.el('div', { class: 'card-note', text: opts.note }));
-      stack.appendChild(meta);
-    }
-
-    b.setAttribute('data-ambient', item.poster || '');
-    b.onclick = function () { if (opts.onSelect) opts.onSelect(item); };
-    return b;
+    return Promise.resolve(lista.map(function (r) { return itemDoHistorico(r, tipo); }));
   }
 
-  function rowBlock(title, subtitle) {
-    var row = w.el('div', { class: 'row' });
-    var head = w.el('div', { class: 'section-title' });
-    head.appendChild(w.el('span', { text: title }));
-    if (subtitle) head.appendChild(w.el('small', { text: subtitle }));
-    var track = w.el('div', { class: 'row-track', 'data-scroll': 'x', 'data-nav-axis': 'x' });
-    row.appendChild(head);
-    row.appendChild(track);
-    row.track = track;
-    return row;
-  }
-
-  function skeletonRow(title, count, shape) {
-    var row = rowBlock(title, '');
-    for (var i = 0; i < (count || 7); i++) {
-      var d = w.el('div', {
-        class: 'skel',
-        style: shape === 'wide' ? 'width:20rem;height:11.25rem;flex:0 0 auto'
-                                : 'width:11.5rem;height:17.2rem;flex:0 0 auto'
-      });
-      row.track.appendChild(d);
-    }
-    return row;
-  }
-
-  function chip(text, cls) { return w.el('span', { class: 'chip ' + (cls || ''), text: text }); }
-
-  function emptyBlock(title, html) {
-    var e = w.el('div', { class: 'empty' });
-    if (title) e.appendChild(w.el('h2', { text: title }));
-    e.appendChild(w.el('div', { html: html || '' }));
-    return e;
-  }
-
-  function errorBlock(err, retry) {
-    var e = w.el('div', { class: 'empty' });
-    e.appendChild(w.el('h2', { text: 'Não consegui carregar' }));
-    e.appendChild(w.el('div', { html: w.esc(err && err.message ? err.message : String(err)) }));
-    if (retry) {
-      var btns = w.el('div', { class: 'row-btns', style: 'margin-top:1.6rem', 'data-nav-axis': 'x' });
-      var b = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Tentar de novo' });
-      b.onclick = retry;
-      btns.appendChild(b);
-      e.appendChild(btns);
-    }
-    return e;
-  }
-
-  /* Converte um registro de progresso em item reproduzível. */
-  function fromProgress(p) {
+  function itemDoHistorico(r, tipo) {
     return {
-      id: p.id, kind: p.kind, title: p.title, subtitle: p.subtitle,
-      poster: p.poster, url: p.stream_url, duration: p.duration,
-      seriesId: p.series_id, seriesTitle: p.series_title,
-      season: p.season, episode: p.episode
+      id: r.id,
+      kind: tipo === 'series' ? 'series' : r.kind,
+      seriesId: r.series_id || '',
+      streamId: String(r.id || '').replace(/^movie:/, ''),
+      title: (tipo === 'series' && r.series_title) ? r.series_title : r.title,
+      subtitle: r.season ? 'T' + r.season + ' E' + r.episode : '',
+      poster: r.poster || '',
+      url: r.stream_url || ''
     };
   }
 
-  function play(item, opts) {
-    w.Player.open(item, opts || {});
+  /* Os canais marcados, com o objeto COMPLETO — o favorito
+     guardado no Store tem só o essencial para a lista, e para
+     tocar é preciso a escada de qualidade inteira. */
+  function temFavoritosDeCanal() {
+    return w.Store.favorites().some(function (f) { return f.kind === 'live'; });
   }
 
-  /* =========================================================
-     TELA: INÍCIO
-     ========================================================= */
-  function home() {
-    var s = screen('screen-home');
-    var inner = scroller(s);
-
-    /* --- Billboard --- */
-    var bb = w.el('div', { class: 'billboard' });
-    var art = w.el('div', { class: 'bb-art' });
-    var body = w.el('div', { class: 'bb-body' });
-    var dots = w.el('div', { class: 'bb-dots' });
-    bb.appendChild(art); bb.appendChild(body); bb.appendChild(dots);
-    inner.appendChild(bb);
-
-    body.innerHTML =
-      '<div class="bb-kicker">Boa noite</div>' +
-      '<div class="bb-title">Nebula</div>' +
-      '<div class="bb-desc">Carregando seu catálogo…</div>';
-
-    /* --- Fileiras --- */
-    var rows = w.el('div', {});
-    inner.appendChild(rows);
-
-    var cont = w.Store.continueList(20);
-    if (cont.length) {
-      var rc = rowBlock('Continuar assistindo', cont.length + ' em andamento');
-      cont.forEach(function (p) {
-        var item = fromProgress(p);
-        rc.track.appendChild(card(item, {
-          shape: 'wide', overlayTitle: true,
-          progress: p.duration ? p.position / p.duration : 0,
-          tag: p.duration ? 'restam ' + w.fmtLeft(p.duration - p.position) : null,
-          onSelect: function (it) { play(it); }
-        }));
-      });
-      rows.appendChild(rc);
-    }
-
-    var lives = w.Store.historyList(40).filter(function (r) { return r.kind === 'live'; }).slice(0, 14);
-    if (lives.length) {
-      var rl = rowBlock('Canais recentes', '');
-      lives.forEach(function (p) {
-        var item = fromProgress(p);
-        rl.track.appendChild(card(item, {
-          shape: 'logo', live: true,
-          onSelect: function (it) { play(it); }
-        }));
-      });
-      rows.appendChild(rl);
-    }
-
-    var favs = w.Store.favorites();
-    if (favs.length) {
-      var rf = rowBlock('Sua lista', favs.length + ' itens');
-      favs.forEach(function (f) {
-        rf.track.appendChild(card(f, {
-          shape: f.kind === 'live' ? 'logo' : 'poster',
-          onSelect: function (it) { openItem(it); }
-        }));
-      });
-      rows.appendChild(rf);
-    }
-
-    var skMovies = skeletonRow('Filmes', 7, 'poster');
-    var skSeries = skeletonRow('Séries', 7, 'poster');
-    rows.appendChild(skMovies);
-    rows.appendChild(skSeries);
-
-    w.Nav.focusFirst('.screen .card') || w.Nav.focusFirst('.rail-item');
-
-    /* --- Preenche em segundo plano --- */
-    var billboardItems = [];
-
-    w.Catalog.categories('movie')
-      .then(function (cats) {
-        if (!cats.length) throw new Error('Nenhuma categoria de filme.');
-        return Promise.all(cats.slice(0, 3).map(function (c) {
-          return w.Catalog.items('movie', c.id).then(function (items) {
-            return { cat: c, items: items };
-          }).catch(function () { return { cat: c, items: [] }; });
-        }));
-      })
-      .then(function (packs) {
-        rows.removeChild(skMovies);
-        var anchor = skSeries;
-        packs.forEach(function (p, idx) {
-          if (!p.items.length) return;
-          var sorted = byNewest(p.items);
-          if (!billboardItems.length) billboardItems = sorted.filter(hasPoster).slice(0, 5);
-          var r = rowBlock(idx === 0 ? 'Adicionados recentemente' : p.cat.name,
-                           idx === 0 ? p.cat.name : p.items.length + ' filmes');
-          sorted.slice(0, 40).forEach(function (it, i) {
-            r.track.appendChild(card(it, {
-              shape: 'poster',
-              rank: (idx === 0 && i < 10) ? i + 1 : null,
-              progress: progressOf(it.id),
-              onSelect: openItem
-            }));
-          });
-          rows.insertBefore(r, anchor);
-        });
-        renderBillboard(art, body, dots, billboardItems);
-      })
-      .catch(function (e) {
-        if (skMovies.parentNode) rows.replaceChild(errorBlock(e, function () { w.App.go('home'); }), skMovies);
-        renderBillboard(art, body, dots, []);
-      });
-
-    w.Catalog.categories('series')
-      .then(function (cats) {
-        return Promise.all(cats.slice(0, 2).map(function (c) {
-          return w.Catalog.items('series', c.id).then(function (items) {
-            return { cat: c, items: items };
-          }).catch(function () { return { cat: c, items: [] }; });
-        }));
-      })
-      .then(function (packs) {
-        if (skSeries.parentNode) rows.removeChild(skSeries);
-        packs.forEach(function (p) {
-          if (!p.items.length) return;
-          var r = rowBlock(p.cat.name, p.items.length + ' séries');
-          byNewest(p.items).slice(0, 40).forEach(function (it) {
-            r.track.appendChild(card(it, { shape: 'poster', onSelect: openItem }));
-          });
-          rows.appendChild(r);
-        });
-      })
-      .catch(function () {
-        if (skSeries.parentNode) rows.removeChild(skSeries);
-      });
-
-    return Promise.resolve();
-  }
-
-  function hasPoster(i) { return !!i.poster; }
-  function byNewest(items) {
-    return items.slice().sort(function (a, b) {
-      return (Number(b.added) || 0) - (Number(a.added) || 0);
+  function canaisFavoritos() {
+    var marcados = {};
+    w.Store.favorites().forEach(function (f) {
+      if (f.kind === 'live') marcados[f.id] = true;
+    });
+    if (!Object.keys(marcados).length) return Promise.resolve([]);
+    return w.Catalog.canais().then(function (todos) {
+      return todos.filter(function (c) { return marcados[c.id]; });
     });
   }
-  function progressOf(id) {
-    var p = w.Store.progressOf(id);
-    return p && p.duration ? p.position / p.duration : 0;
+
+  function colunaCategorias(cats, aoEscolher) {
+    var aside = el('div', {
+      class: 'coluna-cats',
+      'data-region': 'cats', 'data-axis': 'y',
+      'data-nb-left': 'rail', 'data-nb-right': 'grid',
+      'data-enter': 'last'
+    });
+    var janela = el('div', { class: 'janela cheia' });
+    var trilho = el('div', { class: 'trilho', 'data-scroll': 'y' });
+
+    cats.forEach(function (c, i) {
+      var b = el('button', { class: 'cat-item', 'data-focusable': '', text: c.nome });
+      b._cat = c;
+      b._escolher = function () {
+        w.$$('.cat-item', aside).forEach(function (o) { o.classList.remove('ativa'); });
+        b.classList.add('ativa');
+        aoEscolher(c);
+      };
+      /* Recarregar a MESMA pasta. Existe para a pasta Favoritos:
+         quando você desmarca um canal olhando para ela, a lista
+         tem de se refazer, e `_escolher` sozinho não faz nada
+         porque a pasta já é a atual. */
+      b._recarregar = function () { aoEscolher(c, true); };
+      b.onclick = b._escolher;
+      if (i === 0) b.classList.add('ativa');
+      trilho.appendChild(b);
+    });
+
+    janela.appendChild(trilho);
+    aside.appendChild(janela);
+    return aside;
   }
 
-  /* Rotação do destaque principal. */
-  var bbTimer = null;
-  function renderBillboard(art, body, dots, items) {
-    clearInterval(bbTimer);
-    if (!items.length) {
-      body.innerHTML =
-        '<div class="bb-kicker">Nebula</div>' +
-        '<div class="bb-title">Tudo pronto</div>' +
-        '<div class="bb-desc">Use o menu à esquerda para navegar pelos canais, filmes e séries.</div>';
-      return;
+  /* Chamado pelo roteador a cada mudança de foco. */
+  function aoFocarCategoria(elemento) {
+    clearTimeout(esperaCat);
+    if (!elemento || !elemento._escolher) return;
+    esperaCat = setTimeout(function () {
+      if (w.Nav.atual() === elemento) elemento._escolher();
+    }, ESPERA);
+  }
+
+  /* -----------------------------------------------------------
+     Navegar: coluna de categorias + grade
+     ----------------------------------------------------------- */
+  function navegar(tipo, forma) {
+    var tela = w.UI.tela('nav-' + tipo);
+    var conteudo = el('div', { class: 'conteudo' });
+
+    /* ---------------------------------------------------------
+       Filtrar DENTRO da pasta
+       ---------------------------------------------------------
+       A busca do menu varre o catálogo inteiro e é para quando
+       você não sabe onde a coisa está. Este campo é outra coisa:
+       a pasta já está aberta e carregada na memória, então
+       filtrar é instantâneo e não toca na rede.
+
+       Fica acima da grade e é vizinho dela para cima — ↑ na
+       primeira linha chega nele, ↓ volta. E a tecla vermelha
+       pula direto para cá de qualquer lugar da tela.
+       --------------------------------------------------------- */
+    var barra = el('div', {
+      class: 'filtro-barra',
+      'data-region': 'filtro', 'data-axis': 'x',
+      'data-nb-left': 'cats', 'data-nb-down': 'grid', 'data-enter': 'first'
+    });
+    var campo = el('input', { class: 'filtro-campo', 'data-focusable': '', type: 'text',
+                              placeholder: 'Filtrar nesta pasta' });
+    var conta = el('span', { class: 'filtro-conta' });
+    barra.appendChild(campo);
+    barra.appendChild(conta);
+
+    /* -------------------------------------------------------
+       Ordenação
+       -------------------------------------------------------
+       O provedor manda a lista na ordem dele, que não é ordem
+       nenhuma. Três critérios cobrem o uso real: como veio,
+       o que entrou por último, e o que é bem avaliado. A nota
+       vem do próprio painel, então é de graça.
+       ------------------------------------------------------- */
+    var ORDENS = [
+      { id: 'padrao',   nome: 'Da pasta' },
+      { id: 'recentes', nome: 'Recentes' },
+      { id: 'nota',     nome: 'Nota' }
+    ];
+    var ordemAtual = 'padrao';
+    var botoesOrdem = [];
+
+    if (tipo !== 'live') {
+      var caixaOrdem = el('div', { class: 'filtro-ordem' });
+      ORDENS.forEach(function (o) {
+        var b = el('button', { class: 'ordem-btn' + (o.id === 'padrao' ? ' ativo' : ''),
+                               'data-focusable': '', text: o.nome });
+        b.onclick = function () {
+          ordemAtual = o.id;
+          botoesOrdem.forEach(function (x) { x.classList.remove('ativo'); });
+          b.classList.add('ativo');
+          aplicarFiltro();
+        };
+        botoesOrdem.push(b);
+        caixaOrdem.appendChild(b);
+      });
+      barra.appendChild(caixaOrdem);
     }
-    w.clear(dots);
-    items.forEach(function () { dots.appendChild(w.el('i')); });
+
+    function ordenar(lista) {
+      if (ordemAtual === 'padrao') return lista;
+      var copia = lista.slice();
+      if (ordemAtual === 'recentes') {
+        copia.sort(function (a, b) { return (b.added || 0) - (a.added || 0); });
+      } else {
+        copia.sort(function (a, b) {
+          return (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0);
+        });
+      }
+      return copia;
+    }
+
+    var caixaGrade = el('div', {
+      class: 'grade-caixa',
+      'data-region': 'grid', 'data-axis': 'grid',
+      'data-nb-left': 'cats', 'data-nb-up': 'filtro', 'data-enter': 'last'
+    });
+    caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
+
+    conteudo.appendChild(barra);
+    conteudo.appendChild(caixaGrade);
+
+    var atual = null;
+    var itensDaPasta = [];
+
+    function normal(s) {
+      return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    }
+
+    function pintar(itens, cat) {
+      w.Virt.dentroDe(caixaGrade).forEach(function (c) { c.destruir(); });
+      w.clear(caixaGrade);
+      if (!itens.length) {
+        caixaGrade.appendChild(campo.value.trim()
+          ? w.UI.vazio('Nada com "' + campo.value.trim() + '"',
+                       'Nenhum item desta pasta bate com o filtro.')
+          : atual === HISTORICO
+            ? w.UI.vazio('Nada por aqui ainda',
+                         'O que você assistir aparece nesta pasta. Conteúdo adulto ' +
+                         'nunca entra — nem aqui, nem em recentes, nem em relacionados.')
+          : atual === FAVORITOS
+            ? w.UI.vazio('Nenhum canal favoritado ainda',
+                         'Segure OK sobre um canal em qualquer pasta para marcá-lo. ' +
+                         'Ele aparece aqui na hora.')
+            : w.UI.vazio('Nada nesta pasta',
+                         'A categoria "' + (cat ? cat.nome : '') + '" veio vazia do provedor.'));
+        return;
+      }
+      var g = w.UI.grade(itens, { forma: forma, colunas: COLUNAS, aoAbrir: abrir });
+      caixaGrade.appendChild(g);
+      w.UI.ligar(g);
+    }
+
+    function aplicarFiltro() {
+      var termo = normal(campo.value.trim());
+      var lista = !termo ? itensDaPasta : itensDaPasta.filter(function (i) {
+        return normal(i.title).indexOf(termo) >= 0;
+      });
+      conta.textContent = termo
+        ? lista.length + ' de ' + itensDaPasta.length
+        : itensDaPasta.length + ' itens';
+      pintar(ordenar(lista), null);
+    }
+    campo.oninput = w.debounce(aplicarFiltro, 160);
+
+    function mostrar(cat, forcar) {
+      if (atual === cat.id && !forcar) return;
+      atual = cat.id;
+      campo.value = '';
+      conta.textContent = '';
+      w.Virt.dentroDe(caixaGrade).forEach(function (c) { c.destruir(); });
+      w.clear(caixaGrade);
+      caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
+
+      (cat.id === FAVORITOS ? canaisFavoritos()
+        : cat.id === HISTORICO ? historicoDe(tipo)
+        : cat.id === TODOS ? w.Catalog.itens(tipo, '')
+        : w.Catalog.itens(tipo, cat.id))
+      .then(function (itens) {
+        if (atual !== cat.id) return;                 /* já mudou de categoria */
+        itensDaPasta = itens;
+        conta.textContent = itens.length + ' itens';
+        pintar(ordenar(itens), cat);
+      }).catch(function (e) {
+        if (atual !== cat.id) return;
+        w.clear(caixaGrade);
+        caixaGrade.appendChild(w.UI.erro(e, function () { atual = null; mostrar(cat); }));
+      });
+    }
+
+    /* tecla vermelha: vai direto para o filtro desta pasta */
+    tela._tecla = function (k) {
+      if (k !== w.KEY.RED) return false;
+      w.Nav.focar(campo);
+      return true;
+    };
+
+    w.Catalog.categorias(tipo).then(function (cats) {
+      /* ---------------------------------------------------------
+         A pasta Favoritos
+         ---------------------------------------------------------
+         Ideia sua, e é a forma certa: em vez de uma lista de
+         favoritos escondida noutro canto do app, uma PASTA no
+         mesmo lugar das outras, primeira da coluna. Você entra
+         em Ao Vivo e os seus canais estão ali, antes de tudo.
+
+         É uma pasta de mentira: não existe no provedor, é montada
+         a partir do que você marcou. Por isso o id reservado. */
+      var virtuais = [];
+      if (tipo === 'live') virtuais.push({ id: FAVORITOS, nome: '★ Favoritos' });
+      else virtuais.push({ id: TODOS, nome: 'Todos' });
+      virtuais.push({ id: HISTORICO, nome: 'Histórico' });
+      cats = virtuais.concat(cats);
+      if (!cats.length) {
+        var vaz = w.UI.tela();
+        vaz.appendChild(w.UI.vazio('Sem categorias',
+          'O provedor não devolveu nenhuma pasta para esta seção.'));
+        w.UI.trocar(vaz);
+        return;
+      }
+      var coluna = colunaCategorias(cats, mostrar);
+      tela.appendChild(coluna);
+      tela.appendChild(conteudo);
+      w.UI.trocar(tela, 'cats');
+
+      /* A pasta Favoritos fica sempre visível — é assim que se
+         descobre que ela existe. Mas abrir Ao Vivo numa pasta
+         vazia seria uma recepção ruim, então a seleção inicial
+         só cai nela quando há o que mostrar. */
+      /* A seleção inicial pula as pastas virtuais VAZIAS — e o
+         vazio é por tipo. O teste antigo perguntava "existe
+         algum histórico?", e como havia histórico de filmes, a
+         pasta Histórico de CANAIS era escolhida e a tela de Ao
+         Vivo abria em branco. Medido no app real: 53 focáveis na
+         coluna e zero cartões. */
+      var vaziaAgora = function (id) {
+        if (id === FAVORITOS) return !temFavoritosDeCanal();
+        if (id === HISTORICO) {
+          var kind = tipo === 'series' ? 'episode' : tipo === 'movie' ? 'movie' : 'live';
+          return !w.Store.historyList(200).some(function (r) { return r && r.kind === kind; });
+        }
+        return false;
+      };
+      var inicial = 0;
+      while (inicial < cats.length - 1 && vaziaAgora(cats[inicial].id)) inicial++;
+      var botoes = w.$$('.cat-item', coluna);
+      botoes.forEach(function (b) { b.classList.remove('ativa'); });
+      if (botoes[inicial]) botoes[inicial].classList.add('ativa');
+      mostrar(cats[inicial]);
+
+      /* O foco tem de cair na pasta ATIVA, não na primeira da
+         coluna. Sem isto acontecia uma coisa que parecia
+         fantasma: a grade carregava a pasta certa, o foco ia
+         para Favoritos (vazia), e 320 ms depois o carregamento
+         por descanso de foco trocava tudo por uma tela em
+         branco. Levava a culpa a virtualização, e a culpa era
+         daqui. */
+      assumirFocoEm(botoes[inicial]);
+    }).catch(function (e) {
+      var t = w.UI.tela();
+      t.appendChild(w.UI.erro(e, function () { navegar(tipo, forma); }));
+      w.UI.trocar(t);
+    });
+
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Início
+     -----------------------------------------------------------
+     O destaque não é mais um carrossel que troca sozinho. Ele
+     mostra o que você estava assistindo — que é a coisa que uma
+     pessoa mais quer ao ligar a TV — e só cai para uma novidade
+     quando não há nada em andamento.
+
+     E ficou LARGO. Você notou que parecia estreito e errado:
+     era, porque dividia espaço com um carrossel que já não
+     existe mais.
+     ----------------------------------------------------------- */
+  function destaque(item, aoTocar, aoDetalhe) {
+    var sec = el('div', {
+      class: 'hero',
+      'data-region': 'hero', 'data-axis': 'x',
+      'data-nb-left': 'rail', 'data-nb-down': 'rows', 'data-enter': 'first'
+    });
+
+    if (item.backdrop || item.poster) {
+      var arte = el('div', { class: 'hero-arte' });
+      arte.style.backgroundImage = 'url("' +
+        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      sec.appendChild(arte);
+      sec.appendChild(el('div', { class: 'hero-veu' }));
+    }
+
+    var texto = el('div', { class: 'hero-texto' });
+    texto.appendChild(el('h1', { class: 'hero-titulo', text: w.cleanName(item.title || '') }));
+    if (item.subtitle) texto.appendChild(el('div', { class: 'hero-sub', text: item.subtitle }));
+    if (item.plot) texto.appendChild(el('p', { class: 'hero-plot', text: item.plot }));
+
+    var botoes = el('div', { class: 'hero-btns' });
+    var b1 = el('button', { class: 'btn primary', 'data-focusable': '' });
+    b1.innerHTML = w.icon('play') + '<span>' + (item.retomar ? 'Continuar' : 'Assistir') + '</span>';
+    b1.onclick = function () { aoTocar(item); };
+    botoes.appendChild(b1);
+
+    if (aoDetalhe && item.kind !== 'live') {
+      var b2 = el('button', { class: 'btn ghost', 'data-focusable': '' });
+      b2.innerHTML = w.icon('info') + '<span>Mais informações</span>';
+      b2.onclick = function () { aoDetalhe(item); };
+      botoes.appendChild(b2);
+    }
+    texto.appendChild(botoes);
+    sec.appendChild(texto);
+    return sec;
+  }
+
+  function inicio() {
+    var tela = w.UI.tela('home');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    var fileiras = el('div', {
+      'data-region': 'rows', 'data-axis': 'rows',
+      'data-nb-left': 'rail', 'data-nb-up': 'hero', 'data-enter': 'last'
+    });
+
+    /* enquanto os dados não chegam, o esqueleto segura o espaço
+       para a tela não pular quando eles chegarem */
+    fileiras.appendChild(w.UI.esqueleto(8, 'poster'));
+    coluna.appendChild(fileiras);
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'rows');
+
+    var continuar = agruparPorSerie(w.Store.continueList(40).filter(naoAdulto)).slice(0, 20);
+    var favoritos = w.Store.favorites().filter(naoAdulto);
+
+    /* O destaque precisa de arte. Um registro antigo sem capa
+       deixava a tela de abertura preta com um título solto —
+       foi o que apareceu com "Moana". Se o primeiro não tem,
+       pega o primeiro que tiver. */
+    var comArte = continuar.filter(comCapa)[0];
+    var promessaDestaque = comArte
+      ? Promise.resolve(marcarRetomar(comArte))
+      : w.Catalog.categorias('movie')
+          .then(function (cs) { return cs.length ? w.Catalog.itens('movie', cs[0].id) : []; })
+          .then(function (fs) { return fs.filter(comCapa)[0] || null; })
+          .catch(function () { return null; });
+
+    Promise.all([
+      promessaDestaque,
+      w.Catalog.canais().catch(function () { return []; }),
+      pastasEscolhidas('movie'),
+      pastasEscolhidas('series')
+    ]).then(function (r) {
+      var dest = r[0], canais = r[1], filmes = r[2], series = r[3];
+      /* Tudo o que é "voltar a assistir" mora numa fileira só.
+         Três fileiras quase iguais na abertura era ruído — e as
+         capas em pé no meio das deitadas ficavam desalinhadas. */
+      continuar = juntarComRecentes(continuar);
+      recuperarCapas(continuar, fileiras);
+
+      w.clear(fileiras);
+      w.clear(coluna);
+
+      if (dest) coluna.appendChild(destaque(dest, tocarDoDestaque, abrir));
+      coluna.appendChild(fileiras);
+
+      if (continuar.length) {
+        fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
+          { forma: 'wide', aoAbrir: tocarDoDestaque }));
+      }
+      if (favoritos.length) {
+        fileiras.appendChild(w.UI.fileira('Favoritos', favoritos,
+          { forma: 'poster', aoAbrir: abrir }));
+      }
+      var favCanais = canais.filter(function (c) { return w.Store.isFavorite(c.id); });
+      if (favCanais.length) {
+        fileiras.appendChild(w.UI.fileira('Canais favoritos', favCanais,
+          { forma: 'logo', aoAbrir: abrir }));
+      }
+      if (canais.length) {
+        fileiras.appendChild(w.UI.fileira('Canais ao vivo', porHabito(canais).slice(0, 120),
+          { forma: 'logo', aoAbrir: abrir, subtitulo: canais.length + ' canais' }));
+      }
+      filmes.concat(series).forEach(function (bloco) {
+        if (bloco.itens.length) {
+          fileiras.appendChild(w.UI.fileira(bloco.nome, bloco.itens,
+            { forma: 'poster', aoAbrir: abrir }));
+        }
+      });
+
+      if (!fileiras.children.length) {
+        fileiras.appendChild(w.UI.vazio('Sua lista está vazia',
+          'Não consegui montar nenhuma fileira com o que o provedor devolveu.'));
+      }
+
+      w.UI.ligar(tela);
+      w.UI.apontarMenu(dest ? 'hero' : 'rows');
+      if (dest) assumirFoco('hero'); else assumirFoco('rows');
+    }).catch(function (e) {
+      var t = w.UI.tela();
+      t.appendChild(w.UI.erro(e, inicio));
+      w.UI.trocar(t);
+    });
+
+    return tela;
+  }
+
+  /* Últimos assistidos de um tipo, sem repetir série e sem
+     adulto. É a fonte das fileiras "recentes" da inicial. */
+  /* Continuar assistindo = o que está em andamento, e logo atrás
+     o que já foi assistido. Uma fileira só, sempre em formato
+     deitado. */
+  function juntarComRecentes(emAndamento) {
+    var tem = {};
+    emAndamento.forEach(function (r) {
+      tem[r.series_id ? 's:' + r.series_id : r.id] = true;
+    });
+    var recentes = historicoCurto('episode').concat(historicoCurto('movie'))
+      .filter(function (r) {
+        /* assistido até o fim não é "continuar" — sai da abertura
+           e fica no Histórico, com a etiqueta na capa */
+        var p = w.Store.progressOf(r.id);
+        if (p && p.completed) return false;
+        var chave = r.seriesId ? 's:' + r.seriesId : r.id;
+        if (tem[chave]) return false;
+        tem[chave] = true;
+        return true;
+      });
+    return emAndamento.concat(recentes).slice(0, 30);
+  }
+
+  /* Canais na ordem em que você usa. Os abertos recentemente vão
+     para a frente; o resto mantém a ordem do provedor. */
+  function porHabito(canais) {
+    var quando = {};
+    w.Store.recentChannels(40).forEach(function (r, i) { quando[r.id] = i; });
+    var usados = [], resto = [];
+    canais.forEach(function (c) {
+      if (quando[c.id] !== undefined) usados.push(c); else resto.push(c);
+    });
+    usados.sort(function (a, b) { return quando[a.id] - quando[b.id]; });
+    return usados.concat(resto);
+  }
+
+  function historicoCurto(kind) {
+    var vistos = {};
+    return w.Store.historyList(120).filter(function (r) {
+      if (!r || r.kind !== kind) return false;
+      if (w.Catalog.itemAdulto && w.Catalog.itemAdulto(r)) return false;
+      var chave = r.series_id ? 's:' + r.series_id : r.id;
+      if (vistos[chave]) return false;
+      vistos[chave] = true;
+      return true;
+    }).slice(0, 20).map(function (r) {
+      return itemDoHistorico(r, r.kind === 'episode' ? 'series' : 'movie');
+    });
+  }
+
+  /* Quais pastas viram fileira na inicial.
+     -------------------------------------------------------
+     Pegar "as duas primeiras" era arbitrário: a ordem é a do
+     provedor. Agora há uma lista de preferências por nome — 4K,
+     lançamentos, os catálogos grandes — e o resto entra por
+     ordem, até completar. */
+  var PREFERIDAS = [/\b4k\b/i, /lan[çc]amento/i, /netflix/i, /prime/i,
+                    /hbo/i, /disney/i, /a[çc][ãa]o/i];
+
+  function pastasEscolhidas(tipo, quantas) {
+    quantas = quantas || 3;
+    return w.Catalog.categorias(tipo).then(function (cats) {
+      var uteis = cats.filter(function (c) { return !w.Catalog.ehAdulta(c.nome); });
+      var nota = function (c) {
+        for (var i = 0; i < PREFERIDAS.length; i++) {
+          if (PREFERIDAS[i].test(c.nome)) return i;
+        }
+        return PREFERIDAS.length;
+      };
+      var ordenadas = uteis.slice().sort(function (a, b) { return nota(a) - nota(b); });
+      return Promise.all(ordenadas.slice(0, quantas).map(function (c) {
+        return w.Catalog.itens(tipo, c.id)
+          .then(function (its) { return { nome: c.nome, itens: its.slice(0, 60) }; })
+          .catch(function () { return { nome: c.nome, itens: [] }; });
+      }));
+    }).catch(function () { return []; });
+  }
+
+  function primeirasPastas(tipo, quantas) {
+    return w.Catalog.categorias(tipo).then(function (cats) {
+      var uteis = cats.filter(function (c) { return !w.Catalog.ehAdulta(c.nome); })
+                      .slice(0, quantas);
+      return Promise.all(uteis.map(function (c) {
+        return w.Catalog.itens(tipo, c.id)
+          .then(function (its) { return { nome: c.nome, itens: its.slice(0, 60) }; })
+          .catch(function () { return { nome: c.nome, itens: [] }; });
+      }));
+    }).catch(function () { return []; });
+  }
+
+  /* Uma série não pode ocupar cinco lugares em "continuar
+     assistindo" com cinco episódios. Fica o mais recente de cada
+     série, com o rótulo da temporada e do episódio — que é o que
+     faltava para as séries aparecerem de forma útil na inicial. */
+  function agruparPorSerie(lista) {
+    var vistos = {}, saida = [];
+    lista.forEach(function (r) {
+      var chave = r.series_id ? 's:' + r.series_id : r.id;
+      if (vistos[chave]) return;
+      vistos[chave] = true;
+      if (r.series_id) {
+        var c = {};
+        Object.keys(r).forEach(function (k) { c[k] = r[k]; });
+        c.title = r.series_title || r.title;
+        c.subtitle = (r.season ? 'T' + r.season : '') +
+                     (r.episode ? ' E' + r.episode : '');
+        saida.push(c);
+      } else saida.push(r);
+    });
+    return saida;
+  }
+
+  /* Registro sem capa
+     -------------------------------------------------------
+     O progresso guarda a capa no momento em que você dá play.
+     Quem tocou por um caminho sem capa (busca antiga, registro
+     de uma versão anterior) ficou com o campo vazio, e o cartão
+     virava duas letras num quadrado. A capa está a uma chamada
+     de distância e ela é cacheada — então busca e conserta,
+     inclusive no registro, para não repetir amanhã. */
+  function recuperarCapas(lista, raiz) {
+    /* O registro de progresso guarda só `id`, `kind`, `title` e
+       `poster` — não guarda `streamId`. Eu filtrava por
+       `streamId` e o item nunca entrava na recuperação. O número
+       está dentro do próprio id (`movie:640392`), então é de lá
+       que ele sai. */
+    lista.filter(function (i) { return !i.poster && i.id; })
+      .slice(0, 8)
+      .forEach(function (item) {
+        var num = String(item.id).replace(/^[a-z]+:/, '');
+        var ehSerie = item.seriesId || /^series:/.test(item.id);
+        if (!num) return;
+        var busca = ehSerie
+          ? w.Catalog.serie(item.seriesId || num)
+          : w.Catalog.filme(item.streamId || num);
+        busca.then(function (info) {
+          var capa = info && (info.poster || info.fundo);
+          if (!capa) return;
+          item.poster = capa;
+          var p = w.Store.progressOf(item.id);
+          if (p) { p.poster = capa; w.Store.saveProgress(p); }
+          var no = raiz.querySelector('.card[data-id="' + item.id + '"]');
+          if (no) {
+            var casca = no.querySelector('.shell');
+            if (casca && !casca.querySelector('img')) {
+              w.clear(casca);
+              var img = document.createElement('img');
+              img.decoding = 'async';
+              img.onload = function () {
+                if (img.naturalHeight > img.naturalWidth * 1.1) casca.classList.add('retrato');
+              };
+              img.src = capa;
+              casca.appendChild(img);
+            }
+          }
+        }).catch(function () {});
+      });
+  }
+
+  function naoAdulto(item) {
+    return !(w.Catalog.itemAdulto && w.Catalog.itemAdulto(item));
+  }
+  function comCapa(i) { return !!(i.backdrop || i.poster); }
+  function marcarRetomar(i) {
+    var c = {}; Object.keys(i).forEach(function (k) { c[k] = i[k]; });
+    c.retomar = true; return c;
+  }
+  function tocarDoDestaque(item) {
+    if (item.kind === 'series' || item.seriesId) return abrir(item);
+    tocar(item);
+  }
+
+  /* -----------------------------------------------------------
+     Detalhe de filme
+     ----------------------------------------------------------- */
+  function detalheFilme(params) {
+    var base = params.item || {};
+    var tela = w.UI.tela('detalhe');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'acoes');
+
+    w.Catalog.filme(params.id).then(function (info) {
+      var item = mesclar(base, info);
+      var acoesFilme = [
+        { rotulo: 'Assistir', icone: 'play', primario: true,
+          acao: function () { tocar(item); } },
+        botaoFavorito(item)
+      ];
+      acoesFilme.abaixo = 'rows';
+      coluna.appendChild(cabecalhoDetalhe(item, acoesFilme));
+
+      /* Relacionados de verdade: franquia primeiro, depois nome
+         parecido, depois gênero. A versão anterior sorteava. */
+      var pasta = item.categoryId || item.groupId;
+      if (pasta) {
+        w.Catalog.itens('movie', pasta).then(function (universo) {
+          var rel = w.Catalog.relacionados(item, universo, 20);
+          if (!rel.length) return;
+          var cxF = caixaRelacionados(rel, 'acoes');
+          coluna.appendChild(cxF);
+          w.UI.ligar(cxF);          /* sem isto a fileira existe e fica vazia */
+        }).catch(function () {});
+      }
+      assumirFoco('acoes');
+    }).catch(function (e) {
+      coluna.appendChild(w.UI.erro(e, function () { detalheFilme(params); }));
+    });
+
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Detalhe de série
+     ----------------------------------------------------------- */
+  function detalheSerie(params) {
+    var base = params.item || {};
+    var tela = w.UI.tela('detalhe');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'acoes');
+
+    w.Catalog.serie(params.id).then(function (info) {
+      var item = mesclar(base, info);
+      var todos = [];
+      info.temporadas.forEach(function (t) { todos = todos.concat(t.episodios); });
+
+      var ultimo = w.Store.lastEpisodeOf(params.id);
+      var proximo = proximoEpisodio(todos, ultimo);
+
+      var acoesSerie = [
+        { rotulo: proximo.rotulo, icone: 'play', primario: true,
+          acao: function () { tocarEpisodio(proximo.ep, todos, item); } },
+        botaoFavorito(item)
+      ];
+      acoesSerie.abaixo = 'seasons';
+      coluna.appendChild(cabecalhoDetalhe(item, acoesSerie));
+
+      var caixaT = el('div', {
+        class: 'temporadas',
+        'data-region': 'seasons', 'data-axis': 'x',
+        'data-nb-left': 'rail', 'data-nb-up': 'acoes', 'data-nb-down': 'episodes',
+        'data-enter': 'last'
+      });
+      var caixaE = el('div', {
+        class: 'episodios',
+        'data-region': 'episodes', 'data-axis': 'x',
+        'data-nb-left': 'rail', 'data-nb-up': 'seasons',
+        'data-nb-down': 'rows', 'data-enter': 'last'
+      });
+
+      /* Fileira horizontal mesmo. No detalhe ela funciona: as
+         temporadas ficam logo acima, ↑ sai para elas e o cartaz
+         largo do episódio se lê bem passando de lado. */
+      function mostrarTemporada(t, botao) {
+        w.$$('.temp-btn', caixaT).forEach(function (o) { o.classList.remove('ativa'); });
+        if (botao) botao.classList.add('ativa');
+        w.Virt.dentroDe(caixaE).forEach(function (c) { c.destruir(); });
+        w.clear(caixaE);
+        var f = w.UI.fileira('', t.episodios, {
+          forma: 'wide',
+          aoAbrir: function (ep) { tocarEpisodio(ep, todos, item); },
+          nota: function (ep) { return 'T' + ep.temporada + ' E' + ep.episodio; }
+        });
+        caixaE.appendChild(f);
+        w.UI.ligar(f);
+      }
+
+      /* As caixas entram no documento ANTES de montar a fileira.
+         A virtualização mede um cartão de verdade para saber o
+         passo — e um cartão medido fora do documento tem largura
+         zero, o que empilha todos os episódios um por cima do
+         outro. Foi exatamente o que apareceu na tela. */
+      coluna.appendChild(caixaT);
+      coluna.appendChild(caixaE);
+
+      /* Relacionados também em série, abaixo dos episódios —
+         mesma lógica de franquia, nome parecido e gênero. */
+      var pastaS = item.categoryId || item.groupId || params.catId;
+      if (pastaS) {
+        w.Catalog.itens('series', pastaS).then(function (universo) {
+          var rel = w.Catalog.relacionados(item, universo, 20);
+          if (!rel.length) return;
+          var cx = caixaRelacionados(rel, 'episodes');
+          coluna.appendChild(cx);
+          w.UI.ligar(cx);
+        }).catch(function () {});
+      }
+
+      info.temporadas.forEach(function (t, i) {
+        var b = el('button', { class: 'temp-btn', 'data-focusable': '',
+                               text: 'Temporada ' + t.temporada });
+        b.onclick = function () { mostrarTemporada(t, b); };
+        caixaT.appendChild(b);
+        if (i === 0) mostrarTemporada(t, b);
+      });
+      assumirFoco('acoes');
+    }).catch(function (e) {
+      coluna.appendChild(w.UI.erro(e, function () { detalheSerie(params); }));
+    });
+
+    return tela;
+  }
+
+  /* Fileira de relacionados, com o vizinho de cima declarado —
+     em filme vem das ações, em série vem dos episódios. Sem essa
+     declaração a região existia e não havia como chegar nela. */
+  function caixaRelacionados(rel, acima) {
+    var caixa = el('div', {
+      'data-region': 'rows', 'data-axis': 'rows',
+      'data-nb-left': 'rail', 'data-nb-up': acima
+    });
+    caixa.appendChild(w.UI.fileira('Relacionados', rel,
+      { forma: 'poster', aoAbrir: abrir }));
+    return caixa;
+  }
+
+  function botaoFavorito(item) {
+    return {
+      rotulo: w.Store.isFavorite(item.id) ? 'Nos favoritos' : 'Favoritar',
+      icone: 'star',
+      acao: function (b) {
+        var agora = w.Store.toggleFavorite(item);
+        b.querySelector('span').textContent = agora ? 'Nos favoritos' : 'Favoritar';
+        b.classList.toggle('ativo', agora);
+      }
+    };
+  }
+
+  /* Qual episódio o botão principal deve tocar.
+     A conta é sobre estado derivado — posição sobre duração —
+     e não sobre o evento `ended`, que o Chromium engole em
+     alguns arquivos. Mesmo critério do avanço automático. */
+  function proximoEpisodio(todos, ultimo) {
+    if (!todos.length) return { ep: null, rotulo: 'Assistir' };
+    if (!ultimo) return { ep: todos[0], rotulo: 'Assistir T1 E1' };
 
     var i = -1;
-    function next() {
-      i = (i + 1) % items.length;
-      var it = items[i];
-      art.classList.remove('on');
-      setTimeout(function () {
-        art.style.backgroundImage = 'url("' + String(it.poster).replace(/"/g, '%22') + '")';
-        art.classList.add('on');
-      }, 40);
-
-      w.clear(body);
-      body.appendChild(w.el('div', { class: 'bb-kicker', text: 'Em destaque' }));
-      body.appendChild(w.el('div', { class: 'bb-title', text: w.cleanName(it.title) }));
-
-      var meta = w.el('div', { class: 'bb-meta' });
-      if (it.year) meta.appendChild(chip(it.year));
-      if (it.rating) meta.appendChild(chip('★ ' + it.rating, 'warn'));
-      meta.appendChild(chip(it.kind === 'series' ? 'Série' : 'Filme'));
-      body.appendChild(meta);
-
-      body.appendChild(w.el('div', { class: 'bb-desc',
-        text: it.plot || 'Abra para ver os detalhes, o elenco e começar a assistir.' }));
-
-      var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-      var bPlay = w.el('button', { class: 'btn', 'data-focusable': true,
-                                   html: w.icon('play', 'solid') + '<span>Assistir</span>' });
-      bPlay.onclick = function () { openItem(it, true); };
-      var bInfo = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                   html: w.icon('info') + '<span>Detalhes</span>' });
-      bInfo.onclick = function () { openItem(it); };
-      btns.appendChild(bPlay); btns.appendChild(bInfo);
-      body.appendChild(btns);
-
-      w.$$('i', dots).forEach(function (d, k) { d.classList.toggle('on', k === i); });
-
-      /* Na primeira montagem o foco ainda está no menu: traz para o destaque. */
-      var cur = w.Nav.current();
-      if (!cur || (cur.closest && cur.closest('#rail'))) w.Nav.focus(bPlay);
+    for (var k = 0; k < todos.length; k++) {
+      if (String(todos[k].id) === String(ultimo.id)) { i = k; break; }
     }
-    next();
-    bbTimer = setInterval(next, 9000);
+    if (i < 0) return { ep: todos[0], rotulo: 'Assistir T1 E1' };
+
+    var p = w.Store.progressOf(ultimo.id);
+    var terminou = !!(p && (p.completed ||
+      (p.duration > 0 && p.position / p.duration >= 0.95)));
+
+    var alvo = terminou ? (todos[i + 1] || todos[i]) : todos[i];
+    return {
+      ep: alvo,
+      rotulo: (terminou ? 'Assistir T' : 'Continuar T') + alvo.temporada + ' E' + alvo.episodio
+    };
   }
 
-  /* =========================================================
-     Abertura de um item, conforme o tipo
-     ========================================================= */
-  function openItem(item, straightToPlay) {
-    if (item.kind === 'live') { play(item); return; }
-    if (item.kind === 'series') { w.App.go('series-detail', { item: item }); return; }
-    if (item.kind === 'movie') {
-      if (straightToPlay) play(item);
-      else w.App.go('movie-detail', { item: item });
-      return;
-    }
-    play(item);
+  function tocarEpisodio(ep, todos, serie) {
+    if (!ep) return;
+    tocar(ep, { queue: todos, index: todos.indexOf(ep), serie: serie });
   }
-  w.openItem = openItem;
 
-  /* =========================================================
-     TELA GENÉRICA: categorias + grade
-     ========================================================= */
-  function browse(kind, titleText, subtitleText) {
-    var s = screen('screen-browse');
-    var split = w.el('div', { class: 'split' });
-    var catsCol = w.el('div', { class: 'cats' });
-    var catsScroll = w.el('div', { class: 'cats-scroll', 'data-scroll': 'y', 'data-nav-axis': 'y' });
-    catsCol.appendChild(w.el('div', { class: 'cats-head', text: titleText }));
-    catsCol.appendChild(catsScroll);
+  /* Cabeçalho comum aos dois detalhes. */
+  function cabecalhoDetalhe(item, acoes) {
+    var topo = el('div', { class: 'det-topo' });
+    if (item.backdrop || item.poster) {
+      var arte = el('div', { class: 'det-arte' });
+      arte.style.backgroundImage = 'url("' +
+        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      topo.appendChild(arte);
+      topo.appendChild(el('div', { class: 'det-veu' }));
+    }
+    var txt = el('div', { class: 'det-texto' });
+    txt.appendChild(el('h1', { class: 'det-titulo', text: w.cleanName(item.title || '') }));
 
-    var gridWrap = w.el('div', { class: 'grid-wrap' });
-    var gridHead = w.el('div', { class: 'grid-head' });
-    var grid = w.el('div', { class: 'grid', 'data-scroll': 'y', 'data-nav-axis': 'grid' });
-    gridWrap.appendChild(gridHead);
-    gridWrap.appendChild(grid);
+    /* Os campos vêm do catálogo em português (`sinopse`, `elenco`,
+       `direcao`, `ano`, `genero`). Eu estava lendo `plot`, `genre`
+       e `year`, que não existem — por isso a tela do detalhe só
+       mostrava o título e a nota. */
+    var ano    = item.ano || item.year || '';
+    var genero = item.genero || item.genre || '';
+    var nota   = item.rating || '';
+    var dur    = item.duracao ? Math.round(item.duracao / 60) + ' min' : '';
 
-    split.appendChild(catsCol);
-    split.appendChild(gridWrap);
-    s.appendChild(split);
+    var linha = [];
+    if (ano) linha.push(ano);
+    if (dur) linha.push(dur);
+    if (genero) linha.push(genero);
+    if (nota) linha.push('★ ' + nota);
+    if (item.idade) linha.push(item.idade);
+    if (linha.length) txt.appendChild(el('div', { class: 'det-meta', text: linha.join('  ·  ') }));
 
-    gridHead.appendChild(w.el('h2', { text: 'Carregando…' }));
+    var sinopse = item.sinopse || item.plot || '';
+    if (sinopse) txt.appendChild(el('p', { class: 'det-plot', text: sinopse }));
 
-    return w.Catalog.categories(kind).then(function (cats) {
-      if (!cats.length) {
-        w.clear(gridWrap);
-        gridWrap.appendChild(emptyBlock('Nada por aqui',
-          'O servidor não devolveu nenhuma categoria de ' + subtitleText + '.'));
-        w.Nav.focusFirst('.rail-item');
-        return;
-      }
+    /* Elenco e direção: duas linhas curtas, com rótulo. É a
+       informação que faz decidir se vale a pena, e ela já vinha
+       na resposta do painel sem custo nenhum. */
+    if (item.elenco) txt.appendChild(ficha('Elenco', item.elenco));
+    if (item.direcao) txt.appendChild(ficha('Direção', item.direcao));
 
-      var current = null;
-      cats.forEach(function (c, idx) {
-        var b = w.el('button', { class: 'cat-item', 'data-focusable': true });
-        b.appendChild(w.el('b', { text: c.name }));
-        if (c.count) b.appendChild(w.el('i', { text: String(c.count) }));
-        b.onclick = function () { select(c, b); };
-        b.setAttribute('data-on-focus', '1');
-        b._select = function () { select(c, b); };
-        catsScroll.appendChild(b);
-        if (idx === 0) current = { cat: c, btn: b };
-      });
-
-      function select(c, btn) {
-        w.$$('.cat-item', catsScroll).forEach(function (n) { n.classList.remove('active'); });
-        btn.classList.add('active');
-        w.clear(gridHead); w.clear(grid);
-        gridHead.appendChild(w.el('h2', { text: c.name }));
-        var count = w.el('small', { text: 'carregando…' });
-        gridHead.appendChild(count);
-        w.Nav.resetScroll(grid.parentElement);
-
-        w.Catalog.items(kind, c.id).then(function (items) {
-          count.textContent = items.length.toLocaleString('pt-BR') +
-                              ' ' + (kind === 'live' ? 'canais' : kind === 'movie' ? 'filmes' : 'séries');
-          renderPage(items, 0);
-        }).catch(function (e) {
-          w.clear(grid);
-          grid.appendChild(errorBlock(e, function () { select(c, btn); }));
-        });
-
-        function renderPage(items, from) {
-          var slice = items.slice(from, from + w.CFG.PAGE_SIZE);
-          slice.forEach(function (it) {
-            grid.appendChild(card(it, {
-              shape: kind === 'live' ? 'logo' : 'poster',
-              live: kind === 'live',
-              progress: progressOf(it.id),
-              onSelect: openItem
-            }));
-          });
-          if (from + w.CFG.PAGE_SIZE < items.length) {
-            var more = w.el('button', {
-              class: 'card card-' + (kind === 'live' ? 'logo' : 'poster'),
-              'data-focusable': true
-            });
-            var shell = w.el('div', { class: 'shell' });
-            shell.appendChild(w.el('div', { class: 'card-fallback',
-              text: '+' + (items.length - from - w.CFG.PAGE_SIZE) }));
-            more.appendChild(shell);
-            more.appendChild(w.el('div', { class: 'card-meta' },
-              [w.el('div', { class: 'card-name', text: 'Mostrar mais' })]));
-            more.onclick = function () {
-              grid.removeChild(more);
-              renderPage(items, from + w.CFG.PAGE_SIZE);
-              w.Nav.focus(grid.lastChild);
-            };
-            grid.appendChild(more);
-          }
-        }
-      }
-
-      select(current.cat, current.btn);
-      w.Nav.focus(current.btn);
-    }).catch(function (e) {
-      w.clear(s);
-      s.appendChild(errorBlock(e, function () { w.App.go(kind === 'live' ? 'live' : kind === 'movie' ? 'movies' : 'series'); }));
-      w.Nav.focusFirst('.screen .btn') || w.Nav.focusFirst('.rail-item');
+    /* Para onde ↓ leva depende da tela: em série, para as
+       temporadas; em filme, direto para os relacionados. Antes
+       apontava sempre para `seasons`, que em filme não existe —
+       e por isso os relacionados eram inalcançáveis. */
+    var caixa = el('div', {
+      class: 'row-btns', 'data-region': 'acoes', 'data-axis': 'x',
+      'data-nb-left': 'rail', 'data-enter': 'first',
+      'data-nb-down': (acoes.abaixo || 'rows')
     });
-  }
-
-  /* =========================================================
-     TELA: DETALHE DE FILME
-     ========================================================= */
-  function movieDetail(params) {
-    var item = params.item;
-    var s = screen('screen-detail');
-    var inner = scroller(s);
-
-    var art = w.el('div', { class: 'detail-art' });
-    if (item.poster) art.style.backgroundImage = 'url("' + item.poster.replace(/"/g, '%22') + '")';
-    s.insertBefore(art, s.firstChild);
-
-    var head = w.el('div', { class: 'detail-head' });
-    var posterBox = w.el('div', { class: 'detail-poster' });
-    if (item.poster) {
-      var img = w.el('img', { src: item.poster, alt: '' });
-      img.onerror = function () { img.style.display = 'none'; };
-      posterBox.appendChild(img);
-    }
-    var info = w.el('div', { class: 'detail-info' });
-    head.appendChild(posterBox);
-    head.appendChild(info);
-    inner.appendChild(head);
-
-    info.appendChild(w.el('h1', { text: w.cleanName(item.title) }));
-    var meta = w.el('div', { class: 'detail-meta' });
-    info.appendChild(meta);
-    var plot = w.el('div', { class: 'detail-plot', text: 'Buscando informações…' });
-    info.appendChild(plot);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    info.appendChild(btns);
-    var credits = w.el('div', { class: 'detail-credits' });
-    info.appendChild(credits);
-
-    var saved = w.Store.progressOf(item.id);
-    var bPlay = w.el('button', {
-      class: 'btn', 'data-focusable': true,
-      html: w.icon('play', 'solid') + '<span>' +
-            (saved && saved.position > w.CFG.RESUME_MIN_SEC && !saved.completed
-              ? 'Continuar de ' + w.fmtTime(saved.position) : 'Assistir') + '</span>'
+    acoes.forEach(function (a) {
+      var b = el('button', { class: 'btn ' + (a.primario ? 'primary' : 'ghost'),
+                             'data-focusable': '' });
+      b.innerHTML = w.icon(a.icone) + '<span>' + w.esc(a.rotulo) + '</span>';
+      b.onclick = function () { a.acao(b); };
+      caixa.appendChild(b);
     });
-    bPlay.onclick = function () { play(item); };
-    btns.appendChild(bPlay);
-
-    if (saved && saved.position > 0) {
-      var bRestart = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                      text: 'Começar do início' });
-      bRestart.onclick = function () { play(item, { forceStart: true }); };
-      btns.appendChild(bRestart);
-    }
-
-    var bFav = w.el('button', { class: 'btn ghost', 'data-focusable': true });
-    function paintFav() {
-      bFav.innerHTML = w.icon('star', w.Store.isFavorite(item.id) ? 'solid' : '') +
-                       '<span>' + (w.Store.isFavorite(item.id) ? 'Na sua lista' : 'Minha lista') + '</span>';
-    }
-    paintFav();
-    bFav.onclick = function () {
-      var on = w.Store.toggleFavorite(item);
-      paintFav();
-      w.toast(on ? 'Adicionado à sua lista' : 'Removido da sua lista');
-    };
-    btns.appendChild(bFav);
-
-    w.Nav.focus(bPlay);
-    w.setAmbient(item.poster);
-
-    if (item.streamId) {
-      w.Catalog.movieInfo(item.streamId).then(function (d) {
-        if (!d) { plot.textContent = ''; return; }
-        plot.textContent = d.plot || 'Sem sinopse disponível.';
-        w.clear(meta);
-        if (d.year) meta.appendChild(chip(d.year));
-        if (d.duration) meta.appendChild(chip(w.fmtLeft(d.duration)));
-        if (d.rating) meta.appendChild(chip('★ ' + d.rating, 'warn'));
-        if (d.genre) meta.appendChild(chip(d.genre));
-        var c = [];
-        if (d.director) c.push('<b>Direção:</b> ' + w.esc(d.director));
-        if (d.cast) c.push('<b>Elenco:</b> ' + w.esc(d.cast));
-        credits.innerHTML = c.join('<br>');
-        if (d.url) item.url = d.url;
-        if (d.poster) { art.style.backgroundImage = 'url("' + d.poster.replace(/"/g, '%22') + '")'; }
-      }).catch(function () { plot.textContent = ''; });
-    } else {
-      plot.textContent = '';
-    }
-
-    return Promise.resolve();
+    txt.appendChild(caixa);
+    topo.appendChild(txt);
+    return topo;
   }
 
-  /* =========================================================
-     TELA: DETALHE DE SÉRIE
-     ========================================================= */
-  function seriesDetail(params) {
-    var item = params.item;
-    var s = screen('screen-detail');
-    var inner = scroller(s);
-
-    var art = w.el('div', { class: 'detail-art' });
-    if (item.poster) art.style.backgroundImage = 'url("' + item.poster.replace(/"/g, '%22') + '")';
-    s.insertBefore(art, s.firstChild);
-
-    var head = w.el('div', { class: 'detail-head' });
-    var posterBox = w.el('div', { class: 'detail-poster' });
-    if (item.poster) posterBox.appendChild(w.el('img', { src: item.poster, alt: '' }));
-    var info = w.el('div', { class: 'detail-info' });
-    head.appendChild(posterBox); head.appendChild(info);
-    inner.appendChild(head);
-
-    info.appendChild(w.el('h1', { text: w.cleanName(item.title) }));
-    var meta = w.el('div', { class: 'detail-meta' });
-    info.appendChild(meta);
-    var plot = w.el('div', { class: 'detail-plot', text: 'Carregando temporadas…' });
-    info.appendChild(plot);
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    info.appendChild(btns);
-
-    var seasonsBar = w.el('div', { class: 'seasons', 'data-nav-axis': 'x' });
-    var epList = w.el('div', { class: 'episodes' });
-    inner.appendChild(seasonsBar);
-    inner.appendChild(epList);
-
-    w.setAmbient(item.poster);
-    w.Nav.focusFirst('.rail-item');
-
-    return w.Catalog.seriesInfo(item.seriesId).then(function (d) {
-      plot.textContent = d.plot || 'Sem sinopse disponível.';
-      w.clear(meta);
-      if (d.year) meta.appendChild(chip(d.year));
-      meta.appendChild(chip(d.seasons.length + (d.seasons.length === 1 ? ' temporada' : ' temporadas')));
-      if (d.rating) meta.appendChild(chip('★ ' + d.rating, 'warn'));
-      if (d.genre) meta.appendChild(chip(d.genre));
-
-      var all = [];
-      d.seasons.forEach(function (se) { all = all.concat(se.episodes); });
-
-      /* Botão principal: continuar de onde parou, ou o primeiro episódio. */
-      var last = w.Store.lastEpisodeOf(item.seriesId);
-      var target = null, label = 'Assistir T1 E1';
-      if (last) {
-        var idx = indexOfEpisode(all, last.id);
-        var savedRec = w.Store.progressOf(last.id);
-        if (idx >= 0 && savedRec && !savedRec.completed) {
-          target = all[idx];
-          label = 'Continuar T' + target.season + ' E' + target.episode;
-        } else if (idx >= 0 && all[idx + 1]) {
-          target = all[idx + 1];
-          label = 'Próximo: T' + target.season + ' E' + target.episode;
-        }
-      }
-      if (!target) target = all[0];
-
-      if (target) {
-        var bPlay = w.el('button', { class: 'btn', 'data-focusable': true,
-          html: w.icon('play', 'solid') + '<span>' + w.esc(label) + '</span>' });
-        bPlay.onclick = function () { playEpisode(target, all, d); };
-        btns.appendChild(bPlay);
-      }
-
-      var bFav = w.el('button', { class: 'btn ghost', 'data-focusable': true });
-      function paintFav() {
-        bFav.innerHTML = w.icon('star', w.Store.isFavorite(item.id) ? 'solid' : '') +
-                         '<span>' + (w.Store.isFavorite(item.id) ? 'Na sua lista' : 'Minha lista') + '</span>';
-      }
-      paintFav();
-      bFav.onclick = function () { w.Store.toggleFavorite(item); paintFav(); };
-      btns.appendChild(bFav);
-
-      var currentSeason = target ? target.season : (d.seasons[0] && d.seasons[0].season);
-
-      d.seasons.forEach(function (se) {
-        var b = w.el('button', { class: 'season-btn', 'data-focusable': true,
-                                 text: 'Temporada ' + se.season });
-        b.onclick = function () { showSeason(se, b); };
-        seasonsBar.appendChild(b);
-        if (se.season === currentSeason) setTimeout(function () { showSeason(se, b); }, 0);
-      });
-
-      function showSeason(se, btn) {
-        w.$$('.season-btn', seasonsBar).forEach(function (n) { n.classList.remove('active'); });
-        btn.classList.add('active');
-        w.clear(epList);
-        epList.setAttribute('data-nav-axis', 'y');
-        se.episodes.forEach(function (ep) {
-          epList.appendChild(episodeRow(ep, all, d));
-        });
-      }
-
-      if (btns.firstChild) w.Nav.focus(btns.firstChild);
-    }).catch(function (e) {
-      plot.textContent = '';
-      inner.appendChild(errorBlock(e, function () { w.App.go('series-detail', params); }));
-      w.Nav.focusFirst('.screen .btn') || w.Nav.focusFirst('.rail-item');
-    });
-  }
-
-  function indexOfEpisode(all, id) {
-    for (var i = 0; i < all.length; i++) if (all[i].id === id) return i;
-    return -1;
-  }
-
-  function episodeRow(ep, all, info) {
-    var b = w.el('button', { class: 'ep', 'data-focusable': true });
-    var th = w.el('div', { class: 'ep-thumb' });
-    if (ep.poster) {
-      var img = w.el('img', { 'data-src': ep.poster, alt: '' });
-      img.onerror = function () { img.style.display = 'none'; };
-      th.appendChild(img);
-      lazy(img);
-    }
-    th.appendChild(w.el('span', { class: 'ep-num', text: 'T' + ep.season + ' · E' + ep.episode }));
-
-    var p = w.Store.progressOf(ep.id);
-    if (p && p.duration) {
-      var bar = w.el('div', { class: 'card-progress' });
-      bar.appendChild(w.el('i', { style: 'width:' + Math.min(100, (p.position / p.duration) * 100) + '%' }));
-      th.appendChild(bar);
-    }
-
-    var body = w.el('div', { class: 'ep-body' });
-    var line = w.el('div', { class: 'ep-title' });
-    line.appendChild(w.el('span', { text: w.cleanName(ep.title) }));
-    if (ep.duration) line.appendChild(w.el('span', { class: 'ep-dur', text: w.fmtLeft(ep.duration) }));
-    body.appendChild(line);
-    body.appendChild(w.el('div', { class: 'ep-plot', text: ep.plot || '' }));
-    if (p) {
-      body.appendChild(w.el('div', { class: 'ep-state',
-        text: p.completed ? 'Assistido' :
-              (p.position > 30 ? 'Você parou em ' + w.fmtTime(p.position) : '') }));
-    }
-
-    b.appendChild(th); b.appendChild(body);
-    b.setAttribute('data-ambient', ep.poster || info.poster || '');
-    b.onclick = function () { playEpisode(ep, all, info); };
-    return b;
-  }
-
-  function playEpisode(ep, all, info) {
-    var idx = indexOfEpisode(all, ep.id);
-    var queue = all.map(function (e) {
-      return {
-        id: e.id, kind: 'episode', title: e.title,
-        subtitle: info.title + ' · T' + e.season + ' E' + e.episode,
-        poster: e.poster || info.poster, url: e.url, duration: e.duration,
-        seriesId: e.seriesId, seriesTitle: info.title,
-        season: e.season, episode: e.episode
-      };
-    });
-    play(queue[idx >= 0 ? idx : 0], { queue: queue, index: idx >= 0 ? idx : 0 });
-  }
-
-  /* =========================================================
-     TELA: BUSCA
-     ========================================================= */
-  function search() {
-    var s = screen('screen-search');
-    var inner = scroller(s);
-
-    var headBox = w.el('div', { class: 'page-head' });
-    headBox.appendChild(w.el('div', { class: 'page-title', text: 'Buscar' }));
-    headBox.appendChild(w.el('div', { class: 'page-sub',
-      text: 'Digite e o resultado aparece sozinho. Filmes, séries e canais ao mesmo tempo.' }));
-    inner.appendChild(headBox);
-
-    var box = w.el('div', { class: 'pad', style: 'margin-top:2rem' });
-    var field = w.el('div', { class: 'field' });
-    var input = w.el('input', { type: 'text', 'data-focusable': true,
-                                placeholder: 'Nome do filme, série ou canal…' });
-    field.appendChild(input);
-    box.appendChild(field);
-    inner.appendChild(box);
-
-    var status = w.el('div', { class: 'empty', text: 'Preparando o índice de busca…' });
-    inner.appendChild(status);
-
-    var results = w.el('div', { class: 'grid', 'data-nav-axis': 'grid',
-                                style: 'padding-left:4rem' });
-    inner.appendChild(results);
-
-    w.Nav.focus(input);
-
-    var index = null;
-    w.Catalog.buildSearchIndex(function (msg) { status.textContent = msg; })
-      .then(function (idx) {
-        index = idx;
-        status.textContent = idx.length.toLocaleString('pt-BR') + ' títulos prontos para busca.';
-      })
-      .catch(function (e) {
-        status.textContent = 'Não consegui montar o índice: ' + e.message;
-      });
-
-    var run = w.debounce(function () {
-      if (!index) return;
-      var q = input.value.trim();
-      w.clear(results);
-      if (q.length < 2) {
-        status.textContent = index.length.toLocaleString('pt-BR') + ' títulos prontos para busca.';
-        return;
-      }
-      var hits = w.Catalog.search(q, index);
-      status.textContent = hits.length
-        ? hits.length + (hits.length === 200 ? '+' : '') + ' resultados para “' + q + '”'
-        : 'Nada encontrado para “' + q + '”.';
-      hits.forEach(function (it) {
-        results.appendChild(card(it, {
-          shape: it.kind === 'live' ? 'logo' : 'poster',
-          live: it.kind === 'live',
-          note: it.kind === 'live' ? 'Canal' : it.kind === 'series' ? 'Série' : 'Filme',
-          onSelect: openItem
-        }));
-      });
-    }, 320);
-
-    input.addEventListener('input', run);
-    input.addEventListener('keyup', run);
-
-    return Promise.resolve();
-  }
-
-  /* =========================================================
-     TELA: PRIMEIRA CONFIGURAÇÃO
-     ========================================================= */
-  function setup() {
-    var s = screen('screen-setup');
-    var inner = scroller(s);
-
-    var head = w.el('div', { class: 'page-head' });
-    head.appendChild(w.el('div', { class: 'page-title', text: 'Vamos conectar sua lista' }));
-    head.appendChild(w.el('div', { class: 'page-sub',
-      text: 'Cole aqui o mesmo link que você usava no outro aplicativo. Eu descubro sozinho se ele fala a língua do Xtream.' }));
-    inner.appendChild(head);
-
-    var box = w.el('div', { class: 'pad', style: 'margin-top:2.4rem' });
-    inner.appendChild(box);
-
-    var f = w.el('div', { class: 'field' });
-    f.appendChild(w.el('label', { text: 'Endereço da lista M3U' }));
-    var input = w.el('input', { type: 'text', 'data-focusable': true,
-      value: w.Store.get('source.url', ''),
-      placeholder: 'http://servidor:porta/get.php?username=…&password=…' });
-    f.appendChild(input);
-    f.appendChild(w.el('div', { class: 'hint',
-      html: 'Use o controle para abrir o teclado da TV. Se preferir digitar do computador, ' +
-            'dá para colar esse endereço depois pelos Ajustes.' }));
-    box.appendChild(f);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var go = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Conectar' });
-    btns.appendChild(go);
-    box.appendChild(btns);
-
-    var log = w.el('div', { class: 'empty', style: 'padding-left:0' });
-    box.appendChild(log);
-
-    go.onclick = function () {
-      var url = input.value.trim();
-      log.innerHTML = '';
-      var line = w.el('div', { text: 'Conectando…' });
-      log.appendChild(line);
-      go.textContent = 'Conectando…';
-
-      w.Catalog.connect(url, function (msg) { line.textContent = msg; })
-        .then(function (res) {
-          w.toast(res.mode === 'xtream'
-            ? 'Conectado pela API do servidor — catálogo completo.'
-            : 'Lista carregada com ' + (res.count || 0) + ' itens.');
-          w.App.go('home', null, { replace: true });
-        })
-        .catch(function (e) {
-          go.textContent = 'Tentar de novo';
-          line.innerHTML = '<b>Não deu certo:</b> ' + w.esc(e.message);
-          log.appendChild(w.el('div', { style: 'margin-top:1rem;font-size:.9rem',
-            html: 'Se o endereço está certo, o problema costuma ser o servidor recusando ' +
-                  'a conexão vinda da TV. Veja a seção sobre proxy no README.' }));
-        });
-    };
-
-    w.Nav.focus(input);
-    return Promise.resolve();
-  }
-
-  /* =========================================================
-     TELA: AJUSTES
-     ========================================================= */
-  function settings() {
-    var s = screen('screen-settings');
-    var inner = scroller(s);
-
-    var head = w.el('div', { class: 'page-head' });
-    head.appendChild(w.el('div', { class: 'page-title', text: 'Ajustes' }));
-    head.appendChild(w.el('div', { class: 'page-sub', text: 'Fonte, nuvem e atualização do aplicativo.' }));
-    inner.appendChild(head);
-
-    var box = w.el('div', { class: 'pad', style: 'margin-top:2.2rem' });
-    inner.appendChild(box);
-
-    box.appendChild(panelUpdate());
-    box.appendChild(panelSource());
-    box.appendChild(panelCloud());
-    box.appendChild(panelData());
-
-    w.Nav.focusFirst('.screen-settings [data-focusable]');
-    return Promise.resolve();
-  }
-
-  function panel(title, sub) {
-    var p = w.el('div', { class: 'panel' });
-    p.appendChild(w.el('h3', { text: title }));
-    if (sub) p.appendChild(w.el('div', { class: 'sub', text: sub }));
-    return p;
-  }
-
-  function textField(label, value, placeholder, hint) {
-    var f = w.el('div', { class: 'field' });
-    f.appendChild(w.el('label', { text: label }));
-    var i = w.el('input', { type: 'text', 'data-focusable': true,
-                            value: value || '', placeholder: placeholder || '' });
-    f.appendChild(i);
-    if (hint) f.appendChild(w.el('div', { class: 'hint', html: hint }));
-    f.input = i;
-    return f;
-  }
-
-  /* ---- Atualização pelo GitHub ---- */
-  function panelUpdate() {
-    var p = panel('Atualizar pelo GitHub',
-      'O aplicativo instalado na TV é só uma casca. O código de verdade fica no seu repositório: ' +
-      'você dá git push no Mac e aperta o botão aqui.');
-
-    var loaded = (w.Updater && w.Updater.loaded) || {};
-    var kv = w.el('div', { style: 'margin-bottom:1.4rem' });
-    kv.appendChild(row2('Versão em execução', loaded.version || '?'));
-    kv.appendChild(row2('Origem', loaded.source === 'github' ? 'baixada do GitHub'
-                                : loaded.source === 'local' ? 'cópia que veio no aplicativo'
-                                : String(loaded.source || '?')));
-    if (loaded.rolledBackFrom) {
-      kv.appendChild(row2('Atenção', 'a versão ' + loaded.rolledBackFrom +
-                                     ' não iniciou e foi revertida automaticamente'));
-    }
-    p.appendChild(kv);
-
-    var fRepo = textField('Repositório', w.Store.get('update.repo', ''),
-      'seu-usuario/nebula-tv',
-      'No formato <b>usuario/repositorio</b>. O repositório pode ser público ou, se for privado, ' +
-      'a TV não vai conseguir baixar — use um público, já que aqui não vai nada sensível.');
-    var fBranch = textField('Ramo (branch)', w.Store.get('update.branch', 'main'), 'main');
-    var fDir = textField('Pasta do pacote', w.Store.get('update.dir', 'build'), 'build',
-      'É a pasta que o comando <b>npm run build</b> gera.');
-    p.appendChild(fRepo); p.appendChild(fBranch); p.appendChild(fDir);
-
-    var status = w.el('div', { class: 'sub', style: 'margin:0 0 1.2rem' });
-    p.appendChild(status);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    p.appendChild(btns);
-
-    var bSave = w.el('button', { class: 'btn ghost', 'data-focusable': true, text: 'Salvar endereço' });
-    bSave.onclick = function () {
-      w.Store.set('update.repo', fRepo.input.value.trim());
-      w.Store.set('update.branch', fBranch.input.value.trim() || 'main');
-      w.Store.set('update.dir', fDir.input.value.trim());
-      status.textContent = 'Endereço salvo: ' + (w.Updater.baseUrl() || '(incompleto)');
-      w.toast('Endereço salvo');
-    };
-
-    var pending = null;
-    var bCheck = w.el('button', { class: 'btn primary', 'data-focusable': true,
-                                  html: w.icon('refresh') + '<span>Procurar atualização</span>' });
-    bCheck.onclick = function () {
-      bSave.onclick();
-      status.textContent = 'Consultando o GitHub…';
-      w.Updater.check().then(function (info) {
-        pending = info;
-        if (!info.isNew) {
-          status.textContent = 'Você já está na versão mais recente (' + info.version + ').';
-          bInstall.classList.add('hidden');
-          return;
-        }
-        status.innerHTML = 'Versão nova disponível: <b>' + w.esc(info.version) + '</b>' +
-                           (info.notes ? ' — ' + w.esc(info.notes) : '');
-        bInstall.classList.remove('hidden');
-        w.Nav.focus(bInstall);
-      }).catch(function (e) {
-        status.textContent = 'Não consegui verificar: ' + e.message;
-        bInstall.classList.add('hidden');
-      });
-    };
-
-    var bInstall = w.el('button', { class: 'btn', 'data-focusable': true,
-                                    html: w.icon('down') + '<span>Instalar e reiniciar</span>' });
-    bInstall.classList.add('hidden');
-    bInstall.onclick = function () {
-      if (!pending) return;
-      status.textContent = 'Baixando…';
-      w.Updater.install(pending, function (msg) { status.textContent = msg; })
-        .then(function (r) {
-          status.textContent = 'Versão ' + r.version + ' instalada. Reiniciando…';
-          setTimeout(function () { w.Updater.reload(); }, 900);
-        })
-        .catch(function (e) { status.textContent = 'Falhou: ' + e.message; });
-    };
-
-    var bBack = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                 text: 'Voltar à versão anterior' });
-    bBack.onclick = function () {
-      w.confirmDialog('Voltar à versão anterior?',
-        'A TV vai reiniciar o aplicativo usando o pacote guardado antes da última atualização.',
-        'Voltar').then(function (yes) {
-          if (!yes) return;
-          if (w.Updater.rollback()) w.Updater.reload();
-          else w.toast('Não há versão anterior guardada.');
-        });
-    };
-
-    btns.appendChild(bCheck);
-    btns.appendChild(bInstall);
-    btns.appendChild(bSave);
-    if (w.Updater.hasPrevious && w.Updater.hasPrevious()) btns.appendChild(bBack);
-
-    if (w.Updater.baseUrl && w.Updater.baseUrl())
-      status.textContent = 'Buscando em ' + w.Updater.baseUrl();
-
-    return p;
-  }
-
-  function row2(k, v) {
-    var d = w.el('div', { class: 'kv' });
-    d.appendChild(w.el('b', { text: k }));
-    d.appendChild(w.el('span', { text: v }));
+  function ficha(rotulo, valor) {
+    var d = el('div', { class: 'det-ficha' });
+    d.appendChild(el('span', { class: 'det-ficha-k', text: rotulo }));
+    d.appendChild(el('span', { class: 'det-ficha-v', text: String(valor) }));
     return d;
   }
 
-  /* ---- Fonte da lista ---- */
-  function panelSource() {
-    var p = panel('Lista de canais', 'Onde o app busca o catálogo.');
+  function mesclar(a, b) {
+    var o = {};
+    Object.keys(a || {}).forEach(function (k) { o[k] = a[k]; });
+    Object.keys(b || {}).forEach(function (k) { if (b[k] != null && b[k] !== '') o[k] = b[k]; });
+    return o;
+  }
 
-    var acc = w.Store.get('source.account', null);
-    var kv = w.el('div', { style: 'margin-bottom:1.4rem' });
-    kv.appendChild(row2('Modo', w.Catalog.mode() === 'xtream'
-      ? 'API Xtream (catálogo completo)' : 'lista M3U (simples)'));
-    if (w.Store.get('source.username')) kv.appendChild(row2('Usuário', w.Store.get('source.username')));
-    if (acc && acc.expires) kv.appendChild(row2('Vence em', new Date(acc.expires).toLocaleDateString('pt-BR')));
-    if (acc && acc.maxConnections) kv.appendChild(row2('Conexões simultâneas', String(acc.maxConnections)));
-    p.appendChild(kv);
+  /* -----------------------------------------------------------
+     Busca
+     ----------------------------------------------------------- */
+  function busca() {
+    var tela = w.UI.tela('busca');
 
-    var f = textField('Endereço da lista', w.Store.get('source.url', ''),
-      'http://servidor:porta/get.php?username=…&password=…');
-    p.appendChild(f);
+    var topo = el('div', {
+      class: 'busca-topo', 'data-region': 'field', 'data-axis': 'x',
+      'data-nb-left': 'rail', 'data-nb-down': 'grid', 'data-enter': 'first'
+    });
+    var campo = el('input', { class: 'busca-campo', 'data-focusable': '',
+                              type: 'text', placeholder: 'Buscar filmes, séries e canais' });
+    topo.appendChild(campo);
 
-    var fProxy = textField('Proxy (só se precisar)', w.Store.get('source.proxy', ''),
-      'https://seu-worker.workers.dev/?url=',
-      'Deixe vazio primeiro. Preencha só se o app conectar no navegador mas não na TV — ' +
-      'aí o servidor da sua lista está recusando a origem da TV, e o proxy resolve. ' +
-      'O README traz o código pronto de um proxy gratuito no Cloudflare.');
-    p.appendChild(fProxy);
+    var conteudo = el('div', {
+      class: 'conteudo busca-res', 'data-region': 'grid', 'data-axis': 'grid',
+      'data-nb-left': 'rail', 'data-nb-up': 'field', 'data-enter': 'first'
+    });
+    conteudo.appendChild(w.UI.vazio('O que você quer ver?',
+      'Digite pelo menos duas letras.'));
 
-    var status = w.el('div', { class: 'sub', style: 'margin:0 0 1.2rem' });
-    p.appendChild(status);
+    tela.appendChild(topo);
+    tela.appendChild(conteudo);
+    w.UI.trocar(tela, 'field');
+    w.Nav.entrar('field');
 
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var bConn = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Reconectar' });
-    bConn.onclick = function () {
-      w.Store.set('source.proxy', fProxy.input.value.trim());
-      status.textContent = 'Conectando…';
-      w.Catalog.connect(f.input.value.trim(), function (m) { status.textContent = m; })
-        .then(function () { w.toast('Lista atualizada'); w.App.go('home', null, { replace: true }); })
-        .catch(function (e) { status.textContent = 'Falhou: ' + e.message; });
-    };
-    var bRefresh = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                    html: w.icon('refresh') + '<span>Limpar cache do catálogo</span>' });
-    bRefresh.onclick = function () {
-      w.Catalog.refresh().then(function () { w.toast('Cache limpo — o catálogo será rebaixado.'); });
-    };
-    btns.appendChild(bConn); btns.appendChild(bRefresh);
-    p.appendChild(btns);
+    var indice = null;
+    w.Catalog.indice().then(function (ix) { indice = ix; });
+
+    var procurar = w.debounce(function () {
+      var termo = campo.value.trim();
+      w.Virt.dentroDe(conteudo).forEach(function (c) { c.destruir(); });
+      w.clear(conteudo);
+
+      if (termo.length < 2) {
+        conteudo.appendChild(w.UI.vazio('O que você quer ver?', 'Digite pelo menos duas letras.'));
+        return;
+      }
+      if (!indice) {
+        conteudo.appendChild(el('div', { class: 'carregando', text: 'Montando o índice…' }));
+        return;
+      }
+      var achados = w.Catalog.buscar(termo, indice);
+      if (!achados.length) {
+        conteudo.appendChild(w.UI.vazio('Nada encontrado',
+          'Nenhum resultado para "' + termo + '".'));
+        return;
+      }
+      var g = w.UI.grade(achados, { forma: 'poster', colunas: COLUNAS, aoAbrir: abrir });
+      conteudo.appendChild(g);
+      w.UI.ligar(g);
+    }, 260);
+
+    campo.oninput = procurar;
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Ajustes
+     ----------------------------------------------------------- */
+  function painel(titulo, sub) {
+    var p = el('div', { class: 'painel' });
+    p.appendChild(el('h2', { class: 'painel-titulo', text: titulo }));
+    if (sub) p.appendChild(el('p', { class: 'painel-sub', text: sub }));
     return p;
   }
 
-  /* ---- Supabase ---- */
-  function panelCloud() {
-    var p = panel('Histórico na nuvem (Supabase)',
-      'É o que faz o ponto de onde você parou sobreviver a qualquer reinstalação do aplicativo.');
-
-    var fUrl = textField('URL do projeto', w.Store.get('cloud.url', ''),
-      'https://xxxxxxxx.supabase.co');
-    var fKey = textField('Chave anon (public)', w.Store.get('cloud.key', ''), 'eyJhbGciOi…',
-      'É a chave pública do projeto. Ela fica gravada na TV, então não guarde nada sensível nesse banco.');
-    p.appendChild(fUrl); p.appendChild(fKey);
-
-    var status = w.el('div', { class: 'sub', style: 'margin:0 0 1.2rem' });
-    var pend = w.Cloud.pending();
-    status.textContent = w.Cloud.enabled()
-      ? ('Ativo. ' + (pend ? pend + ' registro(s) esperando envio.' : 'Tudo sincronizado.') +
-         (w.Cloud.lastError() ? ' Último erro: ' + w.Cloud.lastError() : ''))
-      : 'Desligado — o histórico está só na TV.';
-    p.appendChild(status);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var bSave = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Salvar e testar' });
-    bSave.onclick = function () {
-      w.Store.set('cloud.url', fUrl.input.value.trim());
-      w.Store.set('cloud.key', fKey.input.value.trim());
-      status.textContent = 'Testando…';
-      w.Cloud.test()
-        .then(function () {
-          status.textContent = 'Funcionou. Trazendo o histórico que já estava na nuvem…';
-          return w.Cloud.pull();
-        })
-        .then(function (n) {
-          status.textContent = 'Tudo certo. ' + (n ? n + ' registros vieram da nuvem.' : 'Nada novo por lá.');
-          w.Cloud.flush();
-        })
-        .catch(function (e) {
-          status.textContent = 'Falhou: ' + e.message +
-            ' — confira se você rodou o supabase/schema.sql no painel do Supabase.';
-        });
-    };
-    var bSync = w.el('button', { class: 'btn ghost', 'data-focusable': true, text: 'Sincronizar agora' });
-    bSync.onclick = function () {
-      status.textContent = 'Sincronizando…';
-      w.Cloud.flush().then(function () { return w.Cloud.pull(); })
-        .then(function (n) { status.textContent = 'Pronto. ' + n + ' registros atualizados.'; })
-        .catch(function (e) { status.textContent = 'Falhou: ' + e.message; });
-    };
-    btns.appendChild(bSave); btns.appendChild(bSync);
-    p.appendChild(btns);
-    return p;
+  function linha(k, v) {
+    var d = el('div', { class: 'linha' });
+    d.appendChild(el('span', { class: 'linha-k', text: k }));
+    d.appendChild(el('span', { class: 'linha-v', text: String(v) }));
+    return d;
   }
 
-  /* ---- Dados locais ---- */
-  function panelData() {
-    var p = panel('Dados neste aparelho', 'Histórico, favoritos e cache guardados na TV.');
-    var hist = w.Store.historyList(999);
-    var kv = w.el('div', { style: 'margin-bottom:1.4rem' });
-    kv.appendChild(row2('Itens no histórico', String(hist.length)));
-    kv.appendChild(row2('Favoritos', String(w.Store.favorites().length)));
-    p.appendChild(kv);
+  function ajustes() {
+    var tela = w.UI.tela('ajustes');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    var caixa = el('div', {
+      class: 'paineis',
+      'data-region': 'opcoes', 'data-axis': 'y',
+      'data-nb-left': 'rail', 'data-enter': 'last'
+    });
 
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var bClear = w.el('button', { class: 'btn danger', 'data-focusable': true,
-                                  text: 'Apagar tudo e recomeçar' });
-    bClear.onclick = function () {
-      w.confirmDialog('Apagar tudo?',
-        'Isso remove a lista configurada, o histórico local, os favoritos e o cache. ' +
-        'O que já foi para o Supabase continua lá.',
-        'Apagar').then(function (yes) {
-          if (!yes) return;
-          w.Store.wipe();
-          w.Updater.reload();
-        });
+    /* --- atualização --- */
+    var pAtu = painel('Atualização',
+      'O app se atualiza pelo código no GitHub, sem pen drive.');
+    pAtu.appendChild(linha('Versão instalada',
+      (w.Updater && w.Updater.version && w.Updater.version()) || '—'));
+    var bAtu = el('button', { class: 'btn', 'data-focusable': '' });
+    bAtu.innerHTML = w.icon('refresh') + '<span>Procurar atualização</span>';
+    bAtu.onclick = function () {
+      var txt = bAtu.querySelector('span');
+      txt.textContent = 'Procurando…';
+      w.Updater.check().then(function (info) {
+        if (!info.isNew) { txt.textContent = 'Já está atualizado'; return; }
+        txt.textContent = 'Instalar versão ' + info.version;
+        bAtu.onclick = function () { w.Updater.apply(info); };
+      }).catch(function (e) { txt.textContent = 'Falhou: ' + e.message; });
     };
-    btns.appendChild(bClear);
-    p.appendChild(btns);
-    return p;
+    pAtu.appendChild(bAtu);
+    caixa.appendChild(pAtu);
+
+    /* --- conteúdo adulto --- */
+    var pAd = painel('Conteúdo adulto',
+      'Independentemente desta opção, nada de conteúdo adulto é gravado como ' +
+      'assistido, recente ou em andamento — nem entra em relacionados.');
+    var oculto = !!w.Store.get('adulto.ocultar');
+    var bAd = el('button', { class: 'btn ghost' + (oculto ? ' ativo' : ''), 'data-focusable': '' });
+    bAd.innerHTML = '<span>' + (oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo') + '</span>';
+    bAd.onclick = function () {
+      oculto = !oculto;
+      w.Store.set('adulto.ocultar', oculto);
+      bAd.classList.toggle('ativo', oculto);
+      bAd.querySelector('span').textContent =
+        oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo';
+      w.Catalog.limparCache();
+    };
+    pAd.appendChild(bAd);
+    caixa.appendChild(pAd);
+
+    /* --- dados --- */
+    var pD = painel('Dados', 'Cache do catálogo e fila do histórico.');
+    pD.appendChild(linha('Blocos em memória', w.Catalog.emMemoria()));
+    pD.appendChild(linha('Fila para a nuvem', w.Cloud.pending()));
+    var bL = el('button', { class: 'btn ghost', 'data-focusable': '' });
+    bL.innerHTML = '<span>Limpar cache do catálogo</span>';
+    bL.onclick = function () {
+      w.Catalog.limparCache().then(function () { w.toast('Cache limpo.'); });
+    };
+    pD.appendChild(bL);
+    caixa.appendChild(pD);
+
+    coluna.appendChild(caixa);
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'opcoes');
+    w.Nav.entrar('opcoes');
+    return tela;
   }
 
-  /* =========================================================
-     Exporta
-     ========================================================= */
+  /* -----------------------------------------------------------
+     Primeira configuração
+     ----------------------------------------------------------- */
+  function configurar() {
+    var tela = w.UI.tela('setup');
+    var caixa = el('div', {
+      class: 'setup-caixa', 'data-region': 'setup', 'data-axis': 'y', 'data-enter': 'first'
+    });
+    caixa.appendChild(el('h1', { text: 'Vamos conectar sua lista' }));
+    caixa.appendChild(el('p', { class: 'painel-sub',
+      text: 'Cole o endereço da sua lista M3U ou Xtream. Fica só nesta TV.' }));
+
+    var campo = el('input', { class: 'busca-campo', 'data-focusable': '', type: 'text',
+                              placeholder: 'http://servidor/get.php?username=…' });
+    campo.value = w.Store.get('source.url', '');
+    caixa.appendChild(campo);
+
+    var aviso = el('div', { class: 'setup-aviso' });
+    caixa.appendChild(aviso);
+
+    var b = el('button', { class: 'btn primary', 'data-focusable': '' });
+    b.innerHTML = '<span>Conectar</span>';
+    b.onclick = function () {
+      aviso.textContent = 'Conectando…';
+      w.Catalog.conectar(campo.value.trim(), function (m) { aviso.textContent = m; })
+        .then(function () { w.App.go('home', null, { replace: true }); })
+        .catch(function (e) { aviso.textContent = 'Não deu: ' + e.message; });
+    };
+    caixa.appendChild(b);
+
+    tela.appendChild(caixa);
+    w.UI.trocar(tela, 'setup');
+    w.Nav.entrar('setup');
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Segurar OK sobre um cartão
+     -----------------------------------------------------------
+     Canal não tem tela de detalhe: aperta OK e já está tocando.
+     Então o gesto que sobra para "eu gosto deste" é o toque
+     longo, que é o mesmo de qualquer celular e não gasta uma
+     tela nova nem uma tecla colorida.
+
+     A mecânica precisa de cuidado: `keydown` repete sozinho
+     enquanto a tecla fica presa (10 a 15 vezes por segundo no
+     controle da LG), então há uma trava para o toque longo não
+     disparar quinze vezes. E o OK curto só age no `keyup` —
+     senão o canal começaria a tocar enquanto você ainda decide
+     se vai segurar.
+     ----------------------------------------------------------- */
+  var SEGURAR = 550;
+  var segurando = false, relogioToque = null, jaAgiu = false;
+
+  function itemDoFoco() {
+    var a = w.Nav.atual();
+    return (a && a._item) ? a : null;
+  }
+
+  function alternarFavorito(cartao) {
+    var item = cartao._item;
+    var agora = w.Store.toggleFavorite(item);
+    cartao.classList.toggle('favorito', agora);
+    w.toast(agora
+      ? '★ ' + w.cleanName(item.title) + ' nos favoritos'
+      : w.cleanName(item.title) + ' fora dos favoritos');
+
+    /* Se você tirou um favorito enquanto olha a pasta Favoritos,
+       ele tem de sumir dali na hora — deixar um cartão morto na
+       lista é o tipo de coisa que faz duvidar se funcionou. */
+    var ativa = w.$('.cat-item.ativa');
+    if (!agora && ativa && ativa._cat && ativa._cat.id === FAVORITOS && ativa._recarregar) {
+      ativa._recarregar();
+    }
+  }
+
+  w.Nav.adicionarTecla(function (k, ev) {
+    if (k !== w.KEY.OK) return false;
+    if (w.Player && w.Player.isOpen()) return false;
+
+    var cartao = itemDoFoco();
+    if (!cartao) return false;                  /* botões comuns seguem o caminho normal */
+    if (ev && ev.repeat) return true;           /* auto-repeat: já estamos contando */
+    if (segurando) return true;
+
+    segurando = true; jaAgiu = false;
+    relogioToque = setTimeout(function () {
+      jaAgiu = true;
+      var c = itemDoFoco();
+      if (c) alternarFavorito(c);
+    }, SEGURAR);
+    return true;
+  });
+
+  document.addEventListener('keyup', function (ev) {
+    if (ev.keyCode !== w.KEY.OK || !segurando) return;
+    segurando = false;
+    clearTimeout(relogioToque);
+    if (jaAgiu) return;                         /* já favoritou: OK curto não abre */
+    var c = itemDoFoco();
+    if (c) c.click();
+  }, true);
+
+  /* -----------------------------------------------------------
+     API
+     ----------------------------------------------------------- */
   w.Views = {
-    home: home,
-    live:   function () { return browse('live',   'Categorias', 'canais'); },
-    movies: function () { return browse('movie',  'Categorias', 'filmes'); },
-    series: function () { return browse('series', 'Categorias', 'séries'); },
-    search: search,
-    setup: setup,
-    settings: settings,
-    movieDetail: movieDetail,
-    seriesDetail: seriesDetail,
-    stopBillboard: function () { clearInterval(bbTimer); }
+    home:         inicio,
+    live:         function () { return navegar('live',   'logo'); },
+    movies:       function () { return navegar('movie',  'poster'); },
+    series:       function () { return navegar('series', 'poster'); },
+    search:       busca,
+    settings:     ajustes,
+    setup:        configurar,
+    movieDetail:  detalheFilme,
+    seriesDetail: detalheSerie,
+
+    aoFocarCategoria: aoFocarCategoria,
+    stopBillboard: function () { clearTimeout(esperaCat); }
   };
 
 })(window);
@@ -3248,7 +5656,6 @@ window.CFG = {
     currentRoute = route;
     w.Views.stopBillboard();
     paintRail(r.rail);
-    w.setAmbient('');
     try {
       var out = r.view(params || {});
       if (out && out.catch) out.catch(function (e) { console.error(e); });
@@ -3302,23 +5709,30 @@ window.CFG = {
   }
 
   /* ---------------------------------------------------------
-     Reações ao foco: abre a barra lateral, troca o fundo
-     ambiente e pré-seleciona categorias.
+     Reações ao foco
+     ---------------------------------------------------------
+     Três coisas, nesta ordem, e a ordem importa:
+
+       1. a virtualização remonta a janela de cartões. Precisa
+          vir primeiro, porque as outras duas podem consultar o
+          DOM que ela acabou de mexer;
+       2. o menu lateral mostra os rótulos quando o foco entra
+          nele (só opacidade — a largura nunca muda);
+       3. a coluna de categorias carrega a pasta quando o foco
+          DESCANSA, não a cada tecla.
+
+     O fundo ambiente saiu daqui. Era o culpado número 1 da
+     queda de quadros: uma imagem grande trocando a cada
+     movimento de foco.
      --------------------------------------------------------- */
-  var catTimer = null;
-  w.Nav.onFocusHook = function (el) {
-    var inRail = !!(el.closest && el.closest('#rail'));
+  w.Nav.aoFocar = function (el) {
+    w.Virt.aoFocar(el);
+
+    var noMenu = !!(el.closest && el.closest('#rail'));
     var rail = w.$('#rail');
-    if (rail) rail.classList.toggle('open', inRail);
+    if (rail) rail.classList.toggle('open', noMenu);
 
-    w.setAmbient(el.getAttribute('data-ambient') || '');
-
-    clearTimeout(catTimer);
-    if (el._select) {
-      catTimer = setTimeout(function () {
-        if (w.Nav.current() === el) el._select();
-      }, 380);
-    }
+    w.Views.aoFocarCategoria(el);
   };
 
   /* ---------------------------------------------------------
@@ -3347,14 +5761,19 @@ window.CFG = {
     }
     if (currentRoute !== 'home') { w.App.go('home', null, { replace: true }); return true; }
 
-    w.confirmDialog('Sair do Nebula?', 'Você volta para a tela inicial da TV.', 'Sair')
+    w.confirmDialog('Sair do ClaudeTV?', 'Você volta para a tela inicial da TV.', 'Sair')
       .then(function (yes) { if (yes) { try { w.close(); } catch (e) {} } });
     return true;
   });
 
-  /* Teclas coloridas: atalhos rápidos. */
+  /* Teclas coloridas: atalhos rápidos.
+     A vermelha é a única que a tela pode interceptar: nas telas
+     com pasta aberta ela leva ao filtro DAQUELA pasta, que é o
+     que a pessoa quer ali. Fora delas, cai na busca global. */
   w.Nav.addKeyHandler(function (k) {
     if (w.Player.isOpen()) return false;
+    var tela = w.$('.screen');
+    if (tela && tela._tecla && tela._tecla(k)) return true;
     if (k === w.KEY.RED)    { w.App.go('search');   return true; }
     if (k === w.KEY.GREEN)  { w.App.go('live');     return true; }
     if (k === w.KEY.YELLOW) { w.App.go('movies');   return true; }
@@ -3390,7 +5809,7 @@ window.CFG = {
       '<div id="restore-msg">Reconectando à sua lista…</div></div></div>';
     var msg = w.$('#restore-msg');
 
-    w.Catalog.connect(w.Store.get('source.url'), function (m) { msg.textContent = m; })
+    w.Catalog.conectar(w.Store.get('source.url'), function (m) { msg.textContent = m; })
       .then(function () {
         if (!w.Cloud.enabled()) return 0;
         msg.textContent = 'Trazendo o histórico da nuvem…';

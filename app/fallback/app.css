@@ -1,44 +1,57 @@
 /* =========================================================
-   NEBULA — folha de estilo única
-   Projetada para 1920×1080 e escalada por rem: a raiz cresce
-   com a largura da tela, então a mesma interface serve 720p,
-   1080p e 4K sem nenhum ajuste.
+   ClaudeTV — folha de estilo
+   =========================================================
+   Escrita sob as regras da seção 4 do SPEC.md. As três que
+   mandam em tudo:
+
+     · só `transform` e `opacity` animam;
+     · nenhum filtro em tempo de execução (zero blur);
+     · `will-change` é responsabilidade do JS, nunca do CSS.
+
+   Se for preciso violar alguma delas, o documento é que muda
+   primeiro — e com uma medição junto.
+
+   Escala: 1rem = 100vw / 96, ou seja 20px numa tela de 1920.
+   O corpo de texto fica em 28px, dentro do mínimo de 10 pés.
    ========================================================= */
 
 :root {
-  --bg:        #07080B;
-  --bg-2:      #0B0E14;
-  --surface:   #141821;
-  --surface-2: #1D2331;
-  --line:      rgba(255,255,255,.08);
-  --text:      #F2F4F8;
-  --muted:     #949CAB;
-  --dim:       #5C6474;
-  --accent:    #7C5CFF;
-  --accent-2:  #4EA8FF;
-  --hot:       #FF4D6D;
-  --ok:        #38D39F;
-  --warn:      #FFC46B;
+  --bg:        #0B0908;
+  --bg-2:      #120E0D;
+  --surface:   #1A1513;
+  --surface-2: #241C19;
+  --linha:     rgba(255,255,255,.09);
 
-  --rail-w:      6rem;
-  --rail-open:   16rem;
-  --pad:         4rem;
-  --ease:        cubic-bezier(.22,.68,.28,1);
-  --ease-out:    cubic-bezier(.16,1,.3,1);
+  --texto:     #F2EFED;    /* dentro da faixa segura de TV, não é branco puro */
+  --suave:     #A79E99;
+  --fraco:     #6B615C;
+
+  --cor:       #E8845C;    /* coral */
+  --cor-2:     #C95C40;    /* terracota */
+  --quente:    #F0B082;
+  --ok:        #4FC28A;
+  --alerta:    #FF6B6B;
+
+  --menu:      5.6rem;     /* 112px — largura FIXA, nunca animada */
+  --pad:       4.8rem;     /* 96px — área segura lateral */
+  --pad-v:     2.7rem;     /* 54px — área segura vertical */
+
+  --rapido:    120ms;      /* acima disso o auto-repeat atropela */
+  --curva:     cubic-bezier(.2,.7,.3,1);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html {
-  font-size: calc(100vw / 120);      /* 16px @ 1920 */
+  font-size: calc(100vw / 96);
   background: var(--bg);
 }
 
 body {
   font-family: "LG Smart UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
   background: var(--bg);
-  color: var(--text);
-  height: 100vh; width: 100vw;
+  color: var(--texto);
+  width: 100vw; height: 100vh;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   user-select: none;
@@ -51,475 +64,423 @@ button, input { font: inherit; color: inherit; cursor: none; }
 svg {
   width: 1.6rem; height: 1.6rem;
   fill: none; stroke: currentColor;
-  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
 }
 svg.solid { fill: currentColor; stroke: none; }
 
 /* =========================================================
-   Fundo ambiente — a capa do item em foco, muito desfocada.
-   É o que dá a sensação de o app respirar junto com o conteúdo.
+   Foco — três sinais, todos baratos
+   ---------------------------------------------------------
+   `outline` não participa do layout e não borra. `transform`
+   é do compositor. A sombra existe, mas é ESTÁTICA: nunca
+   entra numa transição.
    ========================================================= */
-#ambient {
-  position: fixed; inset: -10%;
-  z-index: 0; pointer-events: none;
-  background-size: cover; background-position: center;
-  filter: blur(5rem) saturate(1.6);
-  opacity: 0;
-  transform: scale(1.15);
-  transition: opacity 1.1s var(--ease);
-}
-#ambient.on { opacity: .30; }
-
-#ambient-veil {
-  position: fixed; inset: 0; z-index: 1; pointer-events: none;
-  background:
-    radial-gradient(120% 90% at 20% 0%,   rgba(124,92,255,.10), transparent 60%),
-    radial-gradient(90% 80%  at 100% 100%, rgba(78,168,255,.08), transparent 60%),
-    linear-gradient(180deg, rgba(7,8,11,.55), rgba(7,8,11,.88));
-}
+.focused { outline: .2rem solid #FFF; outline-offset: 0; }
 
 /* =========================================================
-   Barra lateral
+   Menu lateral — largura fixa
+   ---------------------------------------------------------
+   Animar `width` é layout a cada quadro. Os rótulos aparecem
+   por opacidade num painel sobreposto, que não empurra nada.
    ========================================================= */
 #rail {
-  position: fixed; top: 0; left: 0; bottom: 0; z-index: 40;
-  width: var(--rail-w);
+  position: fixed; left: 0; top: 0; bottom: 0; z-index: 40;
+  width: var(--menu);
   display: flex; flex-direction: column;
-  padding: 1.8rem 0;
-  overflow: hidden;
-  background: linear-gradient(90deg, rgba(5,6,9,.96) 40%, rgba(5,6,9,0));
-  transition: width .3s var(--ease), background .3s var(--ease);
-}
-#rail.open {
-  width: var(--rail-open);
-  background: linear-gradient(90deg, #05060A 72%, rgba(5,6,9,.6));
-  box-shadow: 1.5rem 0 5rem rgba(0,0,0,.75);
+  padding: var(--pad-v) 0;
+  background: #070505;
 }
 
 .rail-logo {
-  width: var(--rail-w); min-width: var(--rail-w); height: 3rem;
+  width: 100%; height: 3.2rem;
   display: flex; align-items: center; justify-content: center;
-  margin-bottom: 2.6rem;
+  margin-bottom: 2.4rem;
 }
-.rail-logo svg {
-  width: 2.2rem; height: 2.2rem;
-  fill: var(--accent); stroke: none;
-  filter: drop-shadow(0 0 1rem rgba(124,92,255,.85));
-}
+.rail-logo svg { width: 2.2rem; height: 2.2rem; fill: var(--cor); stroke: none; }
 
-.rail-items { list-style: none; display: flex; flex-direction: column; gap: .3rem; }
+/* Sem espaço entre os itens: os rótulos que aparecem à direita
+   formam uma faixa contínua. Com folga entre eles, a faixa
+   apareceria recortada. O respiro vem do padding de dentro. */
+.rail-items { list-style: none; display: flex; flex-direction: column; gap: 0; }
 .rail-bottom { margin-top: auto; }
 
 .rail-item {
   position: relative;
-  display: flex; align-items: center; gap: 1.15rem;
-  width: 100%; height: 3.5rem;
-  padding-left: calc((var(--rail-w) - 1.6rem) / 2);
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; height: 3.6rem;            /* 72px, acima do mínimo de 64 */
   background: none; border: 0;
-  color: var(--dim);
-  font-size: 1.02rem; white-space: nowrap;
-  border-radius: 0 1.75rem 1.75rem 0;
-  transition: color .22s var(--ease), background .22s var(--ease);
+  color: var(--fraco);
 }
-.rail-item span {
-  opacity: 0; transform: translateX(-.4rem);
-  transition: opacity .22s var(--ease), transform .22s var(--ease);
-}
-#rail.open .rail-item span { opacity: 1; transform: none; }
-
-.rail-item.active { color: var(--text); }
+.rail-item.active { color: var(--texto); }
 .rail-item.active::before {
   content: ""; position: absolute; left: 0; top: 50%;
-  transform: translateY(-50%);
-  width: .25rem; height: 1.9rem; border-radius: 0 .3rem .3rem 0;
-  background: linear-gradient(180deg, var(--accent), var(--accent-2));
-  box-shadow: 0 0 1rem rgba(124,92,255,.9);
+  margin-top: -1rem;
+  width: .16rem; height: 2rem; border-radius: 0 .2rem .2rem 0;
+  background: var(--cor);
 }
-.rail-item.focused {
-  color: #fff;
-  background: linear-gradient(90deg, rgba(124,92,255,.32), rgba(124,92,255,0));
-}
-.rail-item.focused svg { filter: drop-shadow(0 0 .7rem rgba(124,92,255,.95)); }
+.rail-item.focused { color: #FFF; outline-offset: -.2rem; }
 
-#clock {
-  position: fixed; top: 2.2rem; right: var(--pad); z-index: 45;
-  font-size: 1.05rem; font-weight: 550; letter-spacing: .02em;
-  color: rgba(242,244,248,.55);
-  font-variant-numeric: tabular-nums;
-  text-shadow: 0 .2rem 1rem rgba(0,0,0,.8);
-  pointer-events: none;
+/* Rótulo: sai do próprio item, sobreposto ao palco. Não empurra
+   nada, não reflui nada — só a opacidade muda. */
+.rail-label {
+  position: absolute; left: 100%; top: 0;
+  height: 100%; width: 10rem;
+  display: flex; align-items: center;
+  padding-left: .2rem;
+  font-size: 1.1rem; color: var(--suave); white-space: nowrap;
+  background: linear-gradient(90deg, #070505 55%, rgba(7,5,5,0));
+  opacity: 0; pointer-events: none;
+  transition: opacity var(--rapido) var(--curva);
 }
-#clock small { display: block; font-size: .72rem; font-weight: 400;
-               color: var(--dim); text-align: right; margin-top: .1rem; }
+#rail.open .rail-label { opacity: 1; }
+.rail-item.active .rail-label { color: var(--texto); }
+.rail-item.focused .rail-label { color: #FFF; }
 
 /* =========================================================
    Palco e telas
    ========================================================= */
-#stage { position: absolute; inset: 0 0 0 var(--rail-w); z-index: 10; }
+#stage { position: absolute; inset: 0 0 0 var(--menu); z-index: 10; }
 
 .screen { position: absolute; inset: 0; overflow: hidden; }
-.screen.enter { animation: screenIn .42s var(--ease-out) both; }
-@keyframes screenIn {
-  from { opacity: 0; transform: translateY(1.6rem) scale(.995); }
-  to   { opacity: 1; transform: none; }
-}
+.screen.enter { animation: entrar .24s var(--curva) both; }
+@keyframes entrar { from { opacity: 0 } to { opacity: 1 } }   /* só opacity */
 
-.screen-scroll { position: absolute; inset: 0; overflow: hidden; }
-.screen-inner  { padding: 0 0 8rem; will-change: transform;
-                 transition: transform .38s var(--ease-out); }
+/* Janela: recorta. Trilho: se move. O JS mexe no transform.
+   O trilho é criado pelo `virt.js`, com largura e altura do
+   tamanho que a lista TERIA inteira — é o que mantém o limite
+   de rolagem correto mesmo com os cartões sendo reciclados. */
+.janela { position: relative; overflow: hidden; }
+.janela.cheia { position: absolute; inset: 0; }
+.trilho { position: relative; transition: transform .22s var(--curva); }
+
 .pad { padding-left: var(--pad); padding-right: var(--pad); }
 
-.page-head  { padding: 3.4rem var(--pad) 0; }
-.page-title { font-size: 2.9rem; font-weight: 700; letter-spacing: -.03em; line-height: 1.05; }
-.page-sub   { color: var(--muted); font-size: 1.02rem; margin-top: .5rem; }
+.page-head  { padding: var(--pad-v) var(--pad) 0; }
+.page-title { font-size: 2.8rem; font-weight: 700; letter-spacing: -.02em; }
+.page-sub   { color: var(--suave); font-size: 1.2rem; margin-top: .5rem; }
 
 .section-title {
-  display: flex; align-items: baseline; gap: .9rem;
-  font-size: 1.32rem; font-weight: 650; letter-spacing: -.01em;
-  margin: 0; padding-left: var(--pad);
+  display: flex; align-items: baseline; gap: .8rem;
+  font-size: 1.5rem; font-weight: 650;
+  padding-left: var(--pad); margin-bottom: .2rem;
 }
-.section-title small { color: var(--dim); font-weight: 400; font-size: .82rem; letter-spacing: .02em; }
-
-/* =========================================================
-   Billboard (destaque grande da tela inicial)
-   ========================================================= */
-.billboard {
-  position: relative; height: 32rem;
-  display: flex; align-items: flex-end;
-  padding: 0 var(--pad) 3rem;
-  overflow: hidden;
-}
-.bb-art {
-  position: absolute; inset: 0;
-  background-size: cover; background-position: center 20%;
-  opacity: 0; transform: scale(1.06);
-  transition: opacity 1s var(--ease), transform 9s linear;
-}
-.bb-art.on { opacity: .85; transform: scale(1.13); }
-.billboard::after {
-  content: ""; position: absolute; inset: 0;
-  background:
-    linear-gradient(90deg, var(--bg) 6%, rgba(7,8,11,.72) 38%, rgba(7,8,11,.1) 72%),
-    linear-gradient(0deg,  var(--bg) 2%, rgba(7,8,11,.25) 40%, transparent 70%);
-}
-.bb-body { position: relative; z-index: 3; max-width: 48rem; }
-.bb-kicker {
-  display: inline-flex; align-items: center; gap: .5rem;
-  font-size: .74rem; letter-spacing: .22em; text-transform: uppercase;
-  color: var(--accent-2); font-weight: 700; margin-bottom: .9rem;
-}
-.bb-kicker::before {
-  content: ""; width: .35rem; height: .35rem; border-radius: 50%;
-  background: var(--accent-2); box-shadow: 0 0 .6rem var(--accent-2);
-}
-.bb-title {
-  font-size: 3.6rem; line-height: 1.02; letter-spacing: -.035em;
-  font-weight: 750; margin-bottom: .8rem;
-  text-shadow: 0 .3rem 2rem rgba(0,0,0,.7);
-}
-.bb-meta { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; flex-wrap: wrap; }
-.bb-desc {
-  color: rgba(242,244,248,.78); font-size: 1.02rem; line-height: 1.55;
-  margin-bottom: 1.6rem; max-width: 40rem;
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
-}
-.bb-dots { position: absolute; right: var(--pad); bottom: 3.4rem; z-index: 3;
-           display: flex; gap: .4rem; align-items: center; }
-.bb-dots i { width: .4rem; height: .4rem; border-radius: 50%;
-             background: rgba(255,255,255,.25); transition: all .3s var(--ease); }
-.bb-dots i.on { width: 1.5rem; border-radius: .2rem; background: var(--accent); }
+.section-title small { color: var(--fraco); font-weight: 400; font-size: 1rem; }
 
 /* =========================================================
    Fileiras e cards
    ========================================================= */
-.row { margin-top: 2.2rem; }
-.row-track {
-  display: flex; align-items: flex-start; gap: 1rem;
-  padding: 1.1rem var(--pad) 1.4rem;
-  will-change: transform;
-  transition: transform .38s var(--ease-out);
+.row { margin-top: 1.8rem; }
+.row-title {
+  padding: 0 var(--pad) .7rem;
+  font-size: 1.25rem; font-weight: 700; letter-spacing: -.01em;
 }
+.row-title .row-sub {
+  margin-left: .7rem; font-size: 1rem; font-weight: 500; color: var(--fraco);
+}
+
+/* A janela da fileira precisa de altura fixa: é dela que o
+   `virt.js` deduz quantos cartões cabem. Cada forma tem a sua,
+   somando capa + duas linhas de nome + a folga do foco (o
+   cartão cresce 4% ao ser focado e não pode ser recortado). */
+.janela.fileira { padding: .6rem 0 .6rem var(--pad); }
+.janela.fileira.forma-poster { height: 19.4rem; }
+.janela.fileira.forma-wide   { height: 14.6rem; }
+.janela.fileira.forma-logo   { height: 12rem; }
+
+/* A grade vive ao lado da coluna de categorias, que já dá o
+   respiro da esquerda. Repetir a área segura inteira aqui
+   empurrava a última coluna para fora da tela. */
+.janela.grade { padding: .6rem 2rem .6rem 2rem; }
 
 .card {
   position: relative; flex: 0 0 auto;
   background: none; border: 0; padding: 0;
   color: inherit; text-align: left;
-  transition: transform .26s var(--ease-out);
+  transition: transform var(--rapido) var(--curva);
+  /* Isola o card para o que muda dentro dele não invalidar os
+     vizinhos — mas SEM `paint`. Com recorte de pintura, a moldura
+     de foco, que é desenhada por FORA da capa, era cortada na
+     borda do cartão: dava a impressão de estar atrás da imagem.
+     `layout` sozinho dá o isolamento que interessa e não recorta
+     nada. */
+  contain: layout;
 }
+/* -----------------------------------------------------------
+   A IMAGEM DENTRO DA CAPA
+   -----------------------------------------------------------
+   Faltava esta regra inteira, e o efeito era o que você viu:
+   a <img> vinha no tamanho natural do arquivo, estourava a
+   casca e o que aparecia era um pedaço ampliado do meio.
+
+   `cover` para cartaz e para capa larga: recortar as bordas de
+   uma foto é aceitável. `contain` para logo de canal: recortar
+   um logotipo é destruí-lo, então ele encolhe até caber e
+   sobra fundo — que é o certo.
+   ----------------------------------------------------------- */
+.card .shell img {
+  display: block;
+  width: 100%; height: 100%;
+  object-fit: cover; object-position: center;
+}
+.card-logo .shell img {
+  object-fit: contain;
+  padding: .8rem;
+}
+/* Cartaz em pé numa moldura deitada.
+   -----------------------------------------------------------
+   Encaixar inteiro (`contain`) resolvia o recorte mas deixava
+   tarja preta dos dois lados e matava o visual cheio da fileira.
+   O meio-termo certo é continuar preenchendo e mudar ONDE se
+   corta: cartaz de filme põe título e rosto no terço de cima,
+   então é de lá que a faixa sai. O cartão fica cheio e o que
+   aparece é a parte que identifica o filme. */
+.card-wide .shell.retrato img { object-position: center 18%; }
+
 .card .shell {
   position: relative; overflow: hidden;
-  border-radius: .8rem;
-  background: linear-gradient(150deg, #1B2230, #10141C);
-  box-shadow: 0 .6rem 1.6rem rgba(0,0,0,.45);
-  transition: box-shadow .26s var(--ease-out);
+  border-radius: .55rem;
+  background: var(--surface);
+  /* Sem sombra nenhuma. A medição mostrou que mesmo estática ela
+     custa: ao escalar o card, o navegador precisa redesenhar o
+     retângulo borrado junto. A 3 metros de distância a sombra não
+     é percebida — o que separa o card do fundo é o próprio card. */
+  contain: paint;
 }
-.card.focused { transform: scale(1.09) translateY(-.3rem); z-index: 6; }
-.card.focused .shell {
-  box-shadow: 0 0 0 .18rem #fff,
-              0 0 0 .5rem rgba(124,92,255,.35),
-              0 1.6rem 3.4rem rgba(0,0,0,.8);
-}
-.card.focused .card-name { color: #fff; }
+.card.focused { transform: scale(1.04); z-index: 6; outline: none; }
+.card.focused .shell { outline: .2rem solid #FFF; }
+.card.focused .card-name { color: #FFF; }
 
 .thumb { display: block; width: 100%; height: 100%; object-fit: cover; }
-.thumb.contain { object-fit: contain; padding: 1.1rem; }
+.thumb.contain { object-fit: contain; padding: .9rem; }
 
-.card-poster        { width: 11.5rem; }
-.card-poster .shell { height: 17.2rem; }
-.card-wide          { width: 20rem; }
-.card-wide .shell   { height: 11.25rem; }
-.card-logo          { width: 13.5rem; }
-.card-logo .shell   { height: 8rem; background: linear-gradient(150deg,#1A2130,#0E121A); }
+.card-poster        { width: 9.2rem; }     /* 184px */
+.card-poster .shell { height: 13.8rem; }
+.card-wide          { width: 16rem; }
+.card-wide .shell   { height: 9rem; }
+.card-logo          { width: 11rem; }
+.card-logo .shell   { height: 6.4rem; background: var(--surface-2); }
 
 .card-fallback {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 2rem; font-weight: 750; letter-spacing: -.02em;
-  color: rgba(255,255,255,.2);
-  background: linear-gradient(150deg, #1D2533, #10141C);
+  font-size: 1.8rem; font-weight: 750;
+  color: rgba(255,255,255,.18);
+  background: var(--surface-2);
 }
 
-.card-meta { padding: .65rem .15rem 0; width: 100%; }
+.card-meta { padding: .5rem .1rem 0; width: 100%; }
 .card-name {
-  font-size: .88rem; line-height: 1.28; font-weight: 550; color: var(--muted);
+  font-size: 1.05rem;                       /* 21px */
+  line-height: 1.25; font-weight: 550; color: var(--suave);
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-  overflow: hidden; transition: color .2s var(--ease);
+  overflow: hidden;
+  /* Altura fixa de duas linhas. Sem isto, o cartão medido pela
+     virtualização tinha a altura de UM título curto, e todos os
+     títulos de duas linhas ficavam cortados pela fileira de
+     baixo — o que na tela parecia texto vazando. O passo da
+     grade precisa de cartões do mesmo tamanho. */
+  height: 2.7rem;
+  /* sem transição de cor: repintar texto duas vezes por tecla custa,
+     e a troca instantânea é imperceptível a 3 metros */
 }
-.card-note { font-size: .74rem; color: var(--dim); margin-top: .2rem; }
+.card-note { font-size: .9rem; color: var(--fraco); margin-top: .15rem; }
 
 .card-scrim {
-  position: absolute; inset: auto 0 0 0; height: 55%;
-  background: linear-gradient(0deg, rgba(4,5,8,.92), transparent);
+  position: absolute; inset: auto 0 0 0; height: 50%;
+  background: linear-gradient(0deg, rgba(6,5,4,.9), rgba(6,5,4,0));
 }
 .card-overlay {
-  position: absolute; left: .7rem; right: .7rem; bottom: .6rem;
-  font-size: .82rem; font-weight: 600; line-height: 1.25;
+  position: absolute; left: .6rem; right: .6rem; bottom: .5rem;
+  font-size: 1rem; font-weight: 600; line-height: 1.25;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 
 .card-progress {
-  position: absolute; left: 0; right: 0; bottom: 0; height: .22rem;
-  background: rgba(255,255,255,.2);
+  position: absolute; left: 0; right: 0; bottom: 0; height: .18rem;
+  background: rgba(255,255,255,.22);
 }
-.card-progress i {
-  display: block; height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
-  box-shadow: 0 0 .5rem rgba(124,92,255,.9);
+.card-progress i { display: block; height: 100%; background: var(--cor); }
+
+/* -----------------------------------------------------------
+   Etiquetas na capa
+   -----------------------------------------------------------
+   Você pediu faixa ou etiqueta em cima das capas do que está
+   assistindo ou já assistiu. Conteúdo adulto nunca recebe
+   nenhuma delas — não por estilo, por decisão de privacidade:
+   o `UI.marcasDe()` devolve vazio antes de chegar aqui.
+   ----------------------------------------------------------- */
+.card-tag {
+  position: absolute; z-index: 2;
+  left: .45rem; right: auto; bottom: .55rem; top: auto;
+  max-width: calc(100% - .9rem);
+  /* SEM flex. Elemento em `position: absolute` tem o display
+     "blocado" pelo próprio CSS: `inline-flex` vira `flex`, e o
+     flex aqui espremia o texto até sobrar só o ícone — na tela
+     aparecia "ssi" recortado. Medido no navegador, na aba do
+     app real: a caixa vinha com 23px de largura.
+     Bloco com `nowrap` e ícone inline resolve e não tem
+     sutileza nenhuma. */
+  display: block; width: max-content;
+  padding: .2rem .5rem; border-radius: .22rem;
+  font-size: .8rem; font-weight: 700; line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: rgba(6,5,4,.88); color: #FFF;
+}
+/* As duas ficam no MESMO canto e com a MESMA forma. Antes a de
+   "assistido" ficava no topo, com largura livre, e o texto era
+   recortado pela borda da capa — aparecia "ssistido". */
+.card-tag svg {
+  width: .9rem; height: .9rem; stroke-width: 3;
+  display: inline-block; vertical-align: -.13rem; margin-right: .3rem;
+}
+.card-tag > span { display: inline; }
+.card-tag.visto svg { color: var(--ok); }
+.card-tag.andamento { color: var(--quente); }
+.card-tag.andamento::before {
+  content: ""; display: inline-block; vertical-align: .08rem;
+  width: .4rem; height: .4rem; border-radius: 50%;
+  background: var(--cor); margin-right: .35rem;
 }
 
-.tag {
-  position: absolute; top: .55rem; left: .55rem; z-index: 2;
-  font-size: .6rem; font-weight: 800; letter-spacing: .12em;
-  padding: .2rem .45rem; border-radius: .25rem;
-  background: var(--hot); color: #fff;
-  box-shadow: 0 .2rem .8rem rgba(0,0,0,.5);
+/* Qualidade do canal. Quando está travada — você entrou pela
+   pasta de 4K — o selo ganha a cor da marca, para a diferença
+   entre "é isso que tem" e "é isso que eu escolhi" ser visível. */
+.card-qual {
+  position: absolute; top: .45rem; left: .45rem; z-index: 2;
+  font-size: .72rem; font-weight: 800; letter-spacing: .06em;
+  padding: .15rem .4rem; border-radius: .2rem;
+  background: rgba(6,5,4,.78); color: rgba(255,255,255,.85);
 }
-.tag.soft { background: rgba(10,12,18,.82); color: var(--text); }
+.card-qual.travada { background: var(--cor); color: #FFF; }
 
-.play-hint {
-  position: absolute; inset: 0; z-index: 2;
-  display: flex; align-items: center; justify-content: center;
-  opacity: 0; transition: opacity .22s var(--ease);
-  background: rgba(6,8,12,.35);
-}
-.play-hint svg { width: 2.8rem; height: 2.8rem; fill: #fff; stroke: none;
-                 filter: drop-shadow(0 .3rem 1rem rgba(0,0,0,.8)); }
-.card.focused .play-hint { opacity: 1; }
+/* Esqueleto: mesma caixa, sem conteúdo. Serve para a tela não
+   pular quando a lista chega. Sem animação de brilho — pulsar
+   dez caixas ao mesmo tempo é gasto de quadro por nada. */
+.card.vazio .shell { background: var(--surface-2); }
+.esqueleto .trilho { display: flex; gap: 1rem; }
 
-/* Fileira numerada estilo Top 10 */
+/* Selo de assistido / marcador de ao vivo */
+/* AQUI estava o bug da etiqueta "Assistido", e ele levou três
+   tentativas minhas porque eu procurava no lugar errado.
+
+   Sobrou da versão anterior uma regra `.visto` — sem o
+   `.card-tag` na frente. Mesma especificidade da minha, mas
+   escrita DEPOIS no arquivo, então ganhava: fixava a caixa em
+   1,3rem × 1,3rem no canto superior direito. O texto "Assistido"
+   não cabia em 26px e aparecia recortado como "ssi".
+
+   Medido na aba do app de verdade: 23px de largura. Eu tinha
+   reescrito a regra certa duas vezes e ela nunca ia vencer.
+   Removida. Fica o registro para ninguém recriar uma classe
+   solta com nome genérico.
+   ---------------------------------------------------------- */
+
+/* Fileira numerada. Sem stroke de texto animado: cor sólida. */
 .card-rank { display: flex; align-items: flex-start; width: auto; }
-.card-rank > div { width: 11.5rem; flex: 0 0 auto; }
-.card-rank .num { margin-top: 9.7rem; }   /* 17.2rem do pôster − 7.5rem do numeral */
 .card-rank .num {
-  font-size: 7.5rem; line-height: .78; font-weight: 800; letter-spacing: -.08em;
-  color: transparent; -webkit-text-stroke: .12rem rgba(255,255,255,.32);
-  margin-right: -1.4rem; flex: 0 0 auto;
-  transition: -webkit-text-stroke-color .25s var(--ease);
+  flex: 0 0 auto; margin: 7.5rem -1rem 0 0;
+  font-size: 6rem; line-height: .8; font-weight: 800; letter-spacing: -.06em;
+  color: var(--surface-2);
+  transition: color var(--rapido) var(--curva);
 }
-.card-rank.focused .num { -webkit-text-stroke-color: var(--accent); }
+.card-rank.focused .num { color: var(--cor-2); }
+.card-rank > div { width: 9.2rem; flex: 0 0 auto; }
 
 /* =========================================================
    Categorias + grade
+   =========================================================
+   Duas regiões lado a lado, e o motor de navegação sabe disso:
+   `cats` declara `data-nb-right="grid"`, `grid` declara
+   `data-nb-left="cats"`. Era exatamente esta declaração que
+   faltava quando as duas colunas se comportavam como uma só.
    ========================================================= */
-.split { display: flex; height: 100%; }
-
-.cats {
-  width: 20rem; min-width: 20rem; height: 100%;
-  padding: 3.4rem 1.2rem 3rem var(--pad);
-  overflow: hidden;
-  border-right: 1px solid var(--line);
-  background: linear-gradient(90deg, rgba(11,14,20,.6), transparent);
+.coluna-cats {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: 17rem;
+  padding: var(--pad-v) .8rem var(--pad-v) var(--pad);
+  border-right: 1px solid var(--linha);
 }
-.cats-head { font-size: .74rem; letter-spacing: .2em; text-transform: uppercase;
-             color: var(--dim); font-weight: 700; margin-bottom: 1.2rem; }
-.cats-scroll { will-change: transform; transition: transform .32s var(--ease-out); }
 
 .cat-item {
-  display: flex; align-items: center; justify-content: space-between; gap: .7rem;
-  width: 100%; padding: .72rem .95rem; margin-bottom: .18rem;
-  background: none; border: 0; border-radius: .55rem;
-  color: var(--muted); font-size: .94rem; text-align: left;
-  transition: all .18s var(--ease);
+  display: flex; align-items: center; gap: .6rem;
+  width: 100%; min-height: 3.2rem;          /* 64px */
+  padding: .6rem .8rem; margin-bottom: .12rem;
+  background: none; border: 0; border-radius: .35rem;
+  color: var(--suave); font-size: 1.05rem; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color var(--rapido) var(--curva),
+              background-color var(--rapido) var(--curva);
 }
-.cat-item b { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cat-item i { font-style: normal; font-size: .72rem; color: var(--dim); }
-.cat-item.active { color: var(--text); background: rgba(255,255,255,.045); }
-.cat-item.focused {
-  color: #fff;
-  background: linear-gradient(90deg, rgba(124,92,255,.4), rgba(78,168,255,.12));
-  box-shadow: inset 0 0 0 1px rgba(124,92,255,.55), 0 .4rem 1.4rem rgba(0,0,0,.4);
-}
+.cat-item.ativa   { color: var(--texto); background: rgba(255,255,255,.05); }
+.cat-item.focused { color: #FFF; background: var(--cor-2); outline-offset: -.1rem; }
 
-.grid-wrap { flex: 1; padding: 3.4rem 0 3rem 2.6rem; overflow: hidden; }
-.grid {
-  display: flex; flex-wrap: wrap; gap: 1.1rem 1rem;
-  padding: .6rem 2.5rem 6rem .6rem;
-  will-change: transform; transition: transform .34s var(--ease-out);
+/* O lado do conteúdo. `overflow: hidden` aqui é o que recorta a
+   grade — o trilho de dentro é que se move. */
+.conteudo {
+  position: absolute; left: 17rem; right: 0; top: 0; bottom: 0;
+  overflow: hidden;
 }
-.grid-head { padding: 0 0 1rem .6rem; display: flex; align-items: baseline; gap: .8rem; }
-.grid-head h2 { font-size: 1.5rem; font-weight: 650; letter-spacing: -.02em; }
-.grid-head small { color: var(--dim); font-size: .82rem; }
-
-/* =========================================================
-   Página de detalhe
-   ========================================================= */
-.detail-art {
-  position: absolute; inset: 0 0 auto 0; height: 40rem;
-  background-size: cover; background-position: center 15%;
-  opacity: .5;
-}
-.detail-art::after {
-  content: ""; position: absolute; inset: 0;
-  background: linear-gradient(90deg, var(--bg) 10%, rgba(7,8,11,.6) 50%, transparent),
-              linear-gradient(0deg,  var(--bg) 5%, transparent 65%);
-}
-.detail-head { position: relative; z-index: 2; padding: 6rem var(--pad) 0;
-               display: flex; gap: 2.6rem; }
-.detail-poster {
-  width: 16rem; min-width: 16rem; height: 24rem; border-radius: 1rem;
-  overflow: hidden; box-shadow: 0 2rem 4rem rgba(0,0,0,.8);
-  background: linear-gradient(150deg,#1B2230,#10141C);
-}
-.detail-poster img { width: 100%; height: 100%; object-fit: cover; }
-.detail-info { flex: 1; padding-top: 1rem; max-width: 52rem; }
-.detail-info h1 { font-size: 3.1rem; line-height: 1.04; letter-spacing: -.035em; font-weight: 750; }
-.detail-meta { display: flex; align-items: center; gap: .8rem; margin: 1rem 0 1.2rem; flex-wrap: wrap; }
-.detail-plot { color: rgba(242,244,248,.76); font-size: 1rem; line-height: 1.6; margin-bottom: 1.8rem; }
-.detail-credits { color: var(--dim); font-size: .88rem; line-height: 1.7; margin-top: 1.4rem; }
-.detail-credits b { color: var(--muted); font-weight: 550; }
-
-.seasons { display: flex; gap: .6rem; padding: 0 var(--pad); margin: 2.6rem 0 1.2rem; flex-wrap: wrap; }
-.season-btn {
-  padding: .55rem 1.2rem; border: 1px solid var(--line); border-radius: 2rem;
-  background: rgba(255,255,255,.03); color: var(--muted); font-size: .9rem;
-  transition: all .2s var(--ease);
-}
-.season-btn.active { color: var(--text); border-color: rgba(124,92,255,.6);
-                     background: rgba(124,92,255,.16); }
-.season-btn.focused { color: #fff; background: var(--accent); border-color: var(--accent);
-                      transform: scale(1.06); box-shadow: 0 .5rem 1.6rem rgba(124,92,255,.5); }
-
-.episodes { padding: 0 var(--pad) 6rem; display: flex; flex-direction: column; gap: .7rem; }
-.ep {
-  display: flex; gap: 1.2rem; align-items: stretch; width: 100%;
-  padding: .8rem; border: 0; border-radius: .8rem;
-  background: rgba(255,255,255,.028); text-align: left;
-  transition: all .22s var(--ease-out);
-}
-.ep.focused {
-  background: rgba(124,92,255,.16);
-  box-shadow: inset 0 0 0 1px rgba(124,92,255,.5), 0 .8rem 2.2rem rgba(0,0,0,.55);
-  transform: scale(1.012);
-}
-.ep-thumb {
-  position: relative; width: 13rem; min-width: 13rem; height: 7.3rem;
-  border-radius: .55rem; overflow: hidden;
-  background: linear-gradient(150deg,#1B2230,#10141C);
-}
-.ep-thumb img { width: 100%; height: 100%; object-fit: cover; }
-.ep-num {
-  position: absolute; left: .5rem; top: .5rem;
-  font-size: .68rem; font-weight: 700; letter-spacing: .08em;
-  background: rgba(6,8,12,.8); padding: .15rem .45rem; border-radius: .25rem;
-}
-.ep-body { flex: 1; padding: .35rem .4rem 0 0; min-width: 0; }
-.ep-title { font-size: 1.02rem; font-weight: 600; margin-bottom: .35rem;
-             display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
-.ep-dur { font-size: .8rem; font-weight: 400; color: var(--dim); flex: 0 0 auto; }
-.ep-plot {
-  color: var(--muted); font-size: .86rem; line-height: 1.5;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-}
-.ep-state { font-size: .78rem; color: var(--accent-2); margin-top: .45rem; }
+.carregando { padding: var(--pad-v) var(--pad); color: var(--fraco); font-size: 1.1rem; }
 
 /* =========================================================
    Botões, chips, campos
    ========================================================= */
-.row-btns { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; }
+.row-btns { display: flex; gap: .7rem; flex-wrap: wrap; align-items: center; }
 
 .btn {
-  display: inline-flex; align-items: center; gap: .6rem;
-  padding: .82rem 1.7rem; border: 0; border-radius: .55rem;
-  background: #fff; color: #0A0C12;
-  font-size: 1rem; font-weight: 650; letter-spacing: -.01em;
-  transition: transform .2s var(--ease-out), box-shadow .2s var(--ease-out),
-              background .2s var(--ease);
+  display: inline-flex; align-items: center; gap: .5rem;
+  min-height: 3.4rem;                        /* 68px */
+  padding: .7rem 1.5rem; border: 0; border-radius: .4rem;
+  background: #FFF; color: #14100F;
+  font-size: 1.15rem; font-weight: 650;
+  transition: transform var(--rapido) var(--curva);
 }
-.btn svg { width: 1.3rem; height: 1.3rem; }
-.btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff; }
-.btn.ghost   { background: rgba(255,255,255,.12); color: var(--text); }
-.btn.danger  { background: rgba(255,77,109,.16); color: var(--hot); }
-.btn.focused {
-  transform: scale(1.06);
-  box-shadow: 0 0 0 .16rem #fff, 0 .8rem 2.2rem rgba(0,0,0,.65);
-}
+.btn svg { width: 1.4rem; height: 1.4rem; }
+.btn.primary { background: var(--cor-2); color: #FFF; }
+.btn.ghost   { background: rgba(255,255,255,.12); color: var(--texto); }
+.btn.danger  { background: rgba(255,107,107,.16); color: var(--alerta); }
+.btn.focused { transform: scale(1.05); }
 .btn.ghost.focused  { background: rgba(255,255,255,.24); }
-.btn.danger.focused { background: var(--hot); color: #fff; }
+.btn.danger.focused { background: var(--alerta); color: #FFF; }
 
 .chip {
-  display: inline-flex; align-items: center; gap: .35rem;
-  padding: .26rem .65rem; border-radius: .35rem;
-  background: rgba(255,255,255,.08); color: var(--muted);
-  font-size: .78rem; font-weight: 500;
+  display: inline-flex; align-items: center; gap: .3rem;
+  padding: .2rem .55rem; border-radius: .25rem;
+  background: rgba(255,255,255,.08); color: var(--suave); font-size: .95rem;
 }
-.chip.ok   { color: var(--ok);   background: rgba(56,211,159,.14); }
-.chip.warn { color: var(--warn); background: rgba(255,196,107,.14); }
-.chip.err  { color: var(--hot);  background: rgba(255,77,109,.14); }
-.chip.hot  { color: #fff; background: var(--hot); font-weight: 700; letter-spacing: .06em; }
+.chip.ok    { color: var(--ok);     background: rgba(79,194,138,.14); }
+.chip.warn  { color: var(--quente); background: rgba(240,176,130,.14); }
+.chip.err   { color: var(--alerta); background: rgba(255,107,107,.14); }
+.chip.hot   { color: #FFF; background: var(--alerta); font-weight: 700; }
 
-.field { margin-bottom: 1.7rem; max-width: 56rem; }
-.field label { display: block; font-size: .88rem; color: var(--muted);
-               margin-bottom: .5rem; font-weight: 550; }
-.field .hint { font-size: .8rem; color: var(--dim); margin-top: .5rem; line-height: 1.6; }
+.field { margin-bottom: 1.4rem; max-width: 46rem; }
+.field label { display: block; font-size: 1.05rem; color: var(--suave);
+               margin-bottom: .4rem; font-weight: 550; }
+.field .hint { font-size: .95rem; color: var(--fraco); margin-top: .4rem; line-height: 1.55; }
 .field input {
-  width: 100%; padding: .9rem 1.1rem;
-  background: rgba(255,255,255,.04); border: 1px solid var(--line);
-  border-radius: .55rem; font-size: 1rem; outline: none;
-  transition: all .2s var(--ease);
+  width: 100%; min-height: 3.4rem; padding: .7rem .9rem;
+  background: rgba(255,255,255,.05); border: 1px solid var(--linha);
+  border-radius: .4rem; font-size: 1.15rem; outline: none;
+  transition: background-color var(--rapido) var(--curva);
 }
-.field input::placeholder { color: var(--dim); }
-.field input.focused {
-  border-color: var(--accent); background: rgba(124,92,255,.1);
-  box-shadow: 0 0 0 .16rem rgba(124,92,255,.3);
-}
+.field input::placeholder { color: var(--fraco); }
+.field input.focused { background: rgba(232,132,92,.12); outline: .2rem solid #FFF; }
 
 .panel {
-  background: rgba(255,255,255,.03); border: 1px solid var(--line);
-  border-radius: .9rem; padding: 1.6rem 1.8rem; margin-bottom: 1.4rem;
-  max-width: 56rem;
+  background: rgba(255,255,255,.03); border: 1px solid var(--linha);
+  border-radius: .6rem; padding: 1.4rem 1.5rem; margin-bottom: 1.2rem;
+  max-width: 46rem;
 }
-.panel h3 { font-size: 1.1rem; font-weight: 650; margin-bottom: .3rem; }
-.panel .sub { color: var(--dim); font-size: .86rem; line-height: 1.6; margin-bottom: 1.2rem; }
-.kv { display: flex; gap: .8rem; font-size: .88rem; color: var(--muted);
-      padding: .35rem 0; border-bottom: 1px solid rgba(255,255,255,.04); }
-.kv b { color: var(--dim); font-weight: 500; min-width: 11rem; }
+.panel h3 { font-size: 1.3rem; font-weight: 650; margin-bottom: .25rem; }
+.panel .sub { color: var(--fraco); font-size: 1rem; line-height: 1.55; margin-bottom: 1rem; }
+.kv { display: flex; gap: .7rem; font-size: 1.05rem; color: var(--suave);
+      padding: .3rem 0; border-bottom: 1px solid rgba(255,255,255,.04); }
+.kv b { color: var(--fraco); font-weight: 500; min-width: 12rem; }
 
-.empty {
-  padding: 3rem var(--pad); color: var(--muted); font-size: 1.02rem;
-  max-width: 46rem; line-height: 1.7;
-}
-.empty b  { color: var(--text); font-weight: 600; }
-.empty h2 { color: var(--text); font-size: 1.5rem; margin-bottom: .7rem; font-weight: 650; }
+.empty { padding: 2.4rem var(--pad); color: var(--suave); font-size: 1.2rem;
+         max-width: 42rem; line-height: 1.6; }
+.empty b  { color: var(--texto); font-weight: 600; }
+.empty h2 { color: var(--texto); font-size: 1.7rem; margin-bottom: .6rem; font-weight: 650; }
 
 /* =========================================================
    Player
@@ -529,51 +490,171 @@ svg.solid { fill: currentColor; stroke: none; }
 
 #player-ui {
   position: absolute; inset: 0; pointer-events: none;
-  background: linear-gradient(180deg, rgba(0,0,0,.78), transparent 22%,
-                                      transparent 52%, rgba(0,0,0,.9));
-  opacity: 1; transition: opacity .45s var(--ease);
+  background: linear-gradient(180deg, rgba(0,0,0,.7), rgba(0,0,0,0) 24%,
+                                      rgba(0,0,0,0) 56%, rgba(0,0,0,.88));
+  opacity: 1; transition: opacity .3s var(--curva);
 }
 #player-ui.fade { opacity: 0; }
 
-.pl-top { padding: 2.8rem 3.8rem; }
-.pl-title { font-size: 2.1rem; font-weight: 700; letter-spacing: -.028em;
-            text-shadow: 0 .2rem 1.4rem rgba(0,0,0,.8); }
-.pl-sub { color: rgba(255,255,255,.68); font-size: 1rem; margin-top: .35rem; }
+.pl-top { padding: var(--pad-v) var(--pad); }
+.pl-title { font-size: 2.2rem; font-weight: 700; letter-spacing: -.02em; }
+.pl-sub { color: var(--suave); font-size: 1.2rem; margin-top: .3rem; }
 
-.pl-bottom { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 3.8rem 3rem; }
-.pl-bar { position: relative; height: .32rem; border-radius: .2rem;
-          background: rgba(255,255,255,.24); }
-.pl-bar-buf, .pl-bar-fill {
-  position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: .2rem;
+.pl-bottom { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 var(--pad) var(--pad-v); }
+/* A linha do tempo é um botão: precisa receber foco para que
+   ←/→ sejam dela. Área de toque alta (é o alvo mais usado do
+   player), barra fina no meio. */
+.pl-linha { padding: .6rem 0; pointer-events: auto; }
+.pl-bar {
+  position: relative; display: block;
+  width: 100%; height: 1.6rem; padding: 0;
+  border: 0; background: none;
 }
-.pl-bar-buf  { background: rgba(255,255,255,.32); }
-.pl-bar-fill { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.pl-bar::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 50%;
+  margin-top: -.14rem; height: .28rem; border-radius: .15rem;
+  background: rgba(255,255,255,.24);
+}
+.pl-bar.focused { outline: none; }
+.pl-bar.focused::before { height: .44rem; margin-top: -.22rem; background: rgba(255,255,255,.4); }
+.pl-bar-buf, .pl-bar-fill {
+  position: absolute; left: 0; top: 50%; margin-top: -.14rem;
+  height: .28rem; width: 0; border-radius: .15rem;
+}
+.pl-bar.focused .pl-bar-buf,
+.pl-bar.focused .pl-bar-fill { height: .44rem; margin-top: -.22rem; }
+
+/* Cursor fantasma: mostra para ONDE você vai, sem tirar o vídeo
+   do lugar. O vídeo só pula quando você para de arrastar. */
+.pl-fantasma {
+  position: absolute; top: 50%; width: .18rem; height: 1.4rem;
+  margin-top: -.7rem; margin-left: -.09rem;
+  background: #FFF; border-radius: .09rem;
+}
+.pl-fantasma::after {
+  content: attr(data-t);
+  position: absolute; bottom: 1.8rem; left: 50%; transform: translateX(-50%);
+  padding: .25rem .6rem; border-radius: .3rem;
+  background: #FFF; color: #120E0D;
+  font-size: 1rem; font-weight: 700; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.pl-bar.arrastando .pl-knob { opacity: .35; }
+.pl-bar-buf  { background: rgba(255,255,255,.3); }
+.pl-bar-fill { background: var(--cor); }
 .pl-knob {
-  position: absolute; right: -.5rem; top: 50%; transform: translateY(-50%);
-  width: 1rem; height: 1rem; border-radius: 50%; background: #fff;
-  box-shadow: 0 0 1.2rem rgba(124,92,255,.95);
+  position: absolute; right: -.4rem; top: 50%; margin-top: -.4rem;
+  width: .8rem; height: .8rem; border-radius: 50%; background: #FFF;
 }
 .pl-times {
   display: flex; justify-content: space-between; align-items: center;
-  margin-top: .8rem; font-size: .95rem; color: rgba(255,255,255,.82);
+  margin-top: .7rem; font-size: 1.1rem; color: rgba(255,255,255,.82);
   font-variant-numeric: tabular-nums;
 }
 .pl-badge {
-  background: var(--hot); color: #fff; font-size: .68rem; font-weight: 800;
-  letter-spacing: .12em; padding: .22rem .55rem; border-radius: .25rem;
+  background: var(--alerta); color: #FFF; font-size: .8rem; font-weight: 800;
+  letter-spacing: .1em; padding: .15rem .45rem; border-radius: .2rem;
 }
-.pl-hint { display: flex; gap: 2rem; margin-top: 1.3rem;
-           font-size: .82rem; color: rgba(255,255,255,.42); }
-.pl-hint b { color: rgba(255,255,255,.82); font-weight: 650; }
+.pl-hint { display: flex; gap: 1.6rem; margin-top: 1rem;
+           font-size: .95rem; color: rgba(255,255,255,.45); }
+.pl-hint b { color: rgba(255,255,255,.8); font-weight: 650; }
+
+/* ---------------------------------------------------------
+   OSD: transporte e contexto
+   ---------------------------------------------------------
+   Os botões precisam receber clique/foco, então esta parte
+   religa os eventos que `#player-ui` desligou.
+   --------------------------------------------------------- */
+.osd-row {
+  display: flex; align-items: center; gap: .7rem;
+  margin-top: 1.2rem; pointer-events: auto;
+}
+.osd-row.osd-ctx { gap: .5rem; margin-top: .8rem; }
+
+.osd-btn {
+  width: 3.4rem; height: 3.4rem;          /* 68px, acima do mínimo de 64 */
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 50%;
+  background: rgba(255,255,255,.1);
+  color: rgba(255,255,255,.9);
+}
+.osd-btn svg { width: 1.5rem; height: 1.5rem; }
+.osd-btn.focused { background: #FFF; color: #120E0D; }
+.osd-btn[disabled] { opacity: .3; }
+
+.osd-chip {
+  height: 3.4rem; padding: 0 1.1rem;
+  display: flex; align-items: center; gap: .45rem;
+  border: 0; border-radius: 1.7rem;
+  background: rgba(255,255,255,.1);
+  color: rgba(255,255,255,.88);
+  font-size: 1.05rem; font-weight: 600; white-space: nowrap;
+}
+.osd-chip svg { width: 1.25rem; height: 1.25rem; }
+.osd-chip.focused { background: #FFF; color: #120E0D; }
+.osd-chip.ativo { box-shadow: inset 0 0 0 .12rem var(--cor); }
+.osd-chip.ativo::before {
+  content: ""; width: .45rem; height: .45rem; border-radius: 50%;
+  background: var(--cor); flex: 0 0 auto;
+}
+.osd-chip.focused.ativo::before { background: var(--cor-2); }
+
+/* Painel sobreposto do OSD: episódios, faixas, degraus. */
+.osd-panel {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+  max-height: 58%; overflow: hidden;
+  padding: 2rem var(--pad) var(--pad-v);
+  background: linear-gradient(180deg, rgba(11,9,8,0), rgba(11,9,8,.97) 22%);
+  pointer-events: auto;
+}
+.osd-panel h3 {
+  display: flex; align-items: baseline; gap: .8rem;
+  font-size: 1.3rem; font-weight: 700; margin-bottom: 1rem;
+}
+.osd-conta { font-size: 1rem; font-weight: 500; color: var(--fraco); }
+/* Janela recorta, trilho desliza — o mesmo contrato das telas.
+   Sem o trilho, os episódios além do sexto ficavam fora da tela
+   e não havia como chegar neles. */
+.osd-janela { position: relative; overflow: hidden; height: 7rem; }
+.osd-dica {
+  margin-top: .9rem; font-size: .95rem; color: rgba(255,255,255,.45);
+}
+.osd-dica b { color: rgba(255,255,255,.85); font-weight: 650; }
+
+/* ---------------------------------------------------------
+   Painel de aferição — spec de experiência §4.2-A
+   ---------------------------------------------------------
+   Fundo sólido com opacidade, nunca `filter: blur()`: o blur
+   força o compositor a redesenhar a região inteira do vídeo a
+   cada quadro, que é o oposto do que se quer num player.
+   --------------------------------------------------------- */
+.afer {
+  position: absolute; right: var(--pad); top: var(--pad-v); z-index: 3;
+  min-width: 21rem;
+  padding: .9rem 1.1rem;
+  border-radius: .5rem;
+  background: rgba(11,9,8,.82);
+  font-variant-numeric: tabular-nums;
+}
+.afer-l1 { font-size: 1.5rem; font-weight: 650; color: #FFF; }
+.afer-l2 { font-size: 1.05rem; color: rgba(255,255,255,.62); margin-top: .3rem; }
+.afer-sep { opacity: .35; margin: 0 .35rem; }
+.afer-hora {
+  font-size: 1.5rem; font-weight: 650; color: rgba(255,255,255,.85);
+  text-align: right; margin-top: .5rem;
+}
+/* O número que denuncia: resolução real abaixo da declarada. */
+.afer-l1.mentiu #afer-real { color: var(--alerta); }
+.afer-l2.ruim   #afer-quedas { color: var(--alerta); }
 
 .pl-error {
   position: absolute; inset: 0; z-index: 5;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 1.1rem; text-align: center; padding: 0 6rem;
-  background: rgba(7,8,11,.94);
+  gap: 1rem; text-align: center; padding: 0 5rem;
+  background: rgba(11,9,8,.94);
 }
-.pl-error h2 { font-size: 1.9rem; font-weight: 700; }
-.pl-error p  { color: var(--muted); max-width: 42rem; line-height: 1.6; }
+.pl-error h2 { font-size: 2rem; font-weight: 700; }
+.pl-error p  { color: var(--suave); max-width: 38rem; line-height: 1.55; font-size: 1.2rem; }
 
 /* =========================================================
    Sobreposições
@@ -581,58 +662,301 @@ svg.solid { fill: currentColor; stroke: none; }
 .overlay {
   position: fixed; inset: 0; z-index: 130;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(4,5,8,.86);
-  animation: fadeIn .25s var(--ease) both;
+  background: rgba(5,4,3,.86);
+  animation: entrar .18s var(--curva) both;
 }
-@keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
-
 .dialog {
-  background: linear-gradient(160deg, #171C27, #10141C);
-  border: 1px solid var(--line); border-radius: 1rem;
-  padding: 2.6rem 2.8rem; max-width: 42rem; text-align: center;
-  box-shadow: 0 2.5rem 6rem rgba(0,0,0,.85);
-  animation: dialogIn .32s var(--ease-out) both;
+  background: var(--surface); border: 1px solid var(--linha);
+  border-radius: .7rem; padding: 2.2rem 2.4rem; max-width: 38rem; text-align: center;
+  box-shadow: 0 1.5rem 3rem rgba(0,0,0,.8);
 }
-@keyframes dialogIn {
-  from { transform: translateY(1.5rem) scale(.97); opacity: 0 }
-  to   { transform: none; opacity: 1 }
-}
-.dialog h2 { font-size: 1.7rem; font-weight: 700; margin-bottom: .6rem; letter-spacing: -.02em; }
-.dialog p  { color: var(--muted); margin-bottom: 1.9rem; line-height: 1.55; }
+.dialog h2 { font-size: 1.8rem; font-weight: 700; margin-bottom: .5rem; }
+.dialog p  { color: var(--suave); margin-bottom: 1.6rem; line-height: 1.5; font-size: 1.2rem; }
 .dialog .row-btns { justify-content: center; }
 
 .toast {
-  position: fixed; z-index: 200; bottom: 2.6rem; left: 50%;
+  position: fixed; z-index: 200; bottom: var(--pad-v); left: 50%;
   transform: translateX(-50%);
-  background: rgba(20,24,33,.94); border: 1px solid var(--line);
-  padding: .8rem 1.6rem; border-radius: 2rem; font-size: .95rem;
-  box-shadow: 0 1rem 3rem rgba(0,0,0,.75);
-  animation: toastIn .28s var(--ease-out) both;
+  background: var(--surface-2); border: 1px solid var(--linha);
+  padding: .7rem 1.4rem; border-radius: 1.8rem; font-size: 1.1rem;
+  animation: entrar .2s var(--curva) both;
 }
-@keyframes toastIn {
-  from { opacity: 0; transform: translate(-50%, .8rem) }
-  to   { opacity: 1; transform: translateX(-50%) }
+
+#clock {
+  position: fixed; top: var(--pad-v); right: var(--pad); z-index: 45;
+  font-size: 1.2rem; font-weight: 550; color: var(--fraco);
+  font-variant-numeric: tabular-nums; pointer-events: none;
 }
+#clock small { display: block; font-size: .85rem; text-align: right; margin-top: .1rem; }
 
 /* =========================================================
    Carregando
+   ---------------------------------------------------------
+   O esqueleto pulsa por OPACIDADE. A versão anterior animava
+   `background-position`, que não é compositável: eram catorze
+   elementos repintando a cada quadro.
    ========================================================= */
-.loading {
-  display: flex; align-items: center; gap: 1rem;
-  padding: 3rem var(--pad); color: var(--muted); font-size: 1rem;
-}
+.loading { display: flex; align-items: center; gap: .9rem;
+           padding: 2.4rem var(--pad); color: var(--suave); font-size: 1.2rem; }
 .ring, .spinner i {
-  width: 2.4rem; height: 2.4rem; border-radius: 50%;
-  border: .2rem solid rgba(255,255,255,.12); border-top-color: var(--accent);
-  animation: spin .8s linear infinite; display: block; flex: 0 0 auto;
+  width: 2.2rem; height: 2.2rem; border-radius: 50%;
+  border: .18rem solid rgba(255,255,255,.14); border-top-color: var(--cor);
+  animation: girar .8s linear infinite; display: block; flex: 0 0 auto;
 }
 .spinner { position: absolute; inset: 0; z-index: 3;
            display: flex; align-items: center; justify-content: center; }
-@keyframes spin { to { transform: rotate(360deg) } }
+@keyframes girar { to { transform: rotate(360deg) } }
 
-.skel {
-  border-radius: .8rem;
-  background: linear-gradient(100deg, #141821 30%, #1D2331 50%, #141821 70%);
-  background-size: 220% 100%; animation: shimmer 1.4s linear infinite;
+.skel { border-radius: .55rem; background: var(--surface);
+        animation: pulsar 1.4s ease-in-out infinite; }
+@keyframes pulsar { 0%,100% { opacity: .45 } 50% { opacity: .8 } }
+
+/* =========================================================
+   Destaque da tela inicial
+   =========================================================
+   Largo de verdade. A versão anterior parecia estreita e
+   errada porque dividia o espaço com um carrossel que trocava
+   sozinho — carrossel que saiu.
+
+   A arte é um `background-image` estático: sem Ken Burns, sem
+   transição de `background-position`. Animar isso mantinha o
+   compositor aceso o tempo inteiro, mesmo parado.
+   ========================================================= */
+.hero {
+  position: relative;
+  height: 34rem;                            /* ~63% de 1080 */
+  display: flex; align-items: flex-end;
+  padding: 0 var(--pad) 2.8rem;
+  overflow: hidden;
 }
-@keyframes shimmer { to { background-position: -220% 0 } }
+.hero-arte {
+  position: absolute; inset: 0;
+  background-size: cover; background-position: center 22%;
+  opacity: .9;
+}
+/* Um único degradê, não três. */
+.hero-veu {
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, var(--bg) 8%, rgba(11,9,8,.55) 46%, rgba(11,9,8,0) 80%);
+}
+.hero-texto { position: relative; z-index: 2; max-width: 48rem; }
+.hero-titulo {
+  font-size: 3.4rem; line-height: 1.04; letter-spacing: -.03em;
+  font-weight: 750; margin-bottom: .6rem;
+}
+.hero-sub  { color: var(--quente); font-size: 1.15rem; font-weight: 600; margin-bottom: .6rem; }
+.hero-plot {
+  color: var(--suave); font-size: 1.2rem; line-height: 1.5; margin-bottom: 1.4rem;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.hero-btns { display: flex; gap: .8rem; }
+
+/* =========================================================
+   Detalhe
+   ========================================================= */
+/* A arte é presa DENTRO do cabeçalho e recortada por ele. Antes
+   ela tinha altura fixa de 34rem enquanto o cabeçalho tinha 32,
+   então sobrava arte por cima dos botões de temporada — e era
+   isso que cobria a tela inteira do detalhe da série. */
+/* O cabeçalho CRESCE com o conteúdo. Antes tinha altura mínima
+   fixa e recorte: com sinopse longa mais elenco e direção, as
+   linhas de baixo passavam por trás dos botões. Agora a altura é
+   do conteúdo, e a arte é que se limita. */
+.det-topo {
+  position: relative;
+  min-height: 32rem; padding: 5rem var(--pad) 2.4rem;
+}
+.det-arte {
+  position: absolute; inset: 0 0 auto 0; height: 100%; max-height: 34rem;
+  overflow: hidden;
+  background-size: cover; background-position: center 20%;
+  opacity: .55;
+}
+.det-veu {
+  position: absolute; inset: 0 0 auto 0; height: 100%; max-height: 34rem;
+  background: linear-gradient(90deg, var(--bg) 10%, rgba(11,9,8,.5) 55%, rgba(11,9,8,0));
+}
+.det-texto { position: relative; z-index: 2; max-width: 48rem; }
+.det-titulo { font-size: 3rem; line-height: 1.06; letter-spacing: -.03em; font-weight: 750; }
+.det-meta   { color: var(--quente); font-size: 1.1rem; margin: .7rem 0; }
+.det-plot   {
+  color: var(--suave); font-size: 1.15rem; line-height: 1.5; margin-bottom: 1.4rem;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+.temporadas {
+  position: relative; z-index: 2;
+  display: flex; gap: .6rem; flex-wrap: nowrap; overflow: hidden;
+  padding: 1.4rem var(--pad) 1rem;
+}
+.temp-btn {
+  height: 3.2rem; padding: 0 1.2rem;
+  border: 0; border-radius: 1.6rem;
+  background: var(--surface-2); color: var(--suave);
+  font-size: 1.05rem; font-weight: 600; white-space: nowrap;
+}
+.temp-btn.ativa   { color: var(--texto); box-shadow: inset 0 0 0 .12rem var(--cor); }
+.temp-btn.focused { background: #FFF; color: #120E0D; }
+.episodios { position: relative; z-index: 2; padding-bottom: 3rem; }
+
+/* =========================================================
+   Busca
+   ========================================================= */
+.busca-topo { padding: var(--pad-v) var(--pad) 1.2rem; }
+.busca-campo {
+  width: 46rem; max-width: 100%; height: 3.6rem;
+  padding: 0 1.2rem;
+  border: 0; border-radius: .45rem;
+  background: var(--surface-2); color: var(--texto);
+  font-size: 1.2rem;
+}
+.busca-campo.focused { outline: .2rem solid #FFF; }
+.busca-campo::placeholder { color: var(--fraco); }
+.busca-res { top: 8rem; }
+
+/* =========================================================
+   Ajustes e primeira configuração
+   ========================================================= */
+.paineis { padding: var(--pad-v) var(--pad) 6rem; max-width: 56rem; }
+.painel {
+  padding: 1.6rem 0;
+  border-bottom: 1px solid var(--linha);
+}
+.painel-titulo { font-size: 1.5rem; font-weight: 700; margin-bottom: .4rem; }
+.painel-sub    { color: var(--suave); font-size: 1.1rem; line-height: 1.5; margin-bottom: 1rem; }
+.linha {
+  display: flex; justify-content: space-between; gap: 1rem;
+  padding: .45rem 0; font-size: 1.1rem;
+}
+.linha-k { color: var(--fraco); }
+.linha-v { color: var(--texto); font-variant-numeric: tabular-nums; }
+
+.setup-caixa {
+  position: absolute; left: var(--pad); right: var(--pad); top: 22%;
+  max-width: 52rem;
+  display: flex; flex-direction: column; gap: 1.1rem; align-items: flex-start;
+}
+.setup-caixa h1 { font-size: 2.6rem; font-weight: 750; letter-spacing: -.02em; }
+.setup-aviso { color: var(--quente); font-size: 1.1rem; min-height: 1.5rem; }
+
+/* =========================================================
+   Filtro dentro da pasta
+   =========================================================
+   Diferente da busca do menu: aqui a lista já está carregada
+   na memória, então filtrar não toca na rede e é instantâneo.
+   A barra fica opaca e por cima — sem isso a grade rola por
+   baixo dela e vira sopa.
+   ========================================================= */
+.filtro-barra {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 3;
+  height: 5.4rem;
+  display: flex; align-items: center; gap: 1.2rem;
+  /* folga à direita para o relógio: sem ela os botões de
+     ordenação passavam por baixo dele */
+  padding: 0 11rem 0 2rem;
+  background: var(--bg);
+}
+.filtro-campo {
+  width: 28rem; height: 3.4rem;
+  padding: 0 1rem;
+  border: 0; border-radius: .45rem;
+  background: var(--surface-2); color: var(--texto);
+  font-size: 1.1rem;
+}
+.filtro-campo.focused { outline: .2rem solid #FFF; }
+.filtro-campo::placeholder { color: var(--fraco); }
+.filtro-conta { color: var(--fraco); font-size: 1rem; font-variant-numeric: tabular-nums; }
+
+.grade-caixa {
+  position: absolute; top: 5.4rem; left: 0; right: 0; bottom: 0;
+  overflow: hidden;
+}
+
+/* Estrela de favorito no cartão. */
+.card-fav {
+  position: absolute; top: .45rem; right: .45rem; z-index: 2;
+  width: 1.6rem; height: 1.6rem;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; background: rgba(6,5,4,.72);
+  color: var(--quente);
+}
+.card-fav svg { width: 1rem; height: 1rem; }
+/* Se o item também está marcado como visto, a estrela cede o
+   canto — dois selos no mesmo lugar viram borrão a 3 metros. */
+.card-tag.visto ~ .card-fav { right: 2.3rem; }
+
+/* =========================================================
+   OSD aberto / fechado
+   =========================================================
+   Fechado, as linhas do menu não existem para o layout NEM
+   para a navegação: `display: none` tira do fluxo e o motor
+   deixa de enxergá-las como focáveis. Se fossem só invisíveis,
+   uma seta poderia levar o foco para um botão que ninguém vê —
+   e não há bug mais difícil de explicar que esse.
+   ========================================================= */
+#player-ui .osd-row,
+#player-ui .afer { display: none; }
+/* Com o painel de episódios aberto, as linhas de baixo saem do
+   caminho: elas apareciam POR TRÁS dele, sobrepostas. */
+#player-ui.com-painel .osd-row,
+#player-ui.com-painel .pl-times,
+#player-ui.com-painel .pl-hint { display: none; }
+#player-ui.osd-on .osd-row { display: flex; }
+#player-ui.osd-on .afer { display: block; }
+
+/* Lista de episódios sobreposta ao vídeo. */
+.osd-lista { display: flex; gap: .7rem; padding-bottom: .5rem; }
+.osd-ep {
+  flex: 0 0 auto; width: 15rem; min-height: 5.4rem;
+  display: flex; flex-direction: column; gap: .25rem;
+  padding: .8rem .9rem;
+  border: 0; border-radius: .45rem;
+  background: var(--surface-2); color: var(--suave);
+  text-align: left;
+}
+.osd-ep b { color: var(--quente); font-size: .95rem; font-weight: 700; }
+.osd-ep span {
+  font-size: 1rem; line-height: 1.25;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.osd-ep.ativo   { box-shadow: inset 0 0 0 .12rem var(--cor); color: var(--texto); }
+.osd-ep.focused { background: #FFF; color: #120E0D; }
+.osd-ep.focused b { color: var(--cor-2); }
+
+/* Seletor de temporada dentro do painel do player. */
+.osd-temps { display: flex; gap: .5rem; margin-bottom: .9rem; }
+.osd-temp {
+  min-width: 3.4rem; height: 2.8rem; padding: 0 .9rem;
+  border: 0; border-radius: 1.4rem;
+  background: rgba(255,255,255,.1); color: rgba(255,255,255,.8);
+  font-size: 1rem; font-weight: 700;
+}
+.osd-temp.ativo   { box-shadow: inset 0 0 0 .12rem var(--cor); color: #FFF; }
+.osd-temp.focused { background: #FFF; color: #120E0D; }
+
+/* Ordenação, ao lado do campo de filtro. */
+.filtro-ordem { display: flex; gap: .4rem; margin-left: auto; }
+.ordem-btn {
+  height: 2.8rem; padding: 0 1rem;
+  border: 0; border-radius: 1.4rem;
+  background: rgba(255,255,255,.07); color: var(--suave);
+  font-size: 1rem; font-weight: 600; white-space: nowrap;
+}
+.ordem-btn.ativo   { color: var(--texto); box-shadow: inset 0 0 0 .12rem var(--cor); }
+.ordem-btn.focused { background: #FFF; color: #120E0D; }
+
+/* Elenco e direção no detalhe. */
+/* Uma linha por ficha, com reticências. Duas linhas com
+   `-webkit-box` não somavam altura direito e o bloco seguinte
+   subia por cima. */
+.det-ficha {
+  display: flex; gap: .6rem; align-items: baseline;
+  font-size: 1.05rem; line-height: 1.5; margin-top: .3rem;
+}
+.det-ficha-k { color: var(--fraco); min-width: 5.5rem; flex: 0 0 auto; }
+.det-ficha-v {
+  color: var(--suave); flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Respiro real entre a ficha e a linha de botões. */
+.det-texto .row-btns { margin-top: 1.8rem; }

@@ -31,7 +31,6 @@
     currentRoute = route;
     w.Views.stopBillboard();
     paintRail(r.rail);
-    w.setAmbient('');
     try {
       var out = r.view(params || {});
       if (out && out.catch) out.catch(function (e) { console.error(e); });
@@ -85,23 +84,30 @@
   }
 
   /* ---------------------------------------------------------
-     Reações ao foco: abre a barra lateral, troca o fundo
-     ambiente e pré-seleciona categorias.
+     Reações ao foco
+     ---------------------------------------------------------
+     Três coisas, nesta ordem, e a ordem importa:
+
+       1. a virtualização remonta a janela de cartões. Precisa
+          vir primeiro, porque as outras duas podem consultar o
+          DOM que ela acabou de mexer;
+       2. o menu lateral mostra os rótulos quando o foco entra
+          nele (só opacidade — a largura nunca muda);
+       3. a coluna de categorias carrega a pasta quando o foco
+          DESCANSA, não a cada tecla.
+
+     O fundo ambiente saiu daqui. Era o culpado número 1 da
+     queda de quadros: uma imagem grande trocando a cada
+     movimento de foco.
      --------------------------------------------------------- */
-  var catTimer = null;
-  w.Nav.onFocusHook = function (el) {
-    var inRail = !!(el.closest && el.closest('#rail'));
+  w.Nav.aoFocar = function (el) {
+    w.Virt.aoFocar(el);
+
+    var noMenu = !!(el.closest && el.closest('#rail'));
     var rail = w.$('#rail');
-    if (rail) rail.classList.toggle('open', inRail);
+    if (rail) rail.classList.toggle('open', noMenu);
 
-    w.setAmbient(el.getAttribute('data-ambient') || '');
-
-    clearTimeout(catTimer);
-    if (el._select) {
-      catTimer = setTimeout(function () {
-        if (w.Nav.current() === el) el._select();
-      }, 380);
-    }
+    w.Views.aoFocarCategoria(el);
   };
 
   /* ---------------------------------------------------------
@@ -130,14 +136,19 @@
     }
     if (currentRoute !== 'home') { w.App.go('home', null, { replace: true }); return true; }
 
-    w.confirmDialog('Sair do Nebula?', 'Você volta para a tela inicial da TV.', 'Sair')
+    w.confirmDialog('Sair do ClaudeTV?', 'Você volta para a tela inicial da TV.', 'Sair')
       .then(function (yes) { if (yes) { try { w.close(); } catch (e) {} } });
     return true;
   });
 
-  /* Teclas coloridas: atalhos rápidos. */
+  /* Teclas coloridas: atalhos rápidos.
+     A vermelha é a única que a tela pode interceptar: nas telas
+     com pasta aberta ela leva ao filtro DAQUELA pasta, que é o
+     que a pessoa quer ali. Fora delas, cai na busca global. */
   w.Nav.addKeyHandler(function (k) {
     if (w.Player.isOpen()) return false;
+    var tela = w.$('.screen');
+    if (tela && tela._tecla && tela._tecla(k)) return true;
     if (k === w.KEY.RED)    { w.App.go('search');   return true; }
     if (k === w.KEY.GREEN)  { w.App.go('live');     return true; }
     if (k === w.KEY.YELLOW) { w.App.go('movies');   return true; }
@@ -173,7 +184,7 @@
       '<div id="restore-msg">Reconectando à sua lista…</div></div></div>';
     var msg = w.$('#restore-msg');
 
-    w.Catalog.connect(w.Store.get('source.url'), function (m) { msg.textContent = m; })
+    w.Catalog.conectar(w.Store.get('source.url'), function (m) { msg.textContent = m; })
       .then(function () {
         if (!w.Cloud.enabled()) return 0;
         msg.textContent = 'Trazendo o histórico da nuvem…';

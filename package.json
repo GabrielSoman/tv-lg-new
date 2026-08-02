@@ -17,7 +17,16 @@
     "log": "ares-inspect --device tv --app com.gabriel.claudetv --open",
     "remove": "ares-install --device tv --remove com.gabriel.claudetv",
     "check": "node tools/check-secrets.js",
-    "tv:remove-antigo": "ares-install --device tv --remove com.gabriel.nebula"
+    "tv:remove-antigo": "ares-install --device tv --remove com.gabriel.nebula",
+    "test:nav": "node tools/test-nav.js",
+    "test:instalar": "npm i -D playwright && npx playwright install chromium",
+    "test:perf": "node tools/test-perf.js",
+    "test:dados": "node tools/test-dados.js",
+    "test:virt": "node tools/test-virt.js",
+    "test:telas": "node tools/test-telas.js",
+    "test:player": "node tools/test-player.js",
+    "mock": "node tools/mock-iptv.js",
+    "sonda:4k": "node tools/sonda-4k.js"
   },
   "devDependencies": {
     "@webos-tools/cli": "^3.2.5"

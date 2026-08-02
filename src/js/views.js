@@ -1,1171 +1,1251 @@
 /* =========================================================
-   Telas do aplicativo.
-   Cada função monta uma tela dentro de #stage e devolve uma
-   Promise que resolve quando o conteúdo essencial já apareceu.
+   AS TELAS
+   =========================================================
+   Reescritas sobre três coisas que não existiam antes: o motor
+   de regiões (`nav.js`), a virtualização (`virt.js`) e a camada
+   de dados por POST com cache granular (`catalog.js`).
+
+   O defeito que motivou tudo isto, nas suas palavras: "as
+   colunas visuais do sidebar era na realidade tudo uma única
+   grande coluna". A causa principal era o motor antigo, mas as
+   telas ajudavam — nenhuma declarava onde uma região terminava
+   e a outra começava, então não havia o que respeitar.
+
+   Aqui toda tela declara suas regiões e seus vizinhos.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  /* ---------------------------------------------------------
-     Carregamento preguiçoso de imagens
-     --------------------------------------------------------- */
-  var io = null;
-  function lazyInit() {
-    if (io || !w.IntersectionObserver) return;
-    io = new w.IntersectionObserver(function (entries) {
-      entries.forEach(function (e) {
-        if (!e.isIntersecting) return;
-        var img = e.target;
-        io.unobserve(img);
-        var src = img.getAttribute('data-src');
-        if (src) img.src = src;
-      });
-    }, { rootMargin: '300px 600px' });
+  var el = w.el;
+
+  /* A grade calcula as próprias colunas a partir da largura da
+     janela — ver o comentário no `virt.js`. Números fixos aqui
+     foram o motivo de a grade vazar pela direita. */
+  var COLUNAS = 'auto';
+
+  /* -----------------------------------------------------------
+     Abrir conteúdo
+     ----------------------------------------------------------- */
+  function tocar(item, opts) { w.Player.open(item, opts || {}); }
+
+  /* -----------------------------------------------------------
+     Tomar o foco só quando ele é nosso
+     -----------------------------------------------------------
+     As telas montam em duas etapas: o esqueleto entra na hora, o
+     conteúdo chega depois da rede. Se a segunda etapa chamasse
+     `Nav.entrar` sem perguntar, ela arrancaria o foco de onde a
+     pessoa já tivesse levado nesse meio tempo — quase sempre o
+     menu lateral, que é o primeiro lugar para onde se anda.
+
+     Regra: só assume o foco se ninguém tem, se quem tinha saiu do
+     documento (é o caso quando o palco é trocado), ou se o foco
+     ainda está dentro do palco. Foco no menu é do menu.
+     ----------------------------------------------------------- */
+  function podeAssumir() {
+    var atual = w.Nav.atual();
+    return !(atual && document.body.contains(atual) && !atual.closest('#stage'));
   }
-  function lazy(img) {
-    lazyInit();
-    if (io) io.observe(img);
-    else img.src = img.getAttribute('data-src') || '';
+  function assumirFoco(regiao) {
+    return podeAssumir() ? w.Nav.entrar(regiao) : false;
+  }
+  function assumirFocoEm(elemento) {
+    return (elemento && podeAssumir()) ? w.Nav.focar(elemento) : false;
   }
 
-  /* ---------------------------------------------------------
-     Blocos reutilizáveis
-     --------------------------------------------------------- */
-  function screen(cls) {
-    var stage = w.$('#stage');
-    w.clear(stage);
-    var s = w.el('div', { class: 'screen enter ' + (cls || '') });
-    stage.appendChild(s);
-    return s;
+  function abrir(item) {
+    if (!item) return;
+    if (item.kind === 'live')   return tocar(item);
+    if (item.kind === 'movie')  return w.App.go('movie-detail',  { id: item.streamId, item: item });
+    if (item.kind === 'series') return w.App.go('series-detail', { id: item.seriesId, item: item });
+    return tocar(item);
   }
 
-  function scroller(parent) {
-    var wrap = w.el('div', { class: 'screen-scroll' });
-    var inner = w.el('div', { class: 'screen-inner', 'data-scroll': 'y' });
-    wrap.appendChild(inner);
-    parent.appendChild(wrap);
-    return inner;
-  }
+  /* -----------------------------------------------------------
+     Coluna de categorias
+     -----------------------------------------------------------
+     Comum a Ao Vivo, Filmes e Séries. A categoria é carregada
+     quando o foco DESCANSA nela — não a cada tecla. Sem essa
+     espera, atravessar 50 categorias dispara 50 carregamentos,
+     e era isso que fazia a lista engasgar ao rolar rápido.
+     ----------------------------------------------------------- */
+  var esperaCat = null;
+  var ESPERA = 320;
 
-  function thumb(item, shape) {
-    var shell = w.el('div', { class: 'shell' });
-    var url = item.poster || '';
-    if (url) {
-      var img = w.el('img', {
-        class: 'thumb' + (shape === 'logo' ? ' contain' : ''),
-        'data-src': url, alt: ''
-      });
-      img.onerror = function () {
-        img.style.display = 'none';
-        shell.appendChild(w.el('div', { class: 'card-fallback', text: w.initials(item.title) }));
-      };
-      shell.appendChild(img);
-      lazy(img);
-    } else {
-      shell.appendChild(w.el('div', { class: 'card-fallback', text: w.initials(item.title) }));
-    }
-    return shell;
-  }
+  /* Id reservado da pasta de mentira. Começa com dois sublinhados
+     porque nenhum category_id do provedor é assim. */
+  var FAVORITOS = '__favoritos__';
 
-  /* Um card. shape: poster | wide | logo */
-  function card(item, opts) {
-    opts = opts || {};
-    var shape = opts.shape || 'poster';
-    var b = w.el('button', {
-      class: 'card card-' + shape + (opts.rank ? ' card-rank' : ''),
-      'data-focusable': true
+  /* "Todos": a pasta que faltava. Entrar em Filmes e cair numa
+     pasta arbitrária do provedor é uma escolha que ninguém pediu;
+     o natural é ver o acervo inteiro e afunilar depois, com o
+     filtro ou com as pastas. Custa uma chamada maior (o painel
+     devolve o catálogo inteiro do tipo), mas ela é cacheada e a
+     grade é virtualizada — 20 mil itens no ar dão 50 nós no DOM. */
+  var TODOS = '__todos__';
+
+  /* "Histórico": os últimos assistidos daquele tipo. Nunca inclui
+     adulto — o filtro é o mesmo da tela inicial, e a origem é o
+     Store, que já não grava adulto nenhum. */
+  var HISTORICO = '__historico__';
+
+  function historicoDe(tipo) {
+    var alvo = tipo === 'series' ? 'episode' : tipo === 'movie' ? 'movie' : 'live';
+    var vistos = {};
+    var lista = w.Store.historyList(200).filter(function (r) {
+      if (!r || r.kind !== alvo) return false;
+      if (w.Catalog.itemAdulto && w.Catalog.itemAdulto(r)) return false;
+      /* uma série entra uma vez só, pelo episódio mais recente */
+      var chave = (tipo === 'series' && r.series_id) ? 's:' + r.series_id : r.id;
+      if (vistos[chave]) return false;
+      vistos[chave] = true;
+      return true;
     });
-
-    if (opts.rank) b.appendChild(w.el('span', { class: 'num', text: String(opts.rank) }));
-
-    var stack = opts.rank ? w.el('div', {}) : b;
-    if (opts.rank) b.appendChild(stack);
-
-    var shell = thumb(item, shape);
-
-    if (opts.live) shell.appendChild(w.el('span', { class: 'tag', text: 'AO VIVO' }));
-    if (opts.tag)  shell.appendChild(w.el('span', { class: 'tag soft', text: opts.tag }));
-
-    shell.appendChild(w.el('div', { class: 'play-hint', html: w.icon('play', 'solid') }));
-
-    if (opts.overlayTitle) {
-      shell.appendChild(w.el('div', { class: 'card-scrim' }));
-      shell.appendChild(w.el('div', { class: 'card-overlay', text: w.cleanName(item.title) }));
-    }
-
-    if (opts.progress > 0) {
-      var bar = w.el('div', { class: 'card-progress' });
-      bar.appendChild(w.el('i', { style: 'width:' + Math.min(100, opts.progress * 100) + '%' }));
-      shell.appendChild(bar);
-    }
-
-    stack.appendChild(shell);
-
-    if (!opts.overlayTitle) {
-      var meta = w.el('div', { class: 'card-meta' });
-      meta.appendChild(w.el('div', { class: 'card-name', text: w.cleanName(item.title) }));
-      if (opts.note) meta.appendChild(w.el('div', { class: 'card-note', text: opts.note }));
-      stack.appendChild(meta);
-    }
-
-    b.setAttribute('data-ambient', item.poster || '');
-    b.onclick = function () { if (opts.onSelect) opts.onSelect(item); };
-    return b;
+    return Promise.resolve(lista.map(function (r) { return itemDoHistorico(r, tipo); }));
   }
 
-  function rowBlock(title, subtitle) {
-    var row = w.el('div', { class: 'row' });
-    var head = w.el('div', { class: 'section-title' });
-    head.appendChild(w.el('span', { text: title }));
-    if (subtitle) head.appendChild(w.el('small', { text: subtitle }));
-    var track = w.el('div', { class: 'row-track', 'data-scroll': 'x', 'data-nav-axis': 'x' });
-    row.appendChild(head);
-    row.appendChild(track);
-    row.track = track;
-    return row;
-  }
-
-  function skeletonRow(title, count, shape) {
-    var row = rowBlock(title, '');
-    for (var i = 0; i < (count || 7); i++) {
-      var d = w.el('div', {
-        class: 'skel',
-        style: shape === 'wide' ? 'width:20rem;height:11.25rem;flex:0 0 auto'
-                                : 'width:11.5rem;height:17.2rem;flex:0 0 auto'
-      });
-      row.track.appendChild(d);
-    }
-    return row;
-  }
-
-  function chip(text, cls) { return w.el('span', { class: 'chip ' + (cls || ''), text: text }); }
-
-  function emptyBlock(title, html) {
-    var e = w.el('div', { class: 'empty' });
-    if (title) e.appendChild(w.el('h2', { text: title }));
-    e.appendChild(w.el('div', { html: html || '' }));
-    return e;
-  }
-
-  function errorBlock(err, retry) {
-    var e = w.el('div', { class: 'empty' });
-    e.appendChild(w.el('h2', { text: 'Não consegui carregar' }));
-    e.appendChild(w.el('div', { html: w.esc(err && err.message ? err.message : String(err)) }));
-    if (retry) {
-      var btns = w.el('div', { class: 'row-btns', style: 'margin-top:1.6rem', 'data-nav-axis': 'x' });
-      var b = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Tentar de novo' });
-      b.onclick = retry;
-      btns.appendChild(b);
-      e.appendChild(btns);
-    }
-    return e;
-  }
-
-  /* Converte um registro de progresso em item reproduzível. */
-  function fromProgress(p) {
+  function itemDoHistorico(r, tipo) {
     return {
-      id: p.id, kind: p.kind, title: p.title, subtitle: p.subtitle,
-      poster: p.poster, url: p.stream_url, duration: p.duration,
-      seriesId: p.series_id, seriesTitle: p.series_title,
-      season: p.season, episode: p.episode
+      id: r.id,
+      kind: tipo === 'series' ? 'series' : r.kind,
+      seriesId: r.series_id || '',
+      streamId: String(r.id || '').replace(/^movie:/, ''),
+      title: (tipo === 'series' && r.series_title) ? r.series_title : r.title,
+      subtitle: r.season ? 'T' + r.season + ' E' + r.episode : '',
+      poster: r.poster || '',
+      url: r.stream_url || ''
     };
   }
 
-  function play(item, opts) {
-    w.Player.open(item, opts || {});
+  /* Os canais marcados, com o objeto COMPLETO — o favorito
+     guardado no Store tem só o essencial para a lista, e para
+     tocar é preciso a escada de qualidade inteira. */
+  function temFavoritosDeCanal() {
+    return w.Store.favorites().some(function (f) { return f.kind === 'live'; });
   }
 
-  /* =========================================================
-     TELA: INÍCIO
-     ========================================================= */
-  function home() {
-    var s = screen('screen-home');
-    var inner = scroller(s);
-
-    /* --- Billboard --- */
-    var bb = w.el('div', { class: 'billboard' });
-    var art = w.el('div', { class: 'bb-art' });
-    var body = w.el('div', { class: 'bb-body' });
-    var dots = w.el('div', { class: 'bb-dots' });
-    bb.appendChild(art); bb.appendChild(body); bb.appendChild(dots);
-    inner.appendChild(bb);
-
-    body.innerHTML =
-      '<div class="bb-kicker">Boa noite</div>' +
-      '<div class="bb-title">Nebula</div>' +
-      '<div class="bb-desc">Carregando seu catálogo…</div>';
-
-    /* --- Fileiras --- */
-    var rows = w.el('div', {});
-    inner.appendChild(rows);
-
-    var cont = w.Store.continueList(20);
-    if (cont.length) {
-      var rc = rowBlock('Continuar assistindo', cont.length + ' em andamento');
-      cont.forEach(function (p) {
-        var item = fromProgress(p);
-        rc.track.appendChild(card(item, {
-          shape: 'wide', overlayTitle: true,
-          progress: p.duration ? p.position / p.duration : 0,
-          tag: p.duration ? 'restam ' + w.fmtLeft(p.duration - p.position) : null,
-          onSelect: function (it) { play(it); }
-        }));
-      });
-      rows.appendChild(rc);
-    }
-
-    var lives = w.Store.historyList(40).filter(function (r) { return r.kind === 'live'; }).slice(0, 14);
-    if (lives.length) {
-      var rl = rowBlock('Canais recentes', '');
-      lives.forEach(function (p) {
-        var item = fromProgress(p);
-        rl.track.appendChild(card(item, {
-          shape: 'logo', live: true,
-          onSelect: function (it) { play(it); }
-        }));
-      });
-      rows.appendChild(rl);
-    }
-
-    var favs = w.Store.favorites();
-    if (favs.length) {
-      var rf = rowBlock('Sua lista', favs.length + ' itens');
-      favs.forEach(function (f) {
-        rf.track.appendChild(card(f, {
-          shape: f.kind === 'live' ? 'logo' : 'poster',
-          onSelect: function (it) { openItem(it); }
-        }));
-      });
-      rows.appendChild(rf);
-    }
-
-    var skMovies = skeletonRow('Filmes', 7, 'poster');
-    var skSeries = skeletonRow('Séries', 7, 'poster');
-    rows.appendChild(skMovies);
-    rows.appendChild(skSeries);
-
-    w.Nav.focusFirst('.screen .card') || w.Nav.focusFirst('.rail-item');
-
-    /* --- Preenche em segundo plano --- */
-    var billboardItems = [];
-
-    w.Catalog.categories('movie')
-      .then(function (cats) {
-        if (!cats.length) throw new Error('Nenhuma categoria de filme.');
-        return Promise.all(cats.slice(0, 3).map(function (c) {
-          return w.Catalog.items('movie', c.id).then(function (items) {
-            return { cat: c, items: items };
-          }).catch(function () { return { cat: c, items: [] }; });
-        }));
-      })
-      .then(function (packs) {
-        rows.removeChild(skMovies);
-        var anchor = skSeries;
-        packs.forEach(function (p, idx) {
-          if (!p.items.length) return;
-          var sorted = byNewest(p.items);
-          if (!billboardItems.length) billboardItems = sorted.filter(hasPoster).slice(0, 5);
-          var r = rowBlock(idx === 0 ? 'Adicionados recentemente' : p.cat.name,
-                           idx === 0 ? p.cat.name : p.items.length + ' filmes');
-          sorted.slice(0, 40).forEach(function (it, i) {
-            r.track.appendChild(card(it, {
-              shape: 'poster',
-              rank: (idx === 0 && i < 10) ? i + 1 : null,
-              progress: progressOf(it.id),
-              onSelect: openItem
-            }));
-          });
-          rows.insertBefore(r, anchor);
-        });
-        renderBillboard(art, body, dots, billboardItems);
-      })
-      .catch(function (e) {
-        if (skMovies.parentNode) rows.replaceChild(errorBlock(e, function () { w.App.go('home'); }), skMovies);
-        renderBillboard(art, body, dots, []);
-      });
-
-    w.Catalog.categories('series')
-      .then(function (cats) {
-        return Promise.all(cats.slice(0, 2).map(function (c) {
-          return w.Catalog.items('series', c.id).then(function (items) {
-            return { cat: c, items: items };
-          }).catch(function () { return { cat: c, items: [] }; });
-        }));
-      })
-      .then(function (packs) {
-        if (skSeries.parentNode) rows.removeChild(skSeries);
-        packs.forEach(function (p) {
-          if (!p.items.length) return;
-          var r = rowBlock(p.cat.name, p.items.length + ' séries');
-          byNewest(p.items).slice(0, 40).forEach(function (it) {
-            r.track.appendChild(card(it, { shape: 'poster', onSelect: openItem }));
-          });
-          rows.appendChild(r);
-        });
-      })
-      .catch(function () {
-        if (skSeries.parentNode) rows.removeChild(skSeries);
-      });
-
-    return Promise.resolve();
-  }
-
-  function hasPoster(i) { return !!i.poster; }
-  function byNewest(items) {
-    return items.slice().sort(function (a, b) {
-      return (Number(b.added) || 0) - (Number(a.added) || 0);
+  function canaisFavoritos() {
+    var marcados = {};
+    w.Store.favorites().forEach(function (f) {
+      if (f.kind === 'live') marcados[f.id] = true;
+    });
+    if (!Object.keys(marcados).length) return Promise.resolve([]);
+    return w.Catalog.canais().then(function (todos) {
+      return todos.filter(function (c) { return marcados[c.id]; });
     });
   }
-  function progressOf(id) {
-    var p = w.Store.progressOf(id);
-    return p && p.duration ? p.position / p.duration : 0;
+
+  function colunaCategorias(cats, aoEscolher) {
+    var aside = el('div', {
+      class: 'coluna-cats',
+      'data-region': 'cats', 'data-axis': 'y',
+      'data-nb-left': 'rail', 'data-nb-right': 'grid',
+      'data-enter': 'last'
+    });
+    var janela = el('div', { class: 'janela cheia' });
+    var trilho = el('div', { class: 'trilho', 'data-scroll': 'y' });
+
+    cats.forEach(function (c, i) {
+      var b = el('button', { class: 'cat-item', 'data-focusable': '', text: c.nome });
+      b._cat = c;
+      b._escolher = function () {
+        w.$$('.cat-item', aside).forEach(function (o) { o.classList.remove('ativa'); });
+        b.classList.add('ativa');
+        aoEscolher(c);
+      };
+      /* Recarregar a MESMA pasta. Existe para a pasta Favoritos:
+         quando você desmarca um canal olhando para ela, a lista
+         tem de se refazer, e `_escolher` sozinho não faz nada
+         porque a pasta já é a atual. */
+      b._recarregar = function () { aoEscolher(c, true); };
+      b.onclick = b._escolher;
+      if (i === 0) b.classList.add('ativa');
+      trilho.appendChild(b);
+    });
+
+    janela.appendChild(trilho);
+    aside.appendChild(janela);
+    return aside;
   }
 
-  /* Rotação do destaque principal. */
-  var bbTimer = null;
-  function renderBillboard(art, body, dots, items) {
-    clearInterval(bbTimer);
-    if (!items.length) {
-      body.innerHTML =
-        '<div class="bb-kicker">Nebula</div>' +
-        '<div class="bb-title">Tudo pronto</div>' +
-        '<div class="bb-desc">Use o menu à esquerda para navegar pelos canais, filmes e séries.</div>';
-      return;
+  /* Chamado pelo roteador a cada mudança de foco. */
+  function aoFocarCategoria(elemento) {
+    clearTimeout(esperaCat);
+    if (!elemento || !elemento._escolher) return;
+    esperaCat = setTimeout(function () {
+      if (w.Nav.atual() === elemento) elemento._escolher();
+    }, ESPERA);
+  }
+
+  /* -----------------------------------------------------------
+     Navegar: coluna de categorias + grade
+     ----------------------------------------------------------- */
+  function navegar(tipo, forma) {
+    var tela = w.UI.tela('nav-' + tipo);
+    var conteudo = el('div', { class: 'conteudo' });
+
+    /* ---------------------------------------------------------
+       Filtrar DENTRO da pasta
+       ---------------------------------------------------------
+       A busca do menu varre o catálogo inteiro e é para quando
+       você não sabe onde a coisa está. Este campo é outra coisa:
+       a pasta já está aberta e carregada na memória, então
+       filtrar é instantâneo e não toca na rede.
+
+       Fica acima da grade e é vizinho dela para cima — ↑ na
+       primeira linha chega nele, ↓ volta. E a tecla vermelha
+       pula direto para cá de qualquer lugar da tela.
+       --------------------------------------------------------- */
+    var barra = el('div', {
+      class: 'filtro-barra',
+      'data-region': 'filtro', 'data-axis': 'x',
+      'data-nb-left': 'cats', 'data-nb-down': 'grid', 'data-enter': 'first'
+    });
+    var campo = el('input', { class: 'filtro-campo', 'data-focusable': '', type: 'text',
+                              placeholder: 'Filtrar nesta pasta' });
+    var conta = el('span', { class: 'filtro-conta' });
+    barra.appendChild(campo);
+    barra.appendChild(conta);
+
+    /* -------------------------------------------------------
+       Ordenação
+       -------------------------------------------------------
+       O provedor manda a lista na ordem dele, que não é ordem
+       nenhuma. Três critérios cobrem o uso real: como veio,
+       o que entrou por último, e o que é bem avaliado. A nota
+       vem do próprio painel, então é de graça.
+       ------------------------------------------------------- */
+    var ORDENS = [
+      { id: 'padrao',   nome: 'Da pasta' },
+      { id: 'recentes', nome: 'Recentes' },
+      { id: 'nota',     nome: 'Nota' }
+    ];
+    var ordemAtual = 'padrao';
+    var botoesOrdem = [];
+
+    if (tipo !== 'live') {
+      var caixaOrdem = el('div', { class: 'filtro-ordem' });
+      ORDENS.forEach(function (o) {
+        var b = el('button', { class: 'ordem-btn' + (o.id === 'padrao' ? ' ativo' : ''),
+                               'data-focusable': '', text: o.nome });
+        b.onclick = function () {
+          ordemAtual = o.id;
+          botoesOrdem.forEach(function (x) { x.classList.remove('ativo'); });
+          b.classList.add('ativo');
+          aplicarFiltro();
+        };
+        botoesOrdem.push(b);
+        caixaOrdem.appendChild(b);
+      });
+      barra.appendChild(caixaOrdem);
     }
-    w.clear(dots);
-    items.forEach(function () { dots.appendChild(w.el('i')); });
+
+    function ordenar(lista) {
+      if (ordemAtual === 'padrao') return lista;
+      var copia = lista.slice();
+      if (ordemAtual === 'recentes') {
+        copia.sort(function (a, b) { return (b.added || 0) - (a.added || 0); });
+      } else {
+        copia.sort(function (a, b) {
+          return (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0);
+        });
+      }
+      return copia;
+    }
+
+    var caixaGrade = el('div', {
+      class: 'grade-caixa',
+      'data-region': 'grid', 'data-axis': 'grid',
+      'data-nb-left': 'cats', 'data-nb-up': 'filtro', 'data-enter': 'last'
+    });
+    caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
+
+    conteudo.appendChild(barra);
+    conteudo.appendChild(caixaGrade);
+
+    var atual = null;
+    var itensDaPasta = [];
+
+    function normal(s) {
+      return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    }
+
+    function pintar(itens, cat) {
+      w.Virt.dentroDe(caixaGrade).forEach(function (c) { c.destruir(); });
+      w.clear(caixaGrade);
+      if (!itens.length) {
+        caixaGrade.appendChild(campo.value.trim()
+          ? w.UI.vazio('Nada com "' + campo.value.trim() + '"',
+                       'Nenhum item desta pasta bate com o filtro.')
+          : atual === HISTORICO
+            ? w.UI.vazio('Nada por aqui ainda',
+                         'O que você assistir aparece nesta pasta. Conteúdo adulto ' +
+                         'nunca entra — nem aqui, nem em recentes, nem em relacionados.')
+          : atual === FAVORITOS
+            ? w.UI.vazio('Nenhum canal favoritado ainda',
+                         'Segure OK sobre um canal em qualquer pasta para marcá-lo. ' +
+                         'Ele aparece aqui na hora.')
+            : w.UI.vazio('Nada nesta pasta',
+                         'A categoria "' + (cat ? cat.nome : '') + '" veio vazia do provedor.'));
+        return;
+      }
+      var g = w.UI.grade(itens, { forma: forma, colunas: COLUNAS, aoAbrir: abrir });
+      caixaGrade.appendChild(g);
+      w.UI.ligar(g);
+    }
+
+    function aplicarFiltro() {
+      var termo = normal(campo.value.trim());
+      var lista = !termo ? itensDaPasta : itensDaPasta.filter(function (i) {
+        return normal(i.title).indexOf(termo) >= 0;
+      });
+      conta.textContent = termo
+        ? lista.length + ' de ' + itensDaPasta.length
+        : itensDaPasta.length + ' itens';
+      pintar(ordenar(lista), null);
+    }
+    campo.oninput = w.debounce(aplicarFiltro, 160);
+
+    function mostrar(cat, forcar) {
+      if (atual === cat.id && !forcar) return;
+      atual = cat.id;
+      campo.value = '';
+      conta.textContent = '';
+      w.Virt.dentroDe(caixaGrade).forEach(function (c) { c.destruir(); });
+      w.clear(caixaGrade);
+      caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
+
+      (cat.id === FAVORITOS ? canaisFavoritos()
+        : cat.id === HISTORICO ? historicoDe(tipo)
+        : cat.id === TODOS ? w.Catalog.itens(tipo, '')
+        : w.Catalog.itens(tipo, cat.id))
+      .then(function (itens) {
+        if (atual !== cat.id) return;                 /* já mudou de categoria */
+        itensDaPasta = itens;
+        conta.textContent = itens.length + ' itens';
+        pintar(ordenar(itens), cat);
+      }).catch(function (e) {
+        if (atual !== cat.id) return;
+        w.clear(caixaGrade);
+        caixaGrade.appendChild(w.UI.erro(e, function () { atual = null; mostrar(cat); }));
+      });
+    }
+
+    /* tecla vermelha: vai direto para o filtro desta pasta */
+    tela._tecla = function (k) {
+      if (k !== w.KEY.RED) return false;
+      w.Nav.focar(campo);
+      return true;
+    };
+
+    w.Catalog.categorias(tipo).then(function (cats) {
+      /* ---------------------------------------------------------
+         A pasta Favoritos
+         ---------------------------------------------------------
+         Ideia sua, e é a forma certa: em vez de uma lista de
+         favoritos escondida noutro canto do app, uma PASTA no
+         mesmo lugar das outras, primeira da coluna. Você entra
+         em Ao Vivo e os seus canais estão ali, antes de tudo.
+
+         É uma pasta de mentira: não existe no provedor, é montada
+         a partir do que você marcou. Por isso o id reservado. */
+      var virtuais = [];
+      if (tipo === 'live') virtuais.push({ id: FAVORITOS, nome: '★ Favoritos' });
+      else virtuais.push({ id: TODOS, nome: 'Todos' });
+      virtuais.push({ id: HISTORICO, nome: 'Histórico' });
+      cats = virtuais.concat(cats);
+      if (!cats.length) {
+        var vaz = w.UI.tela();
+        vaz.appendChild(w.UI.vazio('Sem categorias',
+          'O provedor não devolveu nenhuma pasta para esta seção.'));
+        w.UI.trocar(vaz);
+        return;
+      }
+      var coluna = colunaCategorias(cats, mostrar);
+      tela.appendChild(coluna);
+      tela.appendChild(conteudo);
+      w.UI.trocar(tela, 'cats');
+
+      /* A pasta Favoritos fica sempre visível — é assim que se
+         descobre que ela existe. Mas abrir Ao Vivo numa pasta
+         vazia seria uma recepção ruim, então a seleção inicial
+         só cai nela quando há o que mostrar. */
+      /* A seleção inicial pula as pastas virtuais VAZIAS — e o
+         vazio é por tipo. O teste antigo perguntava "existe
+         algum histórico?", e como havia histórico de filmes, a
+         pasta Histórico de CANAIS era escolhida e a tela de Ao
+         Vivo abria em branco. Medido no app real: 53 focáveis na
+         coluna e zero cartões. */
+      var vaziaAgora = function (id) {
+        if (id === FAVORITOS) return !temFavoritosDeCanal();
+        if (id === HISTORICO) {
+          var kind = tipo === 'series' ? 'episode' : tipo === 'movie' ? 'movie' : 'live';
+          return !w.Store.historyList(200).some(function (r) { return r && r.kind === kind; });
+        }
+        return false;
+      };
+      var inicial = 0;
+      while (inicial < cats.length - 1 && vaziaAgora(cats[inicial].id)) inicial++;
+      var botoes = w.$$('.cat-item', coluna);
+      botoes.forEach(function (b) { b.classList.remove('ativa'); });
+      if (botoes[inicial]) botoes[inicial].classList.add('ativa');
+      mostrar(cats[inicial]);
+
+      /* O foco tem de cair na pasta ATIVA, não na primeira da
+         coluna. Sem isto acontecia uma coisa que parecia
+         fantasma: a grade carregava a pasta certa, o foco ia
+         para Favoritos (vazia), e 320 ms depois o carregamento
+         por descanso de foco trocava tudo por uma tela em
+         branco. Levava a culpa a virtualização, e a culpa era
+         daqui. */
+      assumirFocoEm(botoes[inicial]);
+    }).catch(function (e) {
+      var t = w.UI.tela();
+      t.appendChild(w.UI.erro(e, function () { navegar(tipo, forma); }));
+      w.UI.trocar(t);
+    });
+
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Início
+     -----------------------------------------------------------
+     O destaque não é mais um carrossel que troca sozinho. Ele
+     mostra o que você estava assistindo — que é a coisa que uma
+     pessoa mais quer ao ligar a TV — e só cai para uma novidade
+     quando não há nada em andamento.
+
+     E ficou LARGO. Você notou que parecia estreito e errado:
+     era, porque dividia espaço com um carrossel que já não
+     existe mais.
+     ----------------------------------------------------------- */
+  function destaque(item, aoTocar, aoDetalhe) {
+    var sec = el('div', {
+      class: 'hero',
+      'data-region': 'hero', 'data-axis': 'x',
+      'data-nb-left': 'rail', 'data-nb-down': 'rows', 'data-enter': 'first'
+    });
+
+    if (item.backdrop || item.poster) {
+      var arte = el('div', { class: 'hero-arte' });
+      arte.style.backgroundImage = 'url("' +
+        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      sec.appendChild(arte);
+      sec.appendChild(el('div', { class: 'hero-veu' }));
+    }
+
+    var texto = el('div', { class: 'hero-texto' });
+    texto.appendChild(el('h1', { class: 'hero-titulo', text: w.cleanName(item.title || '') }));
+    if (item.subtitle) texto.appendChild(el('div', { class: 'hero-sub', text: item.subtitle }));
+    if (item.plot) texto.appendChild(el('p', { class: 'hero-plot', text: item.plot }));
+
+    var botoes = el('div', { class: 'hero-btns' });
+    var b1 = el('button', { class: 'btn primary', 'data-focusable': '' });
+    b1.innerHTML = w.icon('play') + '<span>' + (item.retomar ? 'Continuar' : 'Assistir') + '</span>';
+    b1.onclick = function () { aoTocar(item); };
+    botoes.appendChild(b1);
+
+    if (aoDetalhe && item.kind !== 'live') {
+      var b2 = el('button', { class: 'btn ghost', 'data-focusable': '' });
+      b2.innerHTML = w.icon('info') + '<span>Mais informações</span>';
+      b2.onclick = function () { aoDetalhe(item); };
+      botoes.appendChild(b2);
+    }
+    texto.appendChild(botoes);
+    sec.appendChild(texto);
+    return sec;
+  }
+
+  function inicio() {
+    var tela = w.UI.tela('home');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    var fileiras = el('div', {
+      'data-region': 'rows', 'data-axis': 'rows',
+      'data-nb-left': 'rail', 'data-nb-up': 'hero', 'data-enter': 'last'
+    });
+
+    /* enquanto os dados não chegam, o esqueleto segura o espaço
+       para a tela não pular quando eles chegarem */
+    fileiras.appendChild(w.UI.esqueleto(8, 'poster'));
+    coluna.appendChild(fileiras);
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'rows');
+
+    var continuar = agruparPorSerie(w.Store.continueList(40).filter(naoAdulto)).slice(0, 20);
+    var favoritos = w.Store.favorites().filter(naoAdulto);
+
+    /* O destaque precisa de arte. Um registro antigo sem capa
+       deixava a tela de abertura preta com um título solto —
+       foi o que apareceu com "Moana". Se o primeiro não tem,
+       pega o primeiro que tiver. */
+    var comArte = continuar.filter(comCapa)[0];
+    var promessaDestaque = comArte
+      ? Promise.resolve(marcarRetomar(comArte))
+      : w.Catalog.categorias('movie')
+          .then(function (cs) { return cs.length ? w.Catalog.itens('movie', cs[0].id) : []; })
+          .then(function (fs) { return fs.filter(comCapa)[0] || null; })
+          .catch(function () { return null; });
+
+    Promise.all([
+      promessaDestaque,
+      w.Catalog.canais().catch(function () { return []; }),
+      pastasEscolhidas('movie'),
+      pastasEscolhidas('series')
+    ]).then(function (r) {
+      var dest = r[0], canais = r[1], filmes = r[2], series = r[3];
+      /* Tudo o que é "voltar a assistir" mora numa fileira só.
+         Três fileiras quase iguais na abertura era ruído — e as
+         capas em pé no meio das deitadas ficavam desalinhadas. */
+      continuar = juntarComRecentes(continuar);
+      recuperarCapas(continuar, fileiras);
+
+      w.clear(fileiras);
+      w.clear(coluna);
+
+      if (dest) coluna.appendChild(destaque(dest, tocarDoDestaque, abrir));
+      coluna.appendChild(fileiras);
+
+      if (continuar.length) {
+        fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
+          { forma: 'wide', aoAbrir: tocarDoDestaque }));
+      }
+      if (favoritos.length) {
+        fileiras.appendChild(w.UI.fileira('Favoritos', favoritos,
+          { forma: 'poster', aoAbrir: abrir }));
+      }
+      var favCanais = canais.filter(function (c) { return w.Store.isFavorite(c.id); });
+      if (favCanais.length) {
+        fileiras.appendChild(w.UI.fileira('Canais favoritos', favCanais,
+          { forma: 'logo', aoAbrir: abrir }));
+      }
+      if (canais.length) {
+        fileiras.appendChild(w.UI.fileira('Canais ao vivo', porHabito(canais).slice(0, 120),
+          { forma: 'logo', aoAbrir: abrir, subtitulo: canais.length + ' canais' }));
+      }
+      filmes.concat(series).forEach(function (bloco) {
+        if (bloco.itens.length) {
+          fileiras.appendChild(w.UI.fileira(bloco.nome, bloco.itens,
+            { forma: 'poster', aoAbrir: abrir }));
+        }
+      });
+
+      if (!fileiras.children.length) {
+        fileiras.appendChild(w.UI.vazio('Sua lista está vazia',
+          'Não consegui montar nenhuma fileira com o que o provedor devolveu.'));
+      }
+
+      w.UI.ligar(tela);
+      w.UI.apontarMenu(dest ? 'hero' : 'rows');
+      if (dest) assumirFoco('hero'); else assumirFoco('rows');
+    }).catch(function (e) {
+      var t = w.UI.tela();
+      t.appendChild(w.UI.erro(e, inicio));
+      w.UI.trocar(t);
+    });
+
+    return tela;
+  }
+
+  /* Últimos assistidos de um tipo, sem repetir série e sem
+     adulto. É a fonte das fileiras "recentes" da inicial. */
+  /* Continuar assistindo = o que está em andamento, e logo atrás
+     o que já foi assistido. Uma fileira só, sempre em formato
+     deitado. */
+  function juntarComRecentes(emAndamento) {
+    var tem = {};
+    emAndamento.forEach(function (r) {
+      tem[r.series_id ? 's:' + r.series_id : r.id] = true;
+    });
+    var recentes = historicoCurto('episode').concat(historicoCurto('movie'))
+      .filter(function (r) {
+        /* assistido até o fim não é "continuar" — sai da abertura
+           e fica no Histórico, com a etiqueta na capa */
+        var p = w.Store.progressOf(r.id);
+        if (p && p.completed) return false;
+        var chave = r.seriesId ? 's:' + r.seriesId : r.id;
+        if (tem[chave]) return false;
+        tem[chave] = true;
+        return true;
+      });
+    return emAndamento.concat(recentes).slice(0, 30);
+  }
+
+  /* Canais na ordem em que você usa. Os abertos recentemente vão
+     para a frente; o resto mantém a ordem do provedor. */
+  function porHabito(canais) {
+    var quando = {};
+    w.Store.recentChannels(40).forEach(function (r, i) { quando[r.id] = i; });
+    var usados = [], resto = [];
+    canais.forEach(function (c) {
+      if (quando[c.id] !== undefined) usados.push(c); else resto.push(c);
+    });
+    usados.sort(function (a, b) { return quando[a.id] - quando[b.id]; });
+    return usados.concat(resto);
+  }
+
+  function historicoCurto(kind) {
+    var vistos = {};
+    return w.Store.historyList(120).filter(function (r) {
+      if (!r || r.kind !== kind) return false;
+      if (w.Catalog.itemAdulto && w.Catalog.itemAdulto(r)) return false;
+      var chave = r.series_id ? 's:' + r.series_id : r.id;
+      if (vistos[chave]) return false;
+      vistos[chave] = true;
+      return true;
+    }).slice(0, 20).map(function (r) {
+      return itemDoHistorico(r, r.kind === 'episode' ? 'series' : 'movie');
+    });
+  }
+
+  /* Quais pastas viram fileira na inicial.
+     -------------------------------------------------------
+     Pegar "as duas primeiras" era arbitrário: a ordem é a do
+     provedor. Agora há uma lista de preferências por nome — 4K,
+     lançamentos, os catálogos grandes — e o resto entra por
+     ordem, até completar. */
+  var PREFERIDAS = [/\b4k\b/i, /lan[çc]amento/i, /netflix/i, /prime/i,
+                    /hbo/i, /disney/i, /a[çc][ãa]o/i];
+
+  function pastasEscolhidas(tipo, quantas) {
+    quantas = quantas || 3;
+    return w.Catalog.categorias(tipo).then(function (cats) {
+      var uteis = cats.filter(function (c) { return !w.Catalog.ehAdulta(c.nome); });
+      var nota = function (c) {
+        for (var i = 0; i < PREFERIDAS.length; i++) {
+          if (PREFERIDAS[i].test(c.nome)) return i;
+        }
+        return PREFERIDAS.length;
+      };
+      var ordenadas = uteis.slice().sort(function (a, b) { return nota(a) - nota(b); });
+      return Promise.all(ordenadas.slice(0, quantas).map(function (c) {
+        return w.Catalog.itens(tipo, c.id)
+          .then(function (its) { return { nome: c.nome, itens: its.slice(0, 60) }; })
+          .catch(function () { return { nome: c.nome, itens: [] }; });
+      }));
+    }).catch(function () { return []; });
+  }
+
+  function primeirasPastas(tipo, quantas) {
+    return w.Catalog.categorias(tipo).then(function (cats) {
+      var uteis = cats.filter(function (c) { return !w.Catalog.ehAdulta(c.nome); })
+                      .slice(0, quantas);
+      return Promise.all(uteis.map(function (c) {
+        return w.Catalog.itens(tipo, c.id)
+          .then(function (its) { return { nome: c.nome, itens: its.slice(0, 60) }; })
+          .catch(function () { return { nome: c.nome, itens: [] }; });
+      }));
+    }).catch(function () { return []; });
+  }
+
+  /* Uma série não pode ocupar cinco lugares em "continuar
+     assistindo" com cinco episódios. Fica o mais recente de cada
+     série, com o rótulo da temporada e do episódio — que é o que
+     faltava para as séries aparecerem de forma útil na inicial. */
+  function agruparPorSerie(lista) {
+    var vistos = {}, saida = [];
+    lista.forEach(function (r) {
+      var chave = r.series_id ? 's:' + r.series_id : r.id;
+      if (vistos[chave]) return;
+      vistos[chave] = true;
+      if (r.series_id) {
+        var c = {};
+        Object.keys(r).forEach(function (k) { c[k] = r[k]; });
+        c.title = r.series_title || r.title;
+        c.subtitle = (r.season ? 'T' + r.season : '') +
+                     (r.episode ? ' E' + r.episode : '');
+        saida.push(c);
+      } else saida.push(r);
+    });
+    return saida;
+  }
+
+  /* Registro sem capa
+     -------------------------------------------------------
+     O progresso guarda a capa no momento em que você dá play.
+     Quem tocou por um caminho sem capa (busca antiga, registro
+     de uma versão anterior) ficou com o campo vazio, e o cartão
+     virava duas letras num quadrado. A capa está a uma chamada
+     de distância e ela é cacheada — então busca e conserta,
+     inclusive no registro, para não repetir amanhã. */
+  function recuperarCapas(lista, raiz) {
+    /* O registro de progresso guarda só `id`, `kind`, `title` e
+       `poster` — não guarda `streamId`. Eu filtrava por
+       `streamId` e o item nunca entrava na recuperação. O número
+       está dentro do próprio id (`movie:640392`), então é de lá
+       que ele sai. */
+    lista.filter(function (i) { return !i.poster && i.id; })
+      .slice(0, 8)
+      .forEach(function (item) {
+        var num = String(item.id).replace(/^[a-z]+:/, '');
+        var ehSerie = item.seriesId || /^series:/.test(item.id);
+        if (!num) return;
+        var busca = ehSerie
+          ? w.Catalog.serie(item.seriesId || num)
+          : w.Catalog.filme(item.streamId || num);
+        busca.then(function (info) {
+          var capa = info && (info.poster || info.fundo);
+          if (!capa) return;
+          item.poster = capa;
+          var p = w.Store.progressOf(item.id);
+          if (p) { p.poster = capa; w.Store.saveProgress(p); }
+          var no = raiz.querySelector('.card[data-id="' + item.id + '"]');
+          if (no) {
+            var casca = no.querySelector('.shell');
+            if (casca && !casca.querySelector('img')) {
+              w.clear(casca);
+              var img = document.createElement('img');
+              img.decoding = 'async';
+              img.onload = function () {
+                if (img.naturalHeight > img.naturalWidth * 1.1) casca.classList.add('retrato');
+              };
+              img.src = capa;
+              casca.appendChild(img);
+            }
+          }
+        }).catch(function () {});
+      });
+  }
+
+  function naoAdulto(item) {
+    return !(w.Catalog.itemAdulto && w.Catalog.itemAdulto(item));
+  }
+  function comCapa(i) { return !!(i.backdrop || i.poster); }
+  function marcarRetomar(i) {
+    var c = {}; Object.keys(i).forEach(function (k) { c[k] = i[k]; });
+    c.retomar = true; return c;
+  }
+  function tocarDoDestaque(item) {
+    if (item.kind === 'series' || item.seriesId) return abrir(item);
+    tocar(item);
+  }
+
+  /* -----------------------------------------------------------
+     Detalhe de filme
+     ----------------------------------------------------------- */
+  function detalheFilme(params) {
+    var base = params.item || {};
+    var tela = w.UI.tela('detalhe');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'acoes');
+
+    w.Catalog.filme(params.id).then(function (info) {
+      var item = mesclar(base, info);
+      var acoesFilme = [
+        { rotulo: 'Assistir', icone: 'play', primario: true,
+          acao: function () { tocar(item); } },
+        botaoFavorito(item)
+      ];
+      acoesFilme.abaixo = 'rows';
+      coluna.appendChild(cabecalhoDetalhe(item, acoesFilme));
+
+      /* Relacionados de verdade: franquia primeiro, depois nome
+         parecido, depois gênero. A versão anterior sorteava. */
+      var pasta = item.categoryId || item.groupId;
+      if (pasta) {
+        w.Catalog.itens('movie', pasta).then(function (universo) {
+          var rel = w.Catalog.relacionados(item, universo, 20);
+          if (!rel.length) return;
+          var cxF = caixaRelacionados(rel, 'acoes');
+          coluna.appendChild(cxF);
+          w.UI.ligar(cxF);          /* sem isto a fileira existe e fica vazia */
+        }).catch(function () {});
+      }
+      assumirFoco('acoes');
+    }).catch(function (e) {
+      coluna.appendChild(w.UI.erro(e, function () { detalheFilme(params); }));
+    });
+
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Detalhe de série
+     ----------------------------------------------------------- */
+  function detalheSerie(params) {
+    var base = params.item || {};
+    var tela = w.UI.tela('detalhe');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'acoes');
+
+    w.Catalog.serie(params.id).then(function (info) {
+      var item = mesclar(base, info);
+      var todos = [];
+      info.temporadas.forEach(function (t) { todos = todos.concat(t.episodios); });
+
+      var ultimo = w.Store.lastEpisodeOf(params.id);
+      var proximo = proximoEpisodio(todos, ultimo);
+
+      var acoesSerie = [
+        { rotulo: proximo.rotulo, icone: 'play', primario: true,
+          acao: function () { tocarEpisodio(proximo.ep, todos, item); } },
+        botaoFavorito(item)
+      ];
+      acoesSerie.abaixo = 'seasons';
+      coluna.appendChild(cabecalhoDetalhe(item, acoesSerie));
+
+      var caixaT = el('div', {
+        class: 'temporadas',
+        'data-region': 'seasons', 'data-axis': 'x',
+        'data-nb-left': 'rail', 'data-nb-up': 'acoes', 'data-nb-down': 'episodes',
+        'data-enter': 'last'
+      });
+      var caixaE = el('div', {
+        class: 'episodios',
+        'data-region': 'episodes', 'data-axis': 'x',
+        'data-nb-left': 'rail', 'data-nb-up': 'seasons',
+        'data-nb-down': 'rows', 'data-enter': 'last'
+      });
+
+      /* Fileira horizontal mesmo. No detalhe ela funciona: as
+         temporadas ficam logo acima, ↑ sai para elas e o cartaz
+         largo do episódio se lê bem passando de lado. */
+      function mostrarTemporada(t, botao) {
+        w.$$('.temp-btn', caixaT).forEach(function (o) { o.classList.remove('ativa'); });
+        if (botao) botao.classList.add('ativa');
+        w.Virt.dentroDe(caixaE).forEach(function (c) { c.destruir(); });
+        w.clear(caixaE);
+        var f = w.UI.fileira('', t.episodios, {
+          forma: 'wide',
+          aoAbrir: function (ep) { tocarEpisodio(ep, todos, item); },
+          nota: function (ep) { return 'T' + ep.temporada + ' E' + ep.episodio; }
+        });
+        caixaE.appendChild(f);
+        w.UI.ligar(f);
+      }
+
+      /* As caixas entram no documento ANTES de montar a fileira.
+         A virtualização mede um cartão de verdade para saber o
+         passo — e um cartão medido fora do documento tem largura
+         zero, o que empilha todos os episódios um por cima do
+         outro. Foi exatamente o que apareceu na tela. */
+      coluna.appendChild(caixaT);
+      coluna.appendChild(caixaE);
+
+      /* Relacionados também em série, abaixo dos episódios —
+         mesma lógica de franquia, nome parecido e gênero. */
+      var pastaS = item.categoryId || item.groupId || params.catId;
+      if (pastaS) {
+        w.Catalog.itens('series', pastaS).then(function (universo) {
+          var rel = w.Catalog.relacionados(item, universo, 20);
+          if (!rel.length) return;
+          var cx = caixaRelacionados(rel, 'episodes');
+          coluna.appendChild(cx);
+          w.UI.ligar(cx);
+        }).catch(function () {});
+      }
+
+      info.temporadas.forEach(function (t, i) {
+        var b = el('button', { class: 'temp-btn', 'data-focusable': '',
+                               text: 'Temporada ' + t.temporada });
+        b.onclick = function () { mostrarTemporada(t, b); };
+        caixaT.appendChild(b);
+        if (i === 0) mostrarTemporada(t, b);
+      });
+      assumirFoco('acoes');
+    }).catch(function (e) {
+      coluna.appendChild(w.UI.erro(e, function () { detalheSerie(params); }));
+    });
+
+    return tela;
+  }
+
+  /* Fileira de relacionados, com o vizinho de cima declarado —
+     em filme vem das ações, em série vem dos episódios. Sem essa
+     declaração a região existia e não havia como chegar nela. */
+  function caixaRelacionados(rel, acima) {
+    var caixa = el('div', {
+      'data-region': 'rows', 'data-axis': 'rows',
+      'data-nb-left': 'rail', 'data-nb-up': acima
+    });
+    caixa.appendChild(w.UI.fileira('Relacionados', rel,
+      { forma: 'poster', aoAbrir: abrir }));
+    return caixa;
+  }
+
+  function botaoFavorito(item) {
+    return {
+      rotulo: w.Store.isFavorite(item.id) ? 'Nos favoritos' : 'Favoritar',
+      icone: 'star',
+      acao: function (b) {
+        var agora = w.Store.toggleFavorite(item);
+        b.querySelector('span').textContent = agora ? 'Nos favoritos' : 'Favoritar';
+        b.classList.toggle('ativo', agora);
+      }
+    };
+  }
+
+  /* Qual episódio o botão principal deve tocar.
+     A conta é sobre estado derivado — posição sobre duração —
+     e não sobre o evento `ended`, que o Chromium engole em
+     alguns arquivos. Mesmo critério do avanço automático. */
+  function proximoEpisodio(todos, ultimo) {
+    if (!todos.length) return { ep: null, rotulo: 'Assistir' };
+    if (!ultimo) return { ep: todos[0], rotulo: 'Assistir T1 E1' };
 
     var i = -1;
-    function next() {
-      i = (i + 1) % items.length;
-      var it = items[i];
-      art.classList.remove('on');
-      setTimeout(function () {
-        art.style.backgroundImage = 'url("' + String(it.poster).replace(/"/g, '%22') + '")';
-        art.classList.add('on');
-      }, 40);
-
-      w.clear(body);
-      body.appendChild(w.el('div', { class: 'bb-kicker', text: 'Em destaque' }));
-      body.appendChild(w.el('div', { class: 'bb-title', text: w.cleanName(it.title) }));
-
-      var meta = w.el('div', { class: 'bb-meta' });
-      if (it.year) meta.appendChild(chip(it.year));
-      if (it.rating) meta.appendChild(chip('★ ' + it.rating, 'warn'));
-      meta.appendChild(chip(it.kind === 'series' ? 'Série' : 'Filme'));
-      body.appendChild(meta);
-
-      body.appendChild(w.el('div', { class: 'bb-desc',
-        text: it.plot || 'Abra para ver os detalhes, o elenco e começar a assistir.' }));
-
-      var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-      var bPlay = w.el('button', { class: 'btn', 'data-focusable': true,
-                                   html: w.icon('play', 'solid') + '<span>Assistir</span>' });
-      bPlay.onclick = function () { openItem(it, true); };
-      var bInfo = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                   html: w.icon('info') + '<span>Detalhes</span>' });
-      bInfo.onclick = function () { openItem(it); };
-      btns.appendChild(bPlay); btns.appendChild(bInfo);
-      body.appendChild(btns);
-
-      w.$$('i', dots).forEach(function (d, k) { d.classList.toggle('on', k === i); });
-
-      /* Na primeira montagem o foco ainda está no menu: traz para o destaque. */
-      var cur = w.Nav.current();
-      if (!cur || (cur.closest && cur.closest('#rail'))) w.Nav.focus(bPlay);
+    for (var k = 0; k < todos.length; k++) {
+      if (String(todos[k].id) === String(ultimo.id)) { i = k; break; }
     }
-    next();
-    bbTimer = setInterval(next, 9000);
+    if (i < 0) return { ep: todos[0], rotulo: 'Assistir T1 E1' };
+
+    var p = w.Store.progressOf(ultimo.id);
+    var terminou = !!(p && (p.completed ||
+      (p.duration > 0 && p.position / p.duration >= 0.95)));
+
+    var alvo = terminou ? (todos[i + 1] || todos[i]) : todos[i];
+    return {
+      ep: alvo,
+      rotulo: (terminou ? 'Assistir T' : 'Continuar T') + alvo.temporada + ' E' + alvo.episodio
+    };
   }
 
-  /* =========================================================
-     Abertura de um item, conforme o tipo
-     ========================================================= */
-  function openItem(item, straightToPlay) {
-    if (item.kind === 'live') { play(item); return; }
-    if (item.kind === 'series') { w.App.go('series-detail', { item: item }); return; }
-    if (item.kind === 'movie') {
-      if (straightToPlay) play(item);
-      else w.App.go('movie-detail', { item: item });
-      return;
-    }
-    play(item);
+  function tocarEpisodio(ep, todos, serie) {
+    if (!ep) return;
+    tocar(ep, { queue: todos, index: todos.indexOf(ep), serie: serie });
   }
-  w.openItem = openItem;
 
-  /* =========================================================
-     TELA GENÉRICA: categorias + grade
-     ========================================================= */
-  function browse(kind, titleText, subtitleText) {
-    var s = screen('screen-browse');
-    var split = w.el('div', { class: 'split' });
-    var catsCol = w.el('div', { class: 'cats' });
-    var catsScroll = w.el('div', { class: 'cats-scroll', 'data-scroll': 'y', 'data-nav-axis': 'y' });
-    catsCol.appendChild(w.el('div', { class: 'cats-head', text: titleText }));
-    catsCol.appendChild(catsScroll);
+  /* Cabeçalho comum aos dois detalhes. */
+  function cabecalhoDetalhe(item, acoes) {
+    var topo = el('div', { class: 'det-topo' });
+    if (item.backdrop || item.poster) {
+      var arte = el('div', { class: 'det-arte' });
+      arte.style.backgroundImage = 'url("' +
+        String(item.backdrop || item.poster).replace(/"/g, '%22') + '")';
+      topo.appendChild(arte);
+      topo.appendChild(el('div', { class: 'det-veu' }));
+    }
+    var txt = el('div', { class: 'det-texto' });
+    txt.appendChild(el('h1', { class: 'det-titulo', text: w.cleanName(item.title || '') }));
 
-    var gridWrap = w.el('div', { class: 'grid-wrap' });
-    var gridHead = w.el('div', { class: 'grid-head' });
-    var grid = w.el('div', { class: 'grid', 'data-scroll': 'y', 'data-nav-axis': 'grid' });
-    gridWrap.appendChild(gridHead);
-    gridWrap.appendChild(grid);
+    /* Os campos vêm do catálogo em português (`sinopse`, `elenco`,
+       `direcao`, `ano`, `genero`). Eu estava lendo `plot`, `genre`
+       e `year`, que não existem — por isso a tela do detalhe só
+       mostrava o título e a nota. */
+    var ano    = item.ano || item.year || '';
+    var genero = item.genero || item.genre || '';
+    var nota   = item.rating || '';
+    var dur    = item.duracao ? Math.round(item.duracao / 60) + ' min' : '';
 
-    split.appendChild(catsCol);
-    split.appendChild(gridWrap);
-    s.appendChild(split);
+    var linha = [];
+    if (ano) linha.push(ano);
+    if (dur) linha.push(dur);
+    if (genero) linha.push(genero);
+    if (nota) linha.push('★ ' + nota);
+    if (item.idade) linha.push(item.idade);
+    if (linha.length) txt.appendChild(el('div', { class: 'det-meta', text: linha.join('  ·  ') }));
 
-    gridHead.appendChild(w.el('h2', { text: 'Carregando…' }));
+    var sinopse = item.sinopse || item.plot || '';
+    if (sinopse) txt.appendChild(el('p', { class: 'det-plot', text: sinopse }));
 
-    return w.Catalog.categories(kind).then(function (cats) {
-      if (!cats.length) {
-        w.clear(gridWrap);
-        gridWrap.appendChild(emptyBlock('Nada por aqui',
-          'O servidor não devolveu nenhuma categoria de ' + subtitleText + '.'));
-        w.Nav.focusFirst('.rail-item');
-        return;
-      }
+    /* Elenco e direção: duas linhas curtas, com rótulo. É a
+       informação que faz decidir se vale a pena, e ela já vinha
+       na resposta do painel sem custo nenhum. */
+    if (item.elenco) txt.appendChild(ficha('Elenco', item.elenco));
+    if (item.direcao) txt.appendChild(ficha('Direção', item.direcao));
 
-      var current = null;
-      cats.forEach(function (c, idx) {
-        var b = w.el('button', { class: 'cat-item', 'data-focusable': true });
-        b.appendChild(w.el('b', { text: c.name }));
-        if (c.count) b.appendChild(w.el('i', { text: String(c.count) }));
-        b.onclick = function () { select(c, b); };
-        b.setAttribute('data-on-focus', '1');
-        b._select = function () { select(c, b); };
-        catsScroll.appendChild(b);
-        if (idx === 0) current = { cat: c, btn: b };
-      });
-
-      function select(c, btn) {
-        w.$$('.cat-item', catsScroll).forEach(function (n) { n.classList.remove('active'); });
-        btn.classList.add('active');
-        w.clear(gridHead); w.clear(grid);
-        gridHead.appendChild(w.el('h2', { text: c.name }));
-        var count = w.el('small', { text: 'carregando…' });
-        gridHead.appendChild(count);
-        w.Nav.resetScroll(grid.parentElement);
-
-        w.Catalog.items(kind, c.id).then(function (items) {
-          count.textContent = items.length.toLocaleString('pt-BR') +
-                              ' ' + (kind === 'live' ? 'canais' : kind === 'movie' ? 'filmes' : 'séries');
-          renderPage(items, 0);
-        }).catch(function (e) {
-          w.clear(grid);
-          grid.appendChild(errorBlock(e, function () { select(c, btn); }));
-        });
-
-        function renderPage(items, from) {
-          var slice = items.slice(from, from + w.CFG.PAGE_SIZE);
-          slice.forEach(function (it) {
-            grid.appendChild(card(it, {
-              shape: kind === 'live' ? 'logo' : 'poster',
-              live: kind === 'live',
-              progress: progressOf(it.id),
-              onSelect: openItem
-            }));
-          });
-          if (from + w.CFG.PAGE_SIZE < items.length) {
-            var more = w.el('button', {
-              class: 'card card-' + (kind === 'live' ? 'logo' : 'poster'),
-              'data-focusable': true
-            });
-            var shell = w.el('div', { class: 'shell' });
-            shell.appendChild(w.el('div', { class: 'card-fallback',
-              text: '+' + (items.length - from - w.CFG.PAGE_SIZE) }));
-            more.appendChild(shell);
-            more.appendChild(w.el('div', { class: 'card-meta' },
-              [w.el('div', { class: 'card-name', text: 'Mostrar mais' })]));
-            more.onclick = function () {
-              grid.removeChild(more);
-              renderPage(items, from + w.CFG.PAGE_SIZE);
-              w.Nav.focus(grid.lastChild);
-            };
-            grid.appendChild(more);
-          }
-        }
-      }
-
-      select(current.cat, current.btn);
-      w.Nav.focus(current.btn);
-    }).catch(function (e) {
-      w.clear(s);
-      s.appendChild(errorBlock(e, function () { w.App.go(kind === 'live' ? 'live' : kind === 'movie' ? 'movies' : 'series'); }));
-      w.Nav.focusFirst('.screen .btn') || w.Nav.focusFirst('.rail-item');
+    /* Para onde ↓ leva depende da tela: em série, para as
+       temporadas; em filme, direto para os relacionados. Antes
+       apontava sempre para `seasons`, que em filme não existe —
+       e por isso os relacionados eram inalcançáveis. */
+    var caixa = el('div', {
+      class: 'row-btns', 'data-region': 'acoes', 'data-axis': 'x',
+      'data-nb-left': 'rail', 'data-enter': 'first',
+      'data-nb-down': (acoes.abaixo || 'rows')
     });
-  }
-
-  /* =========================================================
-     TELA: DETALHE DE FILME
-     ========================================================= */
-  function movieDetail(params) {
-    var item = params.item;
-    var s = screen('screen-detail');
-    var inner = scroller(s);
-
-    var art = w.el('div', { class: 'detail-art' });
-    if (item.poster) art.style.backgroundImage = 'url("' + item.poster.replace(/"/g, '%22') + '")';
-    s.insertBefore(art, s.firstChild);
-
-    var head = w.el('div', { class: 'detail-head' });
-    var posterBox = w.el('div', { class: 'detail-poster' });
-    if (item.poster) {
-      var img = w.el('img', { src: item.poster, alt: '' });
-      img.onerror = function () { img.style.display = 'none'; };
-      posterBox.appendChild(img);
-    }
-    var info = w.el('div', { class: 'detail-info' });
-    head.appendChild(posterBox);
-    head.appendChild(info);
-    inner.appendChild(head);
-
-    info.appendChild(w.el('h1', { text: w.cleanName(item.title) }));
-    var meta = w.el('div', { class: 'detail-meta' });
-    info.appendChild(meta);
-    var plot = w.el('div', { class: 'detail-plot', text: 'Buscando informações…' });
-    info.appendChild(plot);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    info.appendChild(btns);
-    var credits = w.el('div', { class: 'detail-credits' });
-    info.appendChild(credits);
-
-    var saved = w.Store.progressOf(item.id);
-    var bPlay = w.el('button', {
-      class: 'btn', 'data-focusable': true,
-      html: w.icon('play', 'solid') + '<span>' +
-            (saved && saved.position > w.CFG.RESUME_MIN_SEC && !saved.completed
-              ? 'Continuar de ' + w.fmtTime(saved.position) : 'Assistir') + '</span>'
+    acoes.forEach(function (a) {
+      var b = el('button', { class: 'btn ' + (a.primario ? 'primary' : 'ghost'),
+                             'data-focusable': '' });
+      b.innerHTML = w.icon(a.icone) + '<span>' + w.esc(a.rotulo) + '</span>';
+      b.onclick = function () { a.acao(b); };
+      caixa.appendChild(b);
     });
-    bPlay.onclick = function () { play(item); };
-    btns.appendChild(bPlay);
-
-    if (saved && saved.position > 0) {
-      var bRestart = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                      text: 'Começar do início' });
-      bRestart.onclick = function () { play(item, { forceStart: true }); };
-      btns.appendChild(bRestart);
-    }
-
-    var bFav = w.el('button', { class: 'btn ghost', 'data-focusable': true });
-    function paintFav() {
-      bFav.innerHTML = w.icon('star', w.Store.isFavorite(item.id) ? 'solid' : '') +
-                       '<span>' + (w.Store.isFavorite(item.id) ? 'Na sua lista' : 'Minha lista') + '</span>';
-    }
-    paintFav();
-    bFav.onclick = function () {
-      var on = w.Store.toggleFavorite(item);
-      paintFav();
-      w.toast(on ? 'Adicionado à sua lista' : 'Removido da sua lista');
-    };
-    btns.appendChild(bFav);
-
-    w.Nav.focus(bPlay);
-    w.setAmbient(item.poster);
-
-    if (item.streamId) {
-      w.Catalog.movieInfo(item.streamId).then(function (d) {
-        if (!d) { plot.textContent = ''; return; }
-        plot.textContent = d.plot || 'Sem sinopse disponível.';
-        w.clear(meta);
-        if (d.year) meta.appendChild(chip(d.year));
-        if (d.duration) meta.appendChild(chip(w.fmtLeft(d.duration)));
-        if (d.rating) meta.appendChild(chip('★ ' + d.rating, 'warn'));
-        if (d.genre) meta.appendChild(chip(d.genre));
-        var c = [];
-        if (d.director) c.push('<b>Direção:</b> ' + w.esc(d.director));
-        if (d.cast) c.push('<b>Elenco:</b> ' + w.esc(d.cast));
-        credits.innerHTML = c.join('<br>');
-        if (d.url) item.url = d.url;
-        if (d.poster) { art.style.backgroundImage = 'url("' + d.poster.replace(/"/g, '%22') + '")'; }
-      }).catch(function () { plot.textContent = ''; });
-    } else {
-      plot.textContent = '';
-    }
-
-    return Promise.resolve();
+    txt.appendChild(caixa);
+    topo.appendChild(txt);
+    return topo;
   }
 
-  /* =========================================================
-     TELA: DETALHE DE SÉRIE
-     ========================================================= */
-  function seriesDetail(params) {
-    var item = params.item;
-    var s = screen('screen-detail');
-    var inner = scroller(s);
-
-    var art = w.el('div', { class: 'detail-art' });
-    if (item.poster) art.style.backgroundImage = 'url("' + item.poster.replace(/"/g, '%22') + '")';
-    s.insertBefore(art, s.firstChild);
-
-    var head = w.el('div', { class: 'detail-head' });
-    var posterBox = w.el('div', { class: 'detail-poster' });
-    if (item.poster) posterBox.appendChild(w.el('img', { src: item.poster, alt: '' }));
-    var info = w.el('div', { class: 'detail-info' });
-    head.appendChild(posterBox); head.appendChild(info);
-    inner.appendChild(head);
-
-    info.appendChild(w.el('h1', { text: w.cleanName(item.title) }));
-    var meta = w.el('div', { class: 'detail-meta' });
-    info.appendChild(meta);
-    var plot = w.el('div', { class: 'detail-plot', text: 'Carregando temporadas…' });
-    info.appendChild(plot);
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    info.appendChild(btns);
-
-    var seasonsBar = w.el('div', { class: 'seasons', 'data-nav-axis': 'x' });
-    var epList = w.el('div', { class: 'episodes' });
-    inner.appendChild(seasonsBar);
-    inner.appendChild(epList);
-
-    w.setAmbient(item.poster);
-    w.Nav.focusFirst('.rail-item');
-
-    return w.Catalog.seriesInfo(item.seriesId).then(function (d) {
-      plot.textContent = d.plot || 'Sem sinopse disponível.';
-      w.clear(meta);
-      if (d.year) meta.appendChild(chip(d.year));
-      meta.appendChild(chip(d.seasons.length + (d.seasons.length === 1 ? ' temporada' : ' temporadas')));
-      if (d.rating) meta.appendChild(chip('★ ' + d.rating, 'warn'));
-      if (d.genre) meta.appendChild(chip(d.genre));
-
-      var all = [];
-      d.seasons.forEach(function (se) { all = all.concat(se.episodes); });
-
-      /* Botão principal: continuar de onde parou, ou o primeiro episódio. */
-      var last = w.Store.lastEpisodeOf(item.seriesId);
-      var target = null, label = 'Assistir T1 E1';
-      if (last) {
-        var idx = indexOfEpisode(all, last.id);
-        var savedRec = w.Store.progressOf(last.id);
-        if (idx >= 0 && savedRec && !savedRec.completed) {
-          target = all[idx];
-          label = 'Continuar T' + target.season + ' E' + target.episode;
-        } else if (idx >= 0 && all[idx + 1]) {
-          target = all[idx + 1];
-          label = 'Próximo: T' + target.season + ' E' + target.episode;
-        }
-      }
-      if (!target) target = all[0];
-
-      if (target) {
-        var bPlay = w.el('button', { class: 'btn', 'data-focusable': true,
-          html: w.icon('play', 'solid') + '<span>' + w.esc(label) + '</span>' });
-        bPlay.onclick = function () { playEpisode(target, all, d); };
-        btns.appendChild(bPlay);
-      }
-
-      var bFav = w.el('button', { class: 'btn ghost', 'data-focusable': true });
-      function paintFav() {
-        bFav.innerHTML = w.icon('star', w.Store.isFavorite(item.id) ? 'solid' : '') +
-                         '<span>' + (w.Store.isFavorite(item.id) ? 'Na sua lista' : 'Minha lista') + '</span>';
-      }
-      paintFav();
-      bFav.onclick = function () { w.Store.toggleFavorite(item); paintFav(); };
-      btns.appendChild(bFav);
-
-      var currentSeason = target ? target.season : (d.seasons[0] && d.seasons[0].season);
-
-      d.seasons.forEach(function (se) {
-        var b = w.el('button', { class: 'season-btn', 'data-focusable': true,
-                                 text: 'Temporada ' + se.season });
-        b.onclick = function () { showSeason(se, b); };
-        seasonsBar.appendChild(b);
-        if (se.season === currentSeason) setTimeout(function () { showSeason(se, b); }, 0);
-      });
-
-      function showSeason(se, btn) {
-        w.$$('.season-btn', seasonsBar).forEach(function (n) { n.classList.remove('active'); });
-        btn.classList.add('active');
-        w.clear(epList);
-        epList.setAttribute('data-nav-axis', 'y');
-        se.episodes.forEach(function (ep) {
-          epList.appendChild(episodeRow(ep, all, d));
-        });
-      }
-
-      if (btns.firstChild) w.Nav.focus(btns.firstChild);
-    }).catch(function (e) {
-      plot.textContent = '';
-      inner.appendChild(errorBlock(e, function () { w.App.go('series-detail', params); }));
-      w.Nav.focusFirst('.screen .btn') || w.Nav.focusFirst('.rail-item');
-    });
-  }
-
-  function indexOfEpisode(all, id) {
-    for (var i = 0; i < all.length; i++) if (all[i].id === id) return i;
-    return -1;
-  }
-
-  function episodeRow(ep, all, info) {
-    var b = w.el('button', { class: 'ep', 'data-focusable': true });
-    var th = w.el('div', { class: 'ep-thumb' });
-    if (ep.poster) {
-      var img = w.el('img', { 'data-src': ep.poster, alt: '' });
-      img.onerror = function () { img.style.display = 'none'; };
-      th.appendChild(img);
-      lazy(img);
-    }
-    th.appendChild(w.el('span', { class: 'ep-num', text: 'T' + ep.season + ' · E' + ep.episode }));
-
-    var p = w.Store.progressOf(ep.id);
-    if (p && p.duration) {
-      var bar = w.el('div', { class: 'card-progress' });
-      bar.appendChild(w.el('i', { style: 'width:' + Math.min(100, (p.position / p.duration) * 100) + '%' }));
-      th.appendChild(bar);
-    }
-
-    var body = w.el('div', { class: 'ep-body' });
-    var line = w.el('div', { class: 'ep-title' });
-    line.appendChild(w.el('span', { text: w.cleanName(ep.title) }));
-    if (ep.duration) line.appendChild(w.el('span', { class: 'ep-dur', text: w.fmtLeft(ep.duration) }));
-    body.appendChild(line);
-    body.appendChild(w.el('div', { class: 'ep-plot', text: ep.plot || '' }));
-    if (p) {
-      body.appendChild(w.el('div', { class: 'ep-state',
-        text: p.completed ? 'Assistido' :
-              (p.position > 30 ? 'Você parou em ' + w.fmtTime(p.position) : '') }));
-    }
-
-    b.appendChild(th); b.appendChild(body);
-    b.setAttribute('data-ambient', ep.poster || info.poster || '');
-    b.onclick = function () { playEpisode(ep, all, info); };
-    return b;
-  }
-
-  function playEpisode(ep, all, info) {
-    var idx = indexOfEpisode(all, ep.id);
-    var queue = all.map(function (e) {
-      return {
-        id: e.id, kind: 'episode', title: e.title,
-        subtitle: info.title + ' · T' + e.season + ' E' + e.episode,
-        poster: e.poster || info.poster, url: e.url, duration: e.duration,
-        seriesId: e.seriesId, seriesTitle: info.title,
-        season: e.season, episode: e.episode
-      };
-    });
-    play(queue[idx >= 0 ? idx : 0], { queue: queue, index: idx >= 0 ? idx : 0 });
-  }
-
-  /* =========================================================
-     TELA: BUSCA
-     ========================================================= */
-  function search() {
-    var s = screen('screen-search');
-    var inner = scroller(s);
-
-    var headBox = w.el('div', { class: 'page-head' });
-    headBox.appendChild(w.el('div', { class: 'page-title', text: 'Buscar' }));
-    headBox.appendChild(w.el('div', { class: 'page-sub',
-      text: 'Digite e o resultado aparece sozinho. Filmes, séries e canais ao mesmo tempo.' }));
-    inner.appendChild(headBox);
-
-    var box = w.el('div', { class: 'pad', style: 'margin-top:2rem' });
-    var field = w.el('div', { class: 'field' });
-    var input = w.el('input', { type: 'text', 'data-focusable': true,
-                                placeholder: 'Nome do filme, série ou canal…' });
-    field.appendChild(input);
-    box.appendChild(field);
-    inner.appendChild(box);
-
-    var status = w.el('div', { class: 'empty', text: 'Preparando o índice de busca…' });
-    inner.appendChild(status);
-
-    var results = w.el('div', { class: 'grid', 'data-nav-axis': 'grid',
-                                style: 'padding-left:4rem' });
-    inner.appendChild(results);
-
-    w.Nav.focus(input);
-
-    var index = null;
-    w.Catalog.buildSearchIndex(function (msg) { status.textContent = msg; })
-      .then(function (idx) {
-        index = idx;
-        status.textContent = idx.length.toLocaleString('pt-BR') + ' títulos prontos para busca.';
-      })
-      .catch(function (e) {
-        status.textContent = 'Não consegui montar o índice: ' + e.message;
-      });
-
-    var run = w.debounce(function () {
-      if (!index) return;
-      var q = input.value.trim();
-      w.clear(results);
-      if (q.length < 2) {
-        status.textContent = index.length.toLocaleString('pt-BR') + ' títulos prontos para busca.';
-        return;
-      }
-      var hits = w.Catalog.search(q, index);
-      status.textContent = hits.length
-        ? hits.length + (hits.length === 200 ? '+' : '') + ' resultados para “' + q + '”'
-        : 'Nada encontrado para “' + q + '”.';
-      hits.forEach(function (it) {
-        results.appendChild(card(it, {
-          shape: it.kind === 'live' ? 'logo' : 'poster',
-          live: it.kind === 'live',
-          note: it.kind === 'live' ? 'Canal' : it.kind === 'series' ? 'Série' : 'Filme',
-          onSelect: openItem
-        }));
-      });
-    }, 320);
-
-    input.addEventListener('input', run);
-    input.addEventListener('keyup', run);
-
-    return Promise.resolve();
-  }
-
-  /* =========================================================
-     TELA: PRIMEIRA CONFIGURAÇÃO
-     ========================================================= */
-  function setup() {
-    var s = screen('screen-setup');
-    var inner = scroller(s);
-
-    var head = w.el('div', { class: 'page-head' });
-    head.appendChild(w.el('div', { class: 'page-title', text: 'Vamos conectar sua lista' }));
-    head.appendChild(w.el('div', { class: 'page-sub',
-      text: 'Cole aqui o mesmo link que você usava no outro aplicativo. Eu descubro sozinho se ele fala a língua do Xtream.' }));
-    inner.appendChild(head);
-
-    var box = w.el('div', { class: 'pad', style: 'margin-top:2.4rem' });
-    inner.appendChild(box);
-
-    var f = w.el('div', { class: 'field' });
-    f.appendChild(w.el('label', { text: 'Endereço da lista M3U' }));
-    var input = w.el('input', { type: 'text', 'data-focusable': true,
-      value: w.Store.get('source.url', ''),
-      placeholder: 'http://servidor:porta/get.php?username=…&password=…' });
-    f.appendChild(input);
-    f.appendChild(w.el('div', { class: 'hint',
-      html: 'Use o controle para abrir o teclado da TV. Se preferir digitar do computador, ' +
-            'dá para colar esse endereço depois pelos Ajustes.' }));
-    box.appendChild(f);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var go = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Conectar' });
-    btns.appendChild(go);
-    box.appendChild(btns);
-
-    var log = w.el('div', { class: 'empty', style: 'padding-left:0' });
-    box.appendChild(log);
-
-    go.onclick = function () {
-      var url = input.value.trim();
-      log.innerHTML = '';
-      var line = w.el('div', { text: 'Conectando…' });
-      log.appendChild(line);
-      go.textContent = 'Conectando…';
-
-      w.Catalog.connect(url, function (msg) { line.textContent = msg; })
-        .then(function (res) {
-          w.toast(res.mode === 'xtream'
-            ? 'Conectado pela API do servidor — catálogo completo.'
-            : 'Lista carregada com ' + (res.count || 0) + ' itens.');
-          w.App.go('home', null, { replace: true });
-        })
-        .catch(function (e) {
-          go.textContent = 'Tentar de novo';
-          line.innerHTML = '<b>Não deu certo:</b> ' + w.esc(e.message);
-          log.appendChild(w.el('div', { style: 'margin-top:1rem;font-size:.9rem',
-            html: 'Se o endereço está certo, o problema costuma ser o servidor recusando ' +
-                  'a conexão vinda da TV. Veja a seção sobre proxy no README.' }));
-        });
-    };
-
-    w.Nav.focus(input);
-    return Promise.resolve();
-  }
-
-  /* =========================================================
-     TELA: AJUSTES
-     ========================================================= */
-  function settings() {
-    var s = screen('screen-settings');
-    var inner = scroller(s);
-
-    var head = w.el('div', { class: 'page-head' });
-    head.appendChild(w.el('div', { class: 'page-title', text: 'Ajustes' }));
-    head.appendChild(w.el('div', { class: 'page-sub', text: 'Fonte, nuvem e atualização do aplicativo.' }));
-    inner.appendChild(head);
-
-    var box = w.el('div', { class: 'pad', style: 'margin-top:2.2rem' });
-    inner.appendChild(box);
-
-    box.appendChild(panelUpdate());
-    box.appendChild(panelSource());
-    box.appendChild(panelCloud());
-    box.appendChild(panelData());
-
-    w.Nav.focusFirst('.screen-settings [data-focusable]');
-    return Promise.resolve();
-  }
-
-  function panel(title, sub) {
-    var p = w.el('div', { class: 'panel' });
-    p.appendChild(w.el('h3', { text: title }));
-    if (sub) p.appendChild(w.el('div', { class: 'sub', text: sub }));
-    return p;
-  }
-
-  function textField(label, value, placeholder, hint) {
-    var f = w.el('div', { class: 'field' });
-    f.appendChild(w.el('label', { text: label }));
-    var i = w.el('input', { type: 'text', 'data-focusable': true,
-                            value: value || '', placeholder: placeholder || '' });
-    f.appendChild(i);
-    if (hint) f.appendChild(w.el('div', { class: 'hint', html: hint }));
-    f.input = i;
-    return f;
-  }
-
-  /* ---- Atualização pelo GitHub ---- */
-  function panelUpdate() {
-    var p = panel('Atualizar pelo GitHub',
-      'O aplicativo instalado na TV é só uma casca. O código de verdade fica no seu repositório: ' +
-      'você dá git push no Mac e aperta o botão aqui.');
-
-    var loaded = (w.Updater && w.Updater.loaded) || {};
-    var kv = w.el('div', { style: 'margin-bottom:1.4rem' });
-    kv.appendChild(row2('Versão em execução', loaded.version || '?'));
-    kv.appendChild(row2('Origem', loaded.source === 'github' ? 'baixada do GitHub'
-                                : loaded.source === 'local' ? 'cópia que veio no aplicativo'
-                                : String(loaded.source || '?')));
-    if (loaded.rolledBackFrom) {
-      kv.appendChild(row2('Atenção', 'a versão ' + loaded.rolledBackFrom +
-                                     ' não iniciou e foi revertida automaticamente'));
-    }
-    p.appendChild(kv);
-
-    var fRepo = textField('Repositório', w.Store.get('update.repo', ''),
-      'seu-usuario/nebula-tv',
-      'No formato <b>usuario/repositorio</b>. O repositório pode ser público ou, se for privado, ' +
-      'a TV não vai conseguir baixar — use um público, já que aqui não vai nada sensível.');
-    var fBranch = textField('Ramo (branch)', w.Store.get('update.branch', 'main'), 'main');
-    var fDir = textField('Pasta do pacote', w.Store.get('update.dir', 'build'), 'build',
-      'É a pasta que o comando <b>npm run build</b> gera.');
-    p.appendChild(fRepo); p.appendChild(fBranch); p.appendChild(fDir);
-
-    var status = w.el('div', { class: 'sub', style: 'margin:0 0 1.2rem' });
-    p.appendChild(status);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    p.appendChild(btns);
-
-    var bSave = w.el('button', { class: 'btn ghost', 'data-focusable': true, text: 'Salvar endereço' });
-    bSave.onclick = function () {
-      w.Store.set('update.repo', fRepo.input.value.trim());
-      w.Store.set('update.branch', fBranch.input.value.trim() || 'main');
-      w.Store.set('update.dir', fDir.input.value.trim());
-      status.textContent = 'Endereço salvo: ' + (w.Updater.baseUrl() || '(incompleto)');
-      w.toast('Endereço salvo');
-    };
-
-    var pending = null;
-    var bCheck = w.el('button', { class: 'btn primary', 'data-focusable': true,
-                                  html: w.icon('refresh') + '<span>Procurar atualização</span>' });
-    bCheck.onclick = function () {
-      bSave.onclick();
-      status.textContent = 'Consultando o GitHub…';
-      w.Updater.check().then(function (info) {
-        pending = info;
-        if (!info.isNew) {
-          status.textContent = 'Você já está na versão mais recente (' + info.version + ').';
-          bInstall.classList.add('hidden');
-          return;
-        }
-        status.innerHTML = 'Versão nova disponível: <b>' + w.esc(info.version) + '</b>' +
-                           (info.notes ? ' — ' + w.esc(info.notes) : '');
-        bInstall.classList.remove('hidden');
-        w.Nav.focus(bInstall);
-      }).catch(function (e) {
-        status.textContent = 'Não consegui verificar: ' + e.message;
-        bInstall.classList.add('hidden');
-      });
-    };
-
-    var bInstall = w.el('button', { class: 'btn', 'data-focusable': true,
-                                    html: w.icon('down') + '<span>Instalar e reiniciar</span>' });
-    bInstall.classList.add('hidden');
-    bInstall.onclick = function () {
-      if (!pending) return;
-      status.textContent = 'Baixando…';
-      w.Updater.install(pending, function (msg) { status.textContent = msg; })
-        .then(function (r) {
-          status.textContent = 'Versão ' + r.version + ' instalada. Reiniciando…';
-          setTimeout(function () { w.Updater.reload(); }, 900);
-        })
-        .catch(function (e) { status.textContent = 'Falhou: ' + e.message; });
-    };
-
-    var bBack = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                 text: 'Voltar à versão anterior' });
-    bBack.onclick = function () {
-      w.confirmDialog('Voltar à versão anterior?',
-        'A TV vai reiniciar o aplicativo usando o pacote guardado antes da última atualização.',
-        'Voltar').then(function (yes) {
-          if (!yes) return;
-          if (w.Updater.rollback()) w.Updater.reload();
-          else w.toast('Não há versão anterior guardada.');
-        });
-    };
-
-    btns.appendChild(bCheck);
-    btns.appendChild(bInstall);
-    btns.appendChild(bSave);
-    if (w.Updater.hasPrevious && w.Updater.hasPrevious()) btns.appendChild(bBack);
-
-    if (w.Updater.baseUrl && w.Updater.baseUrl())
-      status.textContent = 'Buscando em ' + w.Updater.baseUrl();
-
-    return p;
-  }
-
-  function row2(k, v) {
-    var d = w.el('div', { class: 'kv' });
-    d.appendChild(w.el('b', { text: k }));
-    d.appendChild(w.el('span', { text: v }));
+  function ficha(rotulo, valor) {
+    var d = el('div', { class: 'det-ficha' });
+    d.appendChild(el('span', { class: 'det-ficha-k', text: rotulo }));
+    d.appendChild(el('span', { class: 'det-ficha-v', text: String(valor) }));
     return d;
   }
 
-  /* ---- Fonte da lista ---- */
-  function panelSource() {
-    var p = panel('Lista de canais', 'Onde o app busca o catálogo.');
+  function mesclar(a, b) {
+    var o = {};
+    Object.keys(a || {}).forEach(function (k) { o[k] = a[k]; });
+    Object.keys(b || {}).forEach(function (k) { if (b[k] != null && b[k] !== '') o[k] = b[k]; });
+    return o;
+  }
 
-    var acc = w.Store.get('source.account', null);
-    var kv = w.el('div', { style: 'margin-bottom:1.4rem' });
-    kv.appendChild(row2('Modo', w.Catalog.mode() === 'xtream'
-      ? 'API Xtream (catálogo completo)' : 'lista M3U (simples)'));
-    if (w.Store.get('source.username')) kv.appendChild(row2('Usuário', w.Store.get('source.username')));
-    if (acc && acc.expires) kv.appendChild(row2('Vence em', new Date(acc.expires).toLocaleDateString('pt-BR')));
-    if (acc && acc.maxConnections) kv.appendChild(row2('Conexões simultâneas', String(acc.maxConnections)));
-    p.appendChild(kv);
+  /* -----------------------------------------------------------
+     Busca
+     ----------------------------------------------------------- */
+  function busca() {
+    var tela = w.UI.tela('busca');
 
-    var f = textField('Endereço da lista', w.Store.get('source.url', ''),
-      'http://servidor:porta/get.php?username=…&password=…');
-    p.appendChild(f);
+    var topo = el('div', {
+      class: 'busca-topo', 'data-region': 'field', 'data-axis': 'x',
+      'data-nb-left': 'rail', 'data-nb-down': 'grid', 'data-enter': 'first'
+    });
+    var campo = el('input', { class: 'busca-campo', 'data-focusable': '',
+                              type: 'text', placeholder: 'Buscar filmes, séries e canais' });
+    topo.appendChild(campo);
 
-    var fProxy = textField('Proxy (só se precisar)', w.Store.get('source.proxy', ''),
-      'https://seu-worker.workers.dev/?url=',
-      'Deixe vazio primeiro. Preencha só se o app conectar no navegador mas não na TV — ' +
-      'aí o servidor da sua lista está recusando a origem da TV, e o proxy resolve. ' +
-      'O README traz o código pronto de um proxy gratuito no Cloudflare.');
-    p.appendChild(fProxy);
+    var conteudo = el('div', {
+      class: 'conteudo busca-res', 'data-region': 'grid', 'data-axis': 'grid',
+      'data-nb-left': 'rail', 'data-nb-up': 'field', 'data-enter': 'first'
+    });
+    conteudo.appendChild(w.UI.vazio('O que você quer ver?',
+      'Digite pelo menos duas letras.'));
 
-    var status = w.el('div', { class: 'sub', style: 'margin:0 0 1.2rem' });
-    p.appendChild(status);
+    tela.appendChild(topo);
+    tela.appendChild(conteudo);
+    w.UI.trocar(tela, 'field');
+    w.Nav.entrar('field');
 
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var bConn = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Reconectar' });
-    bConn.onclick = function () {
-      w.Store.set('source.proxy', fProxy.input.value.trim());
-      status.textContent = 'Conectando…';
-      w.Catalog.connect(f.input.value.trim(), function (m) { status.textContent = m; })
-        .then(function () { w.toast('Lista atualizada'); w.App.go('home', null, { replace: true }); })
-        .catch(function (e) { status.textContent = 'Falhou: ' + e.message; });
-    };
-    var bRefresh = w.el('button', { class: 'btn ghost', 'data-focusable': true,
-                                    html: w.icon('refresh') + '<span>Limpar cache do catálogo</span>' });
-    bRefresh.onclick = function () {
-      w.Catalog.refresh().then(function () { w.toast('Cache limpo — o catálogo será rebaixado.'); });
-    };
-    btns.appendChild(bConn); btns.appendChild(bRefresh);
-    p.appendChild(btns);
+    var indice = null;
+    w.Catalog.indice().then(function (ix) { indice = ix; });
+
+    var procurar = w.debounce(function () {
+      var termo = campo.value.trim();
+      w.Virt.dentroDe(conteudo).forEach(function (c) { c.destruir(); });
+      w.clear(conteudo);
+
+      if (termo.length < 2) {
+        conteudo.appendChild(w.UI.vazio('O que você quer ver?', 'Digite pelo menos duas letras.'));
+        return;
+      }
+      if (!indice) {
+        conteudo.appendChild(el('div', { class: 'carregando', text: 'Montando o índice…' }));
+        return;
+      }
+      var achados = w.Catalog.buscar(termo, indice);
+      if (!achados.length) {
+        conteudo.appendChild(w.UI.vazio('Nada encontrado',
+          'Nenhum resultado para "' + termo + '".'));
+        return;
+      }
+      var g = w.UI.grade(achados, { forma: 'poster', colunas: COLUNAS, aoAbrir: abrir });
+      conteudo.appendChild(g);
+      w.UI.ligar(g);
+    }, 260);
+
+    campo.oninput = procurar;
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Ajustes
+     ----------------------------------------------------------- */
+  function painel(titulo, sub) {
+    var p = el('div', { class: 'painel' });
+    p.appendChild(el('h2', { class: 'painel-titulo', text: titulo }));
+    if (sub) p.appendChild(el('p', { class: 'painel-sub', text: sub }));
     return p;
   }
 
-  /* ---- Supabase ---- */
-  function panelCloud() {
-    var p = panel('Histórico na nuvem (Supabase)',
-      'É o que faz o ponto de onde você parou sobreviver a qualquer reinstalação do aplicativo.');
-
-    var fUrl = textField('URL do projeto', w.Store.get('cloud.url', ''),
-      'https://xxxxxxxx.supabase.co');
-    var fKey = textField('Chave anon (public)', w.Store.get('cloud.key', ''), 'eyJhbGciOi…',
-      'É a chave pública do projeto. Ela fica gravada na TV, então não guarde nada sensível nesse banco.');
-    p.appendChild(fUrl); p.appendChild(fKey);
-
-    var status = w.el('div', { class: 'sub', style: 'margin:0 0 1.2rem' });
-    var pend = w.Cloud.pending();
-    status.textContent = w.Cloud.enabled()
-      ? ('Ativo. ' + (pend ? pend + ' registro(s) esperando envio.' : 'Tudo sincronizado.') +
-         (w.Cloud.lastError() ? ' Último erro: ' + w.Cloud.lastError() : ''))
-      : 'Desligado — o histórico está só na TV.';
-    p.appendChild(status);
-
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var bSave = w.el('button', { class: 'btn primary', 'data-focusable': true, text: 'Salvar e testar' });
-    bSave.onclick = function () {
-      w.Store.set('cloud.url', fUrl.input.value.trim());
-      w.Store.set('cloud.key', fKey.input.value.trim());
-      status.textContent = 'Testando…';
-      w.Cloud.test()
-        .then(function () {
-          status.textContent = 'Funcionou. Trazendo o histórico que já estava na nuvem…';
-          return w.Cloud.pull();
-        })
-        .then(function (n) {
-          status.textContent = 'Tudo certo. ' + (n ? n + ' registros vieram da nuvem.' : 'Nada novo por lá.');
-          w.Cloud.flush();
-        })
-        .catch(function (e) {
-          status.textContent = 'Falhou: ' + e.message +
-            ' — confira se você rodou o supabase/schema.sql no painel do Supabase.';
-        });
-    };
-    var bSync = w.el('button', { class: 'btn ghost', 'data-focusable': true, text: 'Sincronizar agora' });
-    bSync.onclick = function () {
-      status.textContent = 'Sincronizando…';
-      w.Cloud.flush().then(function () { return w.Cloud.pull(); })
-        .then(function (n) { status.textContent = 'Pronto. ' + n + ' registros atualizados.'; })
-        .catch(function (e) { status.textContent = 'Falhou: ' + e.message; });
-    };
-    btns.appendChild(bSave); btns.appendChild(bSync);
-    p.appendChild(btns);
-    return p;
+  function linha(k, v) {
+    var d = el('div', { class: 'linha' });
+    d.appendChild(el('span', { class: 'linha-k', text: k }));
+    d.appendChild(el('span', { class: 'linha-v', text: String(v) }));
+    return d;
   }
 
-  /* ---- Dados locais ---- */
-  function panelData() {
-    var p = panel('Dados neste aparelho', 'Histórico, favoritos e cache guardados na TV.');
-    var hist = w.Store.historyList(999);
-    var kv = w.el('div', { style: 'margin-bottom:1.4rem' });
-    kv.appendChild(row2('Itens no histórico', String(hist.length)));
-    kv.appendChild(row2('Favoritos', String(w.Store.favorites().length)));
-    p.appendChild(kv);
+  function ajustes() {
+    var tela = w.UI.tela('ajustes');
+    var janela = el('div', { class: 'janela cheia' });
+    var coluna = el('div', { class: 'trilho', 'data-scroll': 'y' });
+    var caixa = el('div', {
+      class: 'paineis',
+      'data-region': 'opcoes', 'data-axis': 'y',
+      'data-nb-left': 'rail', 'data-enter': 'last'
+    });
 
-    var btns = w.el('div', { class: 'row-btns', 'data-nav-axis': 'x' });
-    var bClear = w.el('button', { class: 'btn danger', 'data-focusable': true,
-                                  text: 'Apagar tudo e recomeçar' });
-    bClear.onclick = function () {
-      w.confirmDialog('Apagar tudo?',
-        'Isso remove a lista configurada, o histórico local, os favoritos e o cache. ' +
-        'O que já foi para o Supabase continua lá.',
-        'Apagar').then(function (yes) {
-          if (!yes) return;
-          w.Store.wipe();
-          w.Updater.reload();
-        });
+    /* --- atualização --- */
+    var pAtu = painel('Atualização',
+      'O app se atualiza pelo código no GitHub, sem pen drive.');
+    pAtu.appendChild(linha('Versão instalada',
+      (w.Updater && w.Updater.version && w.Updater.version()) || '—'));
+    var bAtu = el('button', { class: 'btn', 'data-focusable': '' });
+    bAtu.innerHTML = w.icon('refresh') + '<span>Procurar atualização</span>';
+    bAtu.onclick = function () {
+      var txt = bAtu.querySelector('span');
+      txt.textContent = 'Procurando…';
+      w.Updater.check().then(function (info) {
+        if (!info.isNew) { txt.textContent = 'Já está atualizado'; return; }
+        txt.textContent = 'Instalar versão ' + info.version;
+        bAtu.onclick = function () { w.Updater.apply(info); };
+      }).catch(function (e) { txt.textContent = 'Falhou: ' + e.message; });
     };
-    btns.appendChild(bClear);
-    p.appendChild(btns);
-    return p;
+    pAtu.appendChild(bAtu);
+    caixa.appendChild(pAtu);
+
+    /* --- conteúdo adulto --- */
+    var pAd = painel('Conteúdo adulto',
+      'Independentemente desta opção, nada de conteúdo adulto é gravado como ' +
+      'assistido, recente ou em andamento — nem entra em relacionados.');
+    var oculto = !!w.Store.get('adulto.ocultar');
+    var bAd = el('button', { class: 'btn ghost' + (oculto ? ' ativo' : ''), 'data-focusable': '' });
+    bAd.innerHTML = '<span>' + (oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo') + '</span>';
+    bAd.onclick = function () {
+      oculto = !oculto;
+      w.Store.set('adulto.ocultar', oculto);
+      bAd.classList.toggle('ativo', oculto);
+      bAd.querySelector('span').textContent =
+        oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo';
+      w.Catalog.limparCache();
+    };
+    pAd.appendChild(bAd);
+    caixa.appendChild(pAd);
+
+    /* --- dados --- */
+    var pD = painel('Dados', 'Cache do catálogo e fila do histórico.');
+    pD.appendChild(linha('Blocos em memória', w.Catalog.emMemoria()));
+    pD.appendChild(linha('Fila para a nuvem', w.Cloud.pending()));
+    var bL = el('button', { class: 'btn ghost', 'data-focusable': '' });
+    bL.innerHTML = '<span>Limpar cache do catálogo</span>';
+    bL.onclick = function () {
+      w.Catalog.limparCache().then(function () { w.toast('Cache limpo.'); });
+    };
+    pD.appendChild(bL);
+    caixa.appendChild(pD);
+
+    coluna.appendChild(caixa);
+    janela.appendChild(coluna);
+    tela.appendChild(janela);
+    w.UI.trocar(tela, 'opcoes');
+    w.Nav.entrar('opcoes');
+    return tela;
   }
 
-  /* =========================================================
-     Exporta
-     ========================================================= */
+  /* -----------------------------------------------------------
+     Primeira configuração
+     ----------------------------------------------------------- */
+  function configurar() {
+    var tela = w.UI.tela('setup');
+    var caixa = el('div', {
+      class: 'setup-caixa', 'data-region': 'setup', 'data-axis': 'y', 'data-enter': 'first'
+    });
+    caixa.appendChild(el('h1', { text: 'Vamos conectar sua lista' }));
+    caixa.appendChild(el('p', { class: 'painel-sub',
+      text: 'Cole o endereço da sua lista M3U ou Xtream. Fica só nesta TV.' }));
+
+    var campo = el('input', { class: 'busca-campo', 'data-focusable': '', type: 'text',
+                              placeholder: 'http://servidor/get.php?username=…' });
+    campo.value = w.Store.get('source.url', '');
+    caixa.appendChild(campo);
+
+    var aviso = el('div', { class: 'setup-aviso' });
+    caixa.appendChild(aviso);
+
+    var b = el('button', { class: 'btn primary', 'data-focusable': '' });
+    b.innerHTML = '<span>Conectar</span>';
+    b.onclick = function () {
+      aviso.textContent = 'Conectando…';
+      w.Catalog.conectar(campo.value.trim(), function (m) { aviso.textContent = m; })
+        .then(function () { w.App.go('home', null, { replace: true }); })
+        .catch(function (e) { aviso.textContent = 'Não deu: ' + e.message; });
+    };
+    caixa.appendChild(b);
+
+    tela.appendChild(caixa);
+    w.UI.trocar(tela, 'setup');
+    w.Nav.entrar('setup');
+    return tela;
+  }
+
+  /* -----------------------------------------------------------
+     Segurar OK sobre um cartão
+     -----------------------------------------------------------
+     Canal não tem tela de detalhe: aperta OK e já está tocando.
+     Então o gesto que sobra para "eu gosto deste" é o toque
+     longo, que é o mesmo de qualquer celular e não gasta uma
+     tela nova nem uma tecla colorida.
+
+     A mecânica precisa de cuidado: `keydown` repete sozinho
+     enquanto a tecla fica presa (10 a 15 vezes por segundo no
+     controle da LG), então há uma trava para o toque longo não
+     disparar quinze vezes. E o OK curto só age no `keyup` —
+     senão o canal começaria a tocar enquanto você ainda decide
+     se vai segurar.
+     ----------------------------------------------------------- */
+  var SEGURAR = 550;
+  var segurando = false, relogioToque = null, jaAgiu = false;
+
+  function itemDoFoco() {
+    var a = w.Nav.atual();
+    return (a && a._item) ? a : null;
+  }
+
+  function alternarFavorito(cartao) {
+    var item = cartao._item;
+    var agora = w.Store.toggleFavorite(item);
+    cartao.classList.toggle('favorito', agora);
+    w.toast(agora
+      ? '★ ' + w.cleanName(item.title) + ' nos favoritos'
+      : w.cleanName(item.title) + ' fora dos favoritos');
+
+    /* Se você tirou um favorito enquanto olha a pasta Favoritos,
+       ele tem de sumir dali na hora — deixar um cartão morto na
+       lista é o tipo de coisa que faz duvidar se funcionou. */
+    var ativa = w.$('.cat-item.ativa');
+    if (!agora && ativa && ativa._cat && ativa._cat.id === FAVORITOS && ativa._recarregar) {
+      ativa._recarregar();
+    }
+  }
+
+  w.Nav.adicionarTecla(function (k, ev) {
+    if (k !== w.KEY.OK) return false;
+    if (w.Player && w.Player.isOpen()) return false;
+
+    var cartao = itemDoFoco();
+    if (!cartao) return false;                  /* botões comuns seguem o caminho normal */
+    if (ev && ev.repeat) return true;           /* auto-repeat: já estamos contando */
+    if (segurando) return true;
+
+    segurando = true; jaAgiu = false;
+    relogioToque = setTimeout(function () {
+      jaAgiu = true;
+      var c = itemDoFoco();
+      if (c) alternarFavorito(c);
+    }, SEGURAR);
+    return true;
+  });
+
+  document.addEventListener('keyup', function (ev) {
+    if (ev.keyCode !== w.KEY.OK || !segurando) return;
+    segurando = false;
+    clearTimeout(relogioToque);
+    if (jaAgiu) return;                         /* já favoritou: OK curto não abre */
+    var c = itemDoFoco();
+    if (c) c.click();
+  }, true);
+
+  /* -----------------------------------------------------------
+     API
+     ----------------------------------------------------------- */
   w.Views = {
-    home: home,
-    live:   function () { return browse('live',   'Categorias', 'canais'); },
-    movies: function () { return browse('movie',  'Categorias', 'filmes'); },
-    series: function () { return browse('series', 'Categorias', 'séries'); },
-    search: search,
-    setup: setup,
-    settings: settings,
-    movieDetail: movieDetail,
-    seriesDetail: seriesDetail,
-    stopBillboard: function () { clearInterval(bbTimer); }
+    home:         inicio,
+    live:         function () { return navegar('live',   'logo'); },
+    movies:       function () { return navegar('movie',  'poster'); },
+    series:       function () { return navegar('series', 'poster'); },
+    search:       busca,
+    settings:     ajustes,
+    setup:        configurar,
+    movieDetail:  detalheFilme,
+    seriesDetail: detalheSerie,
+
+    aoFocarCategoria: aoFocarCategoria,
+    stopBillboard: function () { clearTimeout(esperaCat); }
   };
 
 })(window);

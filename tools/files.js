@@ -11,7 +11,9 @@ module.exports = {
     'xtream.js',
     'catalog.js',
     'nav.js',
+    'virt.js',
     'dom.js',
+    'ui.js',
     'player.js',
     'views.js',
     'app.js'

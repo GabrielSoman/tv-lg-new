@@ -9,6 +9,7 @@
   var K_SETTINGS  = 'nebula.settings';
   var K_PROGRESS  = 'nebula.progress';
   var K_FAVORITES = 'nebula.favorites';
+  var K_CHANNELS  = 'nebula.channels';
   var MAX_PROGRESS = 300;
 
   function read(key, fallback) {
@@ -24,7 +25,25 @@
 
   var settings  = read(K_SETTINGS, {});
   var progress  = read(K_PROGRESS, {});
+
+  /* Limpeza de uma sujeira que a versão anterior deixou: ela
+     gravava progresso de canal AO VIVO, que é um número sem
+     significado — quando você volta ao canal, o programa é
+     outro. Esses registros entupiam "continuar assistindo" e o
+     histórico. É a mesma faxina que o `schema-v2.sql` faz no
+     banco, só que aqui na TV. */
+  (function limparAoVivo() {
+    var mudou = false;
+    Object.keys(progress).forEach(function (k) {
+      var r = progress[k];
+      if (r && (r.kind === 'live' || /^(live|canal):/.test(k))) {
+        delete progress[k]; mudou = true;
+      }
+    });
+    if (mudou) write(K_PROGRESS, progress);
+  }());
   var favorites = read(K_FAVORITES, {});
+  var channels  = read(K_CHANNELS, {});
 
   w.Store = {
 
@@ -71,6 +90,29 @@
     favorites: function () {
       return Object.keys(favorites).map(function (k) { return favorites[k]; })
         .sort(function (a, b) { return (b.at || '').localeCompare(a.at || ''); });
+    },
+
+    /* ---------------- Hábito de canal ----------------
+       Ao vivo não tem "onde parei", mas TEM "o que eu vejo".
+       Guardar aberturas e a hora da última é o que deixa a lista
+       de canais em ordem de uso em vez de ordem alfabética — e é
+       o espelho local da tabela `channel_usage` do schema v2. */
+    touchChannel: function (item) {
+      if (!item || !item.id) return;
+      var r = channels[item.id] || { id: item.id, chave: item.chave || '', aberturas: 0 };
+      r.title = item.title || r.title || '';
+      r.aberturas++;
+      r.at = new Date().toISOString();
+      channels[item.id] = r;
+      write(K_CHANNELS, channels);
+    },
+
+    channelUsage: function (id) { return channels[id] || null; },
+
+    recentChannels: function (limit) {
+      return Object.keys(channels).map(function (k) { return channels[k]; })
+        .sort(function (a, b) { return (b.at || '').localeCompare(a.at || ''); })
+        .slice(0, limit || 30);
     },
 
     /* ---------------- Progresso ---------------- */

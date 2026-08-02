@@ -1,249 +1,548 @@
 /* =========================================================
-   Navegacao por controle remoto.
+   MOTOR DE NAVEGAÇÃO — ClaudeTV
+   =========================================================
+   Substitui a busca geométrica global, que era a causa de o
+   app inteiro se comportar como uma coluna só.
 
-   Estrategia hibrida: dentro de um container com eixo definido
-   (uma fileira, uma grade, uma coluna de categorias) o movimento
-   segue a ordem dos elementos - previsivel e sem surpresas.
-   Quando nao ha para onde ir dentro do container, cai para uma
-   busca geometrica pela tela inteira, que e o que permite sair
-   de uma fileira e chegar no menu lateral, por exemplo.
+   A tela é uma árvore de REGIÕES declaradas no HTML. O foco
+   anda dentro da região conforme o eixo dela. Ao chegar na
+   borda, ou existe um vizinho declarado naquela direção, ou o
+   foco PARA. Não há busca global. "Não há para onde ir" é uma
+   resposta legítima.
+
+   ---------------------------------------------------------
+   CONTRATO DO HTML
+   ---------------------------------------------------------
+     <div data-region="cats"
+          data-axis="y"              x | y | grid | rows
+          data-nb-left="rail"        vizinho ao sair pela esquerda
+          data-nb-right="grid"
+          data-enter="last"          last | first | seletor CSS
+          data-wrap="y">             eixos em que dá a volta
+       <button data-focusable>…</button>
+     </div>
+
+   Eixo `rows`: a região contém elementos [data-row]; esquerda
+   e direita andam dentro da fileira, cima e baixo trocam de
+   fileira mantendo a posição horizontal.
+
+   Rolagem: o elemento com [data-scroll="x|y"] é o trilho que
+   se move; o pai dele é a janela. A janela precisa ter
+   `overflow: hidden`, e o trilho `position: relative`.
    ========================================================= */
 (function (w) {
   'use strict';
 
-  var current = null;
-  var scope = null;          // elemento que limita o foco (dialogos)
-  var handlers = [];         // ouvintes extras de tecla
+  var doc = document;
 
-  function focusables() {
-    var root = scope || document;
-    return w.$$('[data-focusable]', root).filter(function (e) {
-      return e.offsetParent !== null || e === current;
-    });
+  w.KEY = w.KEY || {
+    LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40,
+    OK: 13, BACK: 461, ESC: 27, BACKSPACE: 8,
+    RED: 403, GREEN: 404, YELLOW: 405, BLUE: 406,
+    PLAY: 415, PAUSE: 19, PLAYPAUSE: 179, STOP: 413,
+    FF: 417, RW: 412, CH_UP: 33, CH_DOWN: 34, INFO: 457
+  };
+
+  var MARGEM = { topo: 120, base: 160, lado: 96 };   // px absolutos
+
+  var atual = null;
+  var escopo = null;
+  var ouvintes = [];
+  var pendente = null;
+  var quadro = null;
+
+  /* ---------------------------------------------------------
+     Consultas
+     --------------------------------------------------------- */
+  function todos(sel, raiz) {
+    return Array.prototype.slice.call((raiz || escopo || doc).querySelectorAll(sel));
   }
 
-  function rect(e) { return e.getBoundingClientRect(); }
-  function center(r) { return { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }; }
+  /* Visível = está no layout. Estar recortado por overflow NÃO
+     desqualifica: é justamente para esses que a rolagem serve. */
+  function visivel(el) {
+    if (!el || el.offsetParent === null) return false;
+    return el.offsetWidth > 0 || el.offsetHeight > 0;
+  }
 
-  /* ---------- Rolagem: move o container, nao a pagina ---------- */
-  function scrollers(el) {
+  function focaveis(raiz) {
+    return todos('[data-focusable]', raiz).filter(visivel);
+  }
+
+  function regiaoDe(el) {
+    var n = el;
+    while (n && n !== doc.body) {
+      if (n.hasAttribute && n.hasAttribute('data-region')) {
+        if (escopo && !escopo.contains(n)) return null;
+        return n;
+      }
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  function regiaoPorNome(nome) {
+    return (escopo || doc).querySelector('[data-region="' + nome + '"]');
+  }
+
+  function eixoDe(reg) { return reg.getAttribute('data-axis') || 'y'; }
+
+  function daVolta(reg, eixo) {
+    return (reg.getAttribute('data-wrap') || '').indexOf(eixo) >= 0;
+  }
+
+  function fileiraDe(el, reg) {
+    var n = el;
+    while (n && n !== reg) {
+      if (n.hasAttribute && n.hasAttribute('data-row')) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  /* ---------------------------------------------------------
+     Geometria — só dentro de uma região
+     --------------------------------------------------------- */
+  function r(el) { return el.getBoundingClientRect(); }
+  function centroX(b) { return (b.left + b.right) / 2; }
+
+  function sobreposicaoX(a, b) {
+    var ini = Math.max(a.left, b.left), fim = Math.min(a.right, b.right);
+    var base = Math.min(a.width, b.width) || 1;
+    return Math.max(0, fim - ini) / base;
+  }
+
+  function mesmaLinha(a, b) {
+    return Math.abs(a.top - b.top) < Math.max(a.height, b.height, 1) * 0.5;
+  }
+
+  /* ---------------------------------------------------------
+     Movimento dentro da região
+     --------------------------------------------------------- */
+  function passoInterno(reg, el, dir) {
+    var eixo = eixoDe(reg);
+    if (eixo === 'rows') return passoFileiras(reg, el, dir);
+
+    var lista = focaveis(reg);
+    var i = lista.indexOf(el);
+    if (i < 0) return null;
+
+    if (eixo === 'x') {
+      if (dir === 'right') return lista[i + 1] || null;
+      if (dir === 'left') return lista[i - 1] || null;
+      return null;
+    }
+    if (eixo === 'y') {
+      if (dir === 'down') return lista[i + 1] || null;
+      if (dir === 'up') return lista[i - 1] || null;
+      return null;
+    }
+    if (eixo === 'grid') {
+      if (dir === 'left' || dir === 'right') {
+        var viz = lista[i + (dir === 'right' ? 1 : -1)];
+        /* só anda para o lado dentro da MESMA linha; na ponta, para */
+        return (viz && mesmaLinha(r(viz), r(el))) ? viz : null;
+      }
+      return gradeVertical(lista, i, dir);
+    }
+    return null;
+  }
+
+  /* Cima/baixo numa grade: linha vizinha, escolhida por
+     sobreposição de projeção — não por distância em diagonal.
+     É isso que faz o foco descer em coluna. */
+  function gradeVertical(lista, i, dir) {
+    var meu = r(lista[i]);
+    var cand = [];
+    for (var k = 0; k < lista.length; k++) {
+      if (k === i) continue;
+      var b = r(lista[k]);
+      if (mesmaLinha(b, meu)) continue;
+      if (dir === 'down' && b.top <= meu.top) continue;
+      if (dir === 'up' && b.top >= meu.top) continue;
+      cand.push({ el: lista[k], b: b });
+    }
+    if (!cand.length) return null;
+
+    var alvo = cand[0].b.top;
+    cand.forEach(function (c) {
+      if (dir === 'down' ? c.b.top < alvo : c.b.top > alvo) alvo = c.b.top;
+    });
+    var linha = cand.filter(function (c) {
+      return Math.abs(c.b.top - alvo) < Math.max(c.b.height, 1) * 0.5;
+    });
+
+    var melhor = null, nota = -1;
+    linha.forEach(function (c) {
+      var s = sobreposicaoX(meu, c.b);
+      if (s > nota) { nota = s; melhor = c.el; }
+    });
+    if (nota >= 0.3) return melhor;
+
+    var perto = null, dist = Infinity;
+    linha.forEach(function (c) {
+      var d = Math.abs(centroX(c.b) - centroX(meu));
+      if (d < dist) { dist = d; perto = c.el; }
+    });
+    return perto || melhor;
+  }
+
+  function passoFileiras(reg, el, dir) {
+    var fileiras = todos('[data-row]', reg).filter(function (f) {
+      return focaveis(f).length > 0;
+    });
+    var minha = fileiraDe(el, reg);
+    var fi = fileiras.indexOf(minha);
+    if (fi < 0) return null;
+
+    if (dir === 'left' || dir === 'right') {
+      var itens = focaveis(minha);
+      var i = itens.indexOf(el);
+      return itens[i + (dir === 'right' ? 1 : -1)] || null;
+    }
+
+    var prox = fileiras[fi + (dir === 'down' ? 1 : -1)];
+    if (!prox) return null;
+    var alvos = focaveis(prox);
+    if (!alvos.length) return null;
+
+    /* mantém a posição horizontal ao trocar de fileira */
+    var cx = centroX(r(el));
+    var melhor = alvos[0], dist = Infinity;
+    alvos.forEach(function (a) {
+      var d = Math.abs(centroX(r(a)) - cx);
+      if (d < dist) { dist = d; melhor = a; }
+    });
+    return melhor;
+  }
+
+  function volta(reg, el, dir) {
+    var eixo = eixoDe(reg);
+    var horizontal = (dir === 'left' || dir === 'right');
+    if (!daVolta(reg, horizontal ? 'x' : 'y')) return null;
+
+    var lista;
+    if (eixo === 'rows') {
+      if (!horizontal) return null;
+      var minha = fileiraDe(el, reg);
+      if (!minha) return null;
+      lista = focaveis(minha);
+    } else {
+      if (eixo === 'x' && !horizontal) return null;
+      if (eixo === 'y' && horizontal) return null;
+      lista = focaveis(reg);
+    }
+    if (lista.length < 2 || lista.indexOf(el) < 0) return null;
+    return (dir === 'right' || dir === 'down') ? lista[0] : lista[lista.length - 1];
+  }
+
+  /* ---------------------------------------------------------
+     Entrar numa região vizinha
+     --------------------------------------------------------- */
+  function entrarNa(nome) {
+    return entrarNaRegiao(regiaoPorNome(nome));
+  }
+
+  function entrarNaRegiao(reg) {
+    if (!reg) return null;
+    var lista = focaveis(reg);
+    if (!lista.length) return null;
+
+    var modo = reg.getAttribute('data-enter') || 'last';
+    if (modo === 'first') return lista[0];
+    if (modo !== 'last') {
+      var alvo = reg.querySelector(modo);
+      return (alvo && visivel(alvo)) ? alvo : lista[0];
+    }
+    var lembrado = reg._ultimoFoco;
+    if (lembrado && doc.contains(lembrado) && lista.indexOf(lembrado) >= 0) return lembrado;
+    return lista[0];
+  }
+
+  var OPOSTO = { left: 'right', right: 'left', up: 'down', down: 'up' };
+
+  /* Grava, na região de destino, o caminho de volta. */
+  function marcarRetorno(destino, dir, origem) {
+    if (!destino || destino === origem) return;
+    destino._retorno = { dir: OPOSTO[dir], reg: origem };
+  }
+
+  /* ---------------------------------------------------------
+     Rolagem — determinística
+     ---------------------------------------------------------
+     Mede por offsetTop/offsetLeft, que não mudam durante uma
+     transição. O motor antigo media com getBoundingClientRect
+     no meio da animação e acumulava erro a cada tecla.
+     --------------------------------------------------------- */
+  function trilhos(el) {
     var out = [], n = el.parentElement;
-    while (n && n !== document.body) {
+    while (n && n !== doc.body) {
       if (n.hasAttribute && n.hasAttribute('data-scroll')) out.push(n);
       n = n.parentElement;
     }
     return out;
   }
 
-  function offsetOf(sc) {
-    return { x: Number(sc.getAttribute('data-off-x') || 0),
-             y: Number(sc.getAttribute('data-off-y') || 0) };
+  function posicaoEm(el, ancestral) {
+    var x = 0, y = 0, n = el, guarda = 0;
+    while (n && n !== ancestral && n !== doc.body && guarda++ < 50) {
+      x += n.offsetLeft; y += n.offsetTop;
+      n = n.offsetParent;
+    }
+    return { x: x, y: y };
   }
 
-  function applyOffset(sc, x, y) {
-    sc.setAttribute('data-off-x', x);
-    sc.setAttribute('data-off-y', y);
-    sc.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
+  function desloc(t) {
+    return { x: Number(t.getAttribute('data-off-x') || 0),
+             y: Number(t.getAttribute('data-off-y') || 0) };
   }
 
-  function ensureVisible(el) {
-    scrollers(el).forEach(function (sc) {
-      var vp = sc.parentElement;
-      if (!vp) return;
-      var axis = sc.getAttribute('data-scroll');
-      var off = offsetOf(sc);
-      var er = rect(el), vr = rect(vp);
+  function aplicaDesloc(t, x, y) {
+    x = Math.round(x); y = Math.round(y);
+    t.setAttribute('data-off-x', x);
+    t.setAttribute('data-off-y', y);
+    t.style.transform = 'translate3d(' + (-x) + 'px,' + (-y) + 'px,0)';
+  }
 
-      if (axis === 'x' || axis === 'xy') {
-        var mx = vr.width * 0.08, dx = 0;
-        if (er.left  < vr.left  + mx) dx = (vr.left + mx) - er.left;
-        else if (er.right > vr.right - mx) dx = (vr.right - mx) - er.right;
-        if (dx) {
-          var minX = Math.min(0, vp.clientWidth - sc.scrollWidth - 8);
-          off.x = Math.max(minX, Math.min(0, off.x + dx));
-        }
+  function areaUtil(janela) {
+    var cs = w.getComputedStyle(janela);
+    return {
+      largura: janela.clientWidth - parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0),
+      altura:  janela.clientHeight - parseFloat(cs.paddingTop || 0) - parseFloat(cs.paddingBottom || 0)
+    };
+  }
+
+  function garanteVisivel(el) {
+    trilhos(el).forEach(function (t) {
+      var janela = t.parentElement;
+      if (!janela) return;
+      var eixo = t.getAttribute('data-scroll');
+      var util = areaUtil(janela);
+      var pos = posicaoEm(el, t);
+      var off = desloc(t);
+
+      if (eixo === 'x' || eixo === 'xy') {
+        var e1 = pos.x, e2 = pos.x + el.offsetWidth;
+        var maxX = Math.max(0, t.scrollWidth - util.largura);
+        var x = off.x;
+        if (e1 - MARGEM.lado < x) x = e1 - MARGEM.lado;
+        else if (e2 + MARGEM.lado > x + util.largura) x = e2 + MARGEM.lado - util.largura;
+        off.x = Math.max(0, Math.min(maxX, x));
       }
-      if (axis === 'y' || axis === 'xy') {
-        var mTop = vr.height * 0.22, mBot = vr.height * 0.26, dy = 0;
-        if (er.top < vr.top + mTop) dy = (vr.top + mTop) - er.top;
-        else if (er.bottom > vr.bottom - mBot) dy = (vr.bottom - mBot) - er.bottom;
-        if (dy) {
-          var minY = Math.min(0, vp.clientHeight - sc.scrollHeight - 8);
-          off.y = Math.max(minY, Math.min(0, off.y + dy));
-        }
+      if (eixo === 'y' || eixo === 'xy') {
+        var t1 = pos.y, t2 = pos.y + el.offsetHeight;
+        var maxY = Math.max(0, t.scrollHeight - util.altura);
+        var y = off.y;
+        if (t1 - MARGEM.topo < y) y = t1 - MARGEM.topo;
+        else if (t2 + MARGEM.base > y + util.altura) y = t2 + MARGEM.base - util.altura;
+        off.y = Math.max(0, Math.min(maxY, y));
       }
-      applyOffset(sc, off.x, off.y);
+      aplicaDesloc(t, off.x, off.y);
     });
   }
 
-  /* ---------- Container e eixo ---------- */
-  function containerOf(el) {
-    var n = el.parentElement;
-    while (n && n !== document.body) {
-      if (n.hasAttribute && n.hasAttribute('data-nav-axis')) return n;
-      n = n.parentElement;
-    }
-    return null;
-  }
+  /* ---------------------------------------------------------
+     API
+     --------------------------------------------------------- */
+  var Nav = {
 
-  function siblingsIn(container) {
-    return w.$$('[data-focusable]', container).filter(function (e) {
-      return e.offsetParent !== null;
-    });
-  }
+    MARGEM: MARGEM,
 
-  function stepInContainer(el, dir) {
-    var c = containerOf(el);
-    if (!c) return null;
-    var axis = c.getAttribute('data-nav-axis');
-    var list = siblingsIn(c);
-    var i = list.indexOf(el);
-    if (i < 0) return null;
+    focar: function (el, opcoes) {
+      if (!el || !visivel(el)) return false;
+      if (escopo && !escopo.contains(el)) return false;
+      if (atual === el) { garanteVisivel(el); return true; }
 
-    if (axis === 'x' && (dir === 'left' || dir === 'right'))
-      return list[i + (dir === 'right' ? 1 : -1)] || null;
-
-    if (axis === 'y' && (dir === 'up' || dir === 'down'))
-      return list[i + (dir === 'down' ? 1 : -1)] || null;
-
-    if (axis === 'grid') {
-      if (dir === 'left' || dir === 'right')
-        return list[i + (dir === 'right' ? 1 : -1)] || null;
-      /* Cima/baixo numa grade: elemento mais alinhado na linha vizinha. */
-      return gridVertical(list, i, dir);
-    }
-    return null;
-  }
-
-  function gridVertical(list, i, dir) {
-    var cr = rect(list[i]), cc = center(cr);
-    var best = null, bestScore = Infinity;
-    for (var k = 0; k < list.length; k++) {
-      if (k === i) continue;
-      var r = rect(list[k]);
-      var sameLine = Math.abs(r.top - cr.top) < cr.height * 0.5;
-      if (sameLine) continue;
-      if (dir === 'down' && r.top <= cr.top) continue;
-      if (dir === 'up'   && r.top >= cr.top) continue;
-      var s = Math.abs(r.top - cr.top) * 2 + Math.abs(center(r).x - cc.x);
-      if (s < bestScore) { bestScore = s; best = list[k]; }
-    }
-    return best;
-  }
-
-  /* ---------- Busca geometrica global ---------- */
-  function geometric(el, dir) {
-    var cr = rect(el), cc = center(cr);
-    var best = null, bestScore = Infinity;
-
-    focusables().forEach(function (t) {
-      if (t === el) return;
-      var r = rect(t);
-      if (!r.width || !r.height) return;
-      var tc = center(r), main, cross;
-
-      if (dir === 'right')      { if (r.left   < cr.right - 2) return; main = r.left - cr.right;   cross = Math.abs(tc.y - cc.y); }
-      else if (dir === 'left')  { if (r.right  > cr.left + 2)  return; main = cr.left - r.right;   cross = Math.abs(tc.y - cc.y); }
-      else if (dir === 'down')  { if (r.top    < cr.bottom - 2) return; main = r.top - cr.bottom;  cross = Math.abs(tc.x - cc.x); }
-      else                      { if (r.bottom > cr.top + 2)   return; main = cr.top - r.bottom;   cross = Math.abs(tc.x - cc.x); }
-
-      var s = Math.max(0, main) + cross * 2.2;
-      if (s < bestScore) { bestScore = s; best = t; }
-    });
-    return best;
-  }
-
-  /* ---------- API ---------- */
-  w.Nav = {
-
-    focus: function (el, opts) {
-      if (!el) return false;
-      if (current === el) { ensureVisible(el); return true; }
-      if (current) current.classList.remove('focused');
-      current = el;
+      if (atual) atual.classList.remove('focused');
+      atual = el;
       el.classList.add('focused');
-      if (!(opts && opts.noScroll)) ensureVisible(el);
-      if (el.tagName === 'INPUT') { try { el.focus(); } catch (e) {} }
-      else if (document.activeElement && document.activeElement.blur) {
-        try { document.activeElement.blur(); } catch (e) {}
+
+      var reg = regiaoDe(el);
+      if (reg) reg._ultimoFoco = el;
+
+      if (!(opcoes && opcoes.semRolar)) garanteVisivel(el);
+
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+        try { el.focus(); } catch (e) {}
+      } else if (doc.activeElement && doc.activeElement.blur &&
+                 doc.activeElement !== doc.body) {
+        try { doc.activeElement.blur(); } catch (e) {}
       }
-      if (w.Nav.onFocusHook) w.Nav.onFocusHook(el);
+      if (Nav.aoFocar) Nav.aoFocar(el, reg);
       return true;
     },
 
-    current: function () { return current; },
+    atual: function () { return atual; },
+    regiaoAtual: function () { return atual ? regiaoDe(atual) : null; },
 
-    /* Foca o primeiro elemento disponivel (ou um seletor especifico). */
-    focusFirst: function (selector) {
-      var list = selector ? w.$$(selector, scope || document) : focusables();
-      list = list.filter(function (e) { return e.offsetParent !== null; });
-      return w.Nav.focus(list[0]);
+    focarPrimeiro: function (seletor) {
+      var lista = seletor ? todos(seletor).filter(visivel) : focaveis();
+      return Nav.focar(lista[0]);
     },
 
-    move: function (dir) {
-      if (!current || current.offsetParent === null) return w.Nav.focusFirst();
-      var next = stepInContainer(current, dir) || geometric(current, dir);
-      if (next) { w.Nav.focus(next); return true; }
-      return false;
-    },
+    entrar: function (nome) { return Nav.focar(entrarNa(nome)); },
 
-    /* Limita o foco a um pedaco da tela (dialogos, erro do player). */
-    setScope: function (root, firstSelector) {
-      scope = root || null;
-      if (root) {
-        if (current) current.classList.remove('focused');
-        current = null;
-        w.Nav.focusFirst(firstSelector);
+    /* O coração. true = moveu; false = a borda parou. */
+    mover: function (dir) {
+      if (!atual || !doc.contains(atual) || !visivel(atual)) return Nav.focarPrimeiro();
+      var reg = regiaoDe(atual);
+      if (!reg) return Nav.focarPrimeiro();
+
+      var alvo = passoInterno(reg, atual, dir);
+      if (alvo) return Nav.focar(alvo);
+
+      alvo = volta(reg, atual, dir);
+      if (alvo) return Nav.focar(alvo);
+
+      /* Voltar por onde se veio.
+         Se você saiu da grade para o menu apertando ←, então →
+         tem de devolver você à grade — mesmo que o menu declare
+         outro vizinho à direita. É o que todo app de TV faz, e a
+         falta disso é o tipo de coisa que faz a pessoa perder o
+         lugar e desistir de procurar. O vizinho declarado é o
+         padrão; o retorno é a exceção que vale mais. */
+      if (reg._retorno && reg._retorno.dir === dir &&
+          doc.contains(reg._retorno.reg) && reg._retorno.reg !== reg) {
+        alvo = entrarNaRegiao(reg._retorno.reg);
+        if (alvo) { marcarRetorno(regiaoDe(alvo), dir, reg); return Nav.focar(alvo); }
       }
+
+      var vizinho = reg.getAttribute('data-nb-' + dir);
+      if (vizinho) {
+        var destino = regiaoPorNome(vizinho);
+        alvo = entrarNaRegiao(destino);
+        if (alvo) { marcarRetorno(destino, dir, reg); return Nav.focar(alvo); }
+      }
+      return false;          /* borda: isto é sucesso, não falha */
     },
 
-    clearScope: function (restoreTo) {
-      scope = null;
-      if (restoreTo) w.Nav.focus(restoreTo);
-    },
-
-    scoped: function () { return scope; },
-
-    /* Zera as rolagens de um container (ao trocar de tela). */
-    resetScroll: function (root) {
-      w.$$('[data-scroll]', root || document).forEach(function (sc) {
-        applyOffset(sc, 0, 0);
+    /* No máximo um movimento por quadro. O auto-repeat do
+       controle dispara 10 a 15 eventos por segundo. */
+    pedirMovimento: function (dir) {
+      pendente = dir;
+      if (quadro) return;
+      quadro = w.requestAnimationFrame(function () {
+        quadro = null;
+        var d = pendente; pendente = null;
+        if (d) Nav.mover(d);
       });
     },
 
-    /* Ouvintes extras: recebem (keyCode, event) e devolvem true se trataram. */
-    addKeyHandler: function (fn) { handlers.unshift(fn); },
-    removeKeyHandler: function (fn) {
-      handlers = handlers.filter(function (h) { return h !== fn; });
-    }
+    definirEscopo: function (raiz, primeiro) {
+      escopo = raiz || null;
+      if (raiz) {
+        if (atual) atual.classList.remove('focused');
+        atual = null;
+        Nav.focarPrimeiro(primeiro);
+      }
+    },
+    limparEscopo: function (voltarPara) {
+      escopo = null;
+      if (voltarPara) Nav.focar(voltarPara);
+    },
+    escopo: function () { return escopo; },
+
+    zerarRolagem: function (raiz) {
+      todos('[data-scroll]', raiz || doc).forEach(function (t) { aplicaDesloc(t, 0, 0); });
+    },
+
+    reiniciar: function () {
+      if (atual) atual.classList.remove('focused');
+      atual = null; pendente = null;
+    },
+
+    /* Se o elemento em foco sumiu, cai no vizinho da mesma
+       região — nunca no menu. */
+    revalidar: function () {
+      if (atual && doc.contains(atual) && visivel(atual)) return true;
+      var reg = atual ? regiaoDe(atual) : null;
+      atual = null;
+      if (reg && doc.contains(reg)) {
+        var lista = focaveis(reg);
+        if (lista.length) return Nav.focar(lista[0]);
+      }
+      return false;
+    },
+
+    adicionarTecla: function (fn) { ouvintes.unshift(fn); },
+    removerTecla: function (fn) {
+      ouvintes = ouvintes.filter(function (h) { return h !== fn; });
+    },
+
+    aoFocar: null
   };
 
-  /* ---------- Teclado ---------- */
-  document.addEventListener('keydown', function (ev) {
+  /* ---------------------------------------------------------
+     Ponte com os nomes antigos.
+     As telas ainda chamam Nav.focus, Nav.move e companhia. Estes
+     apelidos evitam que o app estoure enquanto a camada 4 —
+     reescrita das telas — não declara as regiões. Some quando
+     `views.js` e `app.js` estiverem convertidos.
+     --------------------------------------------------------- */
+  Nav.focus            = Nav.focar;
+  Nav.move             = Nav.mover;
+  Nav.current          = Nav.atual;
+  Nav.focusFirst       = Nav.focarPrimeiro;
+  Nav.resetScroll      = Nav.zerarRolagem;
+  Nav.setScope         = Nav.definirEscopo;
+  Nav.clearScope       = Nav.limparEscopo;
+  Nav.scoped           = Nav.escopo;
+  Nav.addKeyHandler    = Nav.adicionarTecla;
+  Nav.removeKeyHandler = Nav.removerTecla;
+  Object.defineProperty(Nav, 'onFocusHook', {
+    get: function () { return Nav.aoFocar; },
+    set: function (fn) { Nav.aoFocar = fn; },
+    configurable: true
+  });
+
+  w.Nav = Nav;
+
+  /* ---------------------------------------------------------
+     Teclado
+     --------------------------------------------------------- */
+  var DIR = {};
+  DIR[w.KEY.LEFT] = 'left'; DIR[w.KEY.RIGHT] = 'right';
+  DIR[w.KEY.UP] = 'up';     DIR[w.KEY.DOWN] = 'down';
+
+  doc.addEventListener('keydown', function (ev) {
     var k = ev.keyCode;
 
-    for (var i = 0; i < handlers.length; i++) {
-      if (handlers[i](k, ev) === true) { ev.preventDefault(); return; }
+    for (var i = 0; i < ouvintes.length; i++) {
+      if (ouvintes[i](k, ev) === true) { ev.preventDefault(); return; }
     }
 
-    /* Enquanto digita num campo de texto, as setas pertencem ao campo -
-       exceto cima/baixo, que continuam navegando entre os campos. */
-    var typing = current && current.tagName === 'INPUT';
+    /* Com campo de texto em foco, as setas horizontais pertencem
+       ao cursor — MAS só enquanto houver texto e o cursor não
+       estiver na ponta. Com o campo vazio, ou com o cursor no
+       fim, a seta volta a ser navegação.
 
-    switch (k) {
-      case w.KEY.LEFT:  if (typing) return; w.Nav.move('left');  break;
-      case w.KEY.RIGHT: if (typing) return; w.Nav.move('right'); break;
-      case w.KEY.UP:    w.Nav.move('up');    break;
-      case w.KEY.DOWN:  w.Nav.move('down');  break;
-      case w.KEY.OK:
-        if (current) {
-          if (current.tagName === 'INPUT') return;   // deixa o teclado da TV abrir
-          current.click();
-        }
-        break;
-      default: return;
+       Sem esta regra o campo virava uma armadilha: os botões ao
+       lado dele (a ordenação da pasta) eram inalcançáveis pelo
+       controle, porque a seta nunca saía do texto. */
+    var alvo = doc.activeElement;
+    var campo = alvo && (alvo.tagName === 'INPUT' || alvo.tagName === 'TEXTAREA');
+    var digitando = false;
+    if (campo) {
+      var texto = String(alvo.value || '');
+      var cursor = typeof alvo.selectionStart === 'number' ? alvo.selectionStart : texto.length;
+      if (texto.length) {
+        if (k === w.KEY.LEFT) digitando = cursor > 0;
+        else if (k === w.KEY.RIGHT) digitando = cursor < texto.length;
+        else digitando = true;              /* Backspace continua sendo do campo */
+      }
     }
-    ev.preventDefault();
+
+    if (DIR[k]) {
+      if (digitando && (k === w.KEY.LEFT || k === w.KEY.RIGHT)) return;
+      Nav.pedirMovimento(DIR[k]);
+      ev.preventDefault();
+      return;
+    }
+    if (k === w.KEY.OK) {
+      if (digitando) return;
+      if (atual) atual.click();
+      ev.preventDefault();
+    }
   }, true);
 
 })(window);
