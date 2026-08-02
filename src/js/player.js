@@ -101,7 +101,6 @@
     video.addEventListener('waiting', comecouAEngasgar);
     video.addEventListener('stalled', comecouAEngasgar);
     video.addEventListener('playing', function () {
-      spinner.classList.add('hidden');
       errBox.classList.add('hidden');
       terminouDeEngasgar();
     });
@@ -292,6 +291,7 @@
     if (!aoVivo && isFinite(video.duration) && video.duration) {
       barra(video.currentTime / video.duration, null);
     }
+    julgarSuspeita();
     conferirFim(false);
     conferirEscada();
   }
@@ -361,22 +361,69 @@
      fontes na mesma qualidade — servidores diferentes — e trocar
      de servidor é a correção mais barata que existe.
      ----------------------------------------------------------- */
+  /* -----------------------------------------------------------
+     ENGASGO É O RELÓGIO PARADO, NÃO O EVENTO
+     -----------------------------------------------------------
+     Medido na TV: num canal ao vivo em `.ts`, o `waiting` e o
+     `stalled` disparam o tempo todo — a cada reenchimento de
+     buffer — mesmo com a imagem perfeita. E o `playing`, que era
+     quem apagava o rodinha e fechava a contagem, só volta depois
+     de uma pausa de verdade.
+
+     O resultado era o que você viu: a rodinha laranja acesa o
+     tempo inteiro, e a escada descendo de FHD até SD sem que
+     nada tivesse travado um segundo sequer.
+
+     Agora o evento só ABRE uma suspeita. Ela vira engasgo de
+     verdade se o `currentTime` ficar parado mais de 1,2 s. Se o
+     relógio andar, a suspeita é descartada e a rodinha apaga.
+     ----------------------------------------------------------- */
+  var SUSPEITA_MS = 1200;
+  var suspeita = null;          /* { em, tempoNoInicio } */
+
   function comecouAEngasgar() {
-    spinner.classList.remove('hidden');
-    travadas.push({ em: Date.now(), ms: 0, aberta: true });
+    if (suspeita) return;
+    suspeita = { em: Date.now(), tempo: video.currentTime || 0 };
   }
+
   function terminouDeEngasgar() {
-    var t = travadas[travadas.length - 1];
-    if (t && t.aberta) { t.aberta = false; t.ms = Date.now() - t.em; }
+    spinner.classList.add('hidden');
+    if (suspeita) {
+      /* Só vira registro a suspeita CONFIRMADA — aquela em que o
+         relógio realmente ficou parado. Uma suspeita que morreu
+         porque o vídeo continuou andando não foi travamento
+         nenhum, por mais tempo que o evento tenha demorado a ser
+         desmentido. */
+      if (suspeita.confirmada) {
+        travadas.push({ em: suspeita.em, ms: Date.now() - suspeita.em, aberta: false });
+      }
+      suspeita = null;
+    }
+  }
+
+  /* Chamado a cada `timeupdate`: é o juiz. */
+  function julgarSuspeita() {
+    if (!suspeita) { spinner.classList.add('hidden'); return; }
+    var agora = Date.now();
+    var andou = (video.currentTime || 0) - suspeita.tempo > 0.15;
+
+    if (andou) { terminouDeEngasgar(); return; }
+    /* parado de verdade: aí sim confirma e mostra que carrega */
+    if (agora - suspeita.em >= SUSPEITA_MS) {
+      suspeita.confirmada = true;
+      spinner.classList.remove('hidden');
+    }
   }
   function zerarMedidas() {
-    travadas = []; trocouEm = 0; esperaSubida = SUBIR_MS;
+    travadas = []; suspeita = null; trocouEm = 0; esperaSubida = SUBIR_MS;
   }
 
   function msTravadosNaJanela() {
     var agora = Date.now(), total = 0;
     travadas = travadas.filter(function (t) { return agora - t.em < JANELA_MS; });
-    travadas.forEach(function (t) { total += t.aberta ? (agora - t.em) : t.ms; });
+    travadas.forEach(function (t) { total += t.ms; });
+    /* a suspeita em curso conta enquanto o relógio estiver parado */
+    if (suspeita && suspeita.confirmada) total += agora - suspeita.em;
     return total;
   }
 
@@ -1019,6 +1066,11 @@
       conferirEscada();
     },
     _fixar: fixarDegrau,
+    _travas: function () {
+      return { registradas: travadas.length, suspeitaAberta: !!suspeita,
+               msNaJanela: Math.round(msTravadosNaJanela()),
+               rodinha: !spinner.classList.contains('hidden') };
+    },
     _arraste: function () {
       return { ativo: arrastando, alvo: Math.round(alvoArraste), passo: PASSOS[nivelPasso] };
     },

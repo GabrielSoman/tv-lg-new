@@ -119,8 +119,22 @@
   /* Os canais marcados, com o objeto COMPLETO — o favorito
      guardado no Store tem só o essencial para a lista, e para
      tocar é preciso a escada de qualidade inteira. */
-  function temFavoritosDeCanal() {
-    return w.Store.favorites().some(function (f) { return f.kind === 'live'; });
+  /* Qual "kind" de favorito pertence a cada seção. */
+  function kindDe(tipo) {
+    return tipo === 'series' ? 'series' : tipo === 'movie' ? 'movie' : 'live';
+  }
+
+  function temFavoritosDe(tipo) {
+    var k = kindDe(tipo);
+    return w.Store.favorites().some(function (f) { return f.kind === k; });
+  }
+
+  function favoritosDe(tipo) {
+    if (tipo === 'live') return canaisFavoritos();
+    var k = kindDe(tipo);
+    return Promise.resolve(w.Store.favorites().filter(function (f) {
+      return f.kind === k && naoAdulto(f);
+    }));
   }
 
   function canaisFavoritos() {
@@ -281,9 +295,12 @@
                          'O que você assistir aparece nesta pasta. Conteúdo adulto ' +
                          'nunca entra — nem aqui, nem em recentes, nem em relacionados.')
           : atual === FAVORITOS
-            ? w.UI.vazio('Nenhum canal favoritado ainda',
-                         'Segure OK sobre um canal em qualquer pasta para marcá-lo. ' +
-                         'Ele aparece aqui na hora.')
+            ? w.UI.vazio('Nada favoritado ainda',
+                         tipo === 'live'
+                           ? 'Segure OK sobre um canal em qualquer pasta para marcá-lo. ' +
+                             'Ele aparece aqui na hora.'
+                           : 'Use o botão Favoritar na tela do título. ' +
+                             'Ele aparece aqui na hora.')
             : w.UI.vazio('Nada nesta pasta',
                          'A categoria "' + (cat ? cat.nome : '') + '" veio vazia do provedor.'));
         return;
@@ -314,7 +331,7 @@
       w.clear(caixaGrade);
       caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
 
-      (cat.id === FAVORITOS ? canaisFavoritos()
+      (cat.id === FAVORITOS ? favoritosDe(tipo)
         : cat.id === HISTORICO ? historicoDe(tipo)
         : cat.id === TODOS ? w.Catalog.itens(tipo, '')
         : w.Catalog.itens(tipo, cat.id))
@@ -348,9 +365,13 @@
 
          É uma pasta de mentira: não existe no provedor, é montada
          a partir do que você marcou. Por isso o id reservado. */
+      /* Favorito tem UM lugar: a pasta. Ele estava também em duas
+         fileiras da tela inicial, e você viu o resultado — o mesmo
+         canal aparecendo duas vezes na abertura. Uma pasta em cada
+         seção é suficiente e é onde a pessoa procura. */
       var virtuais = [];
-      if (tipo === 'live') virtuais.push({ id: FAVORITOS, nome: '★ Favoritos' });
-      else virtuais.push({ id: TODOS, nome: 'Todos' });
+      if (tipo !== 'live') virtuais.push({ id: TODOS, nome: 'Todos' });
+      virtuais.push({ id: FAVORITOS, nome: '★ Favoritos' });
       virtuais.push({ id: HISTORICO, nome: 'Histórico' });
       cats = virtuais.concat(cats);
       if (!cats.length) {
@@ -376,7 +397,7 @@
          Vivo abria em branco. Medido no app real: 53 focáveis na
          coluna e zero cartões. */
       var vaziaAgora = function (id) {
-        if (id === FAVORITOS) return !temFavoritosDeCanal();
+        if (id === FAVORITOS) return !temFavoritosDe(tipo);
         if (id === HISTORICO) {
           var kind = tipo === 'series' ? 'episode' : tipo === 'movie' ? 'movie' : 'live';
           return !w.Store.historyList(200).some(function (r) { return r && r.kind === kind; });
@@ -474,7 +495,6 @@
     w.UI.trocar(tela, 'rows');
 
     var continuar = agruparPorSerie(w.Store.continueList(40).filter(naoAdulto)).slice(0, 20);
-    var favoritos = w.Store.favorites().filter(naoAdulto);
 
     /* O destaque precisa de arte. Um registro antigo sem capa
        deixava a tela de abertura preta com um título solto —
@@ -510,15 +530,6 @@
       if (continuar.length) {
         fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
           { forma: 'wide', aoAbrir: tocarDoDestaque }));
-      }
-      if (favoritos.length) {
-        fileiras.appendChild(w.UI.fileira('Favoritos', favoritos,
-          { forma: 'poster', aoAbrir: abrir }));
-      }
-      var favCanais = canais.filter(function (c) { return w.Store.isFavorite(c.id); });
-      if (favCanais.length) {
-        fileiras.appendChild(w.UI.fileira('Canais favoritos', favCanais,
-          { forma: 'logo', aoAbrir: abrir }));
       }
       if (canais.length) {
         fileiras.appendChild(w.UI.fileira('Canais ao vivo', porHabito(canais).slice(0, 120),

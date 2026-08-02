@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+6a464f14";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+66f05bc8";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -3424,7 +3424,6 @@ window.CFG = {
     video.addEventListener('waiting', comecouAEngasgar);
     video.addEventListener('stalled', comecouAEngasgar);
     video.addEventListener('playing', function () {
-      spinner.classList.add('hidden');
       errBox.classList.add('hidden');
       terminouDeEngasgar();
     });
@@ -3615,6 +3614,7 @@ window.CFG = {
     if (!aoVivo && isFinite(video.duration) && video.duration) {
       barra(video.currentTime / video.duration, null);
     }
+    julgarSuspeita();
     conferirFim(false);
     conferirEscada();
   }
@@ -3684,22 +3684,69 @@ window.CFG = {
      fontes na mesma qualidade — servidores diferentes — e trocar
      de servidor é a correção mais barata que existe.
      ----------------------------------------------------------- */
+  /* -----------------------------------------------------------
+     ENGASGO É O RELÓGIO PARADO, NÃO O EVENTO
+     -----------------------------------------------------------
+     Medido na TV: num canal ao vivo em `.ts`, o `waiting` e o
+     `stalled` disparam o tempo todo — a cada reenchimento de
+     buffer — mesmo com a imagem perfeita. E o `playing`, que era
+     quem apagava o rodinha e fechava a contagem, só volta depois
+     de uma pausa de verdade.
+
+     O resultado era o que você viu: a rodinha laranja acesa o
+     tempo inteiro, e a escada descendo de FHD até SD sem que
+     nada tivesse travado um segundo sequer.
+
+     Agora o evento só ABRE uma suspeita. Ela vira engasgo de
+     verdade se o `currentTime` ficar parado mais de 1,2 s. Se o
+     relógio andar, a suspeita é descartada e a rodinha apaga.
+     ----------------------------------------------------------- */
+  var SUSPEITA_MS = 1200;
+  var suspeita = null;          /* { em, tempoNoInicio } */
+
   function comecouAEngasgar() {
-    spinner.classList.remove('hidden');
-    travadas.push({ em: Date.now(), ms: 0, aberta: true });
+    if (suspeita) return;
+    suspeita = { em: Date.now(), tempo: video.currentTime || 0 };
   }
+
   function terminouDeEngasgar() {
-    var t = travadas[travadas.length - 1];
-    if (t && t.aberta) { t.aberta = false; t.ms = Date.now() - t.em; }
+    spinner.classList.add('hidden');
+    if (suspeita) {
+      /* Só vira registro a suspeita CONFIRMADA — aquela em que o
+         relógio realmente ficou parado. Uma suspeita que morreu
+         porque o vídeo continuou andando não foi travamento
+         nenhum, por mais tempo que o evento tenha demorado a ser
+         desmentido. */
+      if (suspeita.confirmada) {
+        travadas.push({ em: suspeita.em, ms: Date.now() - suspeita.em, aberta: false });
+      }
+      suspeita = null;
+    }
+  }
+
+  /* Chamado a cada `timeupdate`: é o juiz. */
+  function julgarSuspeita() {
+    if (!suspeita) { spinner.classList.add('hidden'); return; }
+    var agora = Date.now();
+    var andou = (video.currentTime || 0) - suspeita.tempo > 0.15;
+
+    if (andou) { terminouDeEngasgar(); return; }
+    /* parado de verdade: aí sim confirma e mostra que carrega */
+    if (agora - suspeita.em >= SUSPEITA_MS) {
+      suspeita.confirmada = true;
+      spinner.classList.remove('hidden');
+    }
   }
   function zerarMedidas() {
-    travadas = []; trocouEm = 0; esperaSubida = SUBIR_MS;
+    travadas = []; suspeita = null; trocouEm = 0; esperaSubida = SUBIR_MS;
   }
 
   function msTravadosNaJanela() {
     var agora = Date.now(), total = 0;
     travadas = travadas.filter(function (t) { return agora - t.em < JANELA_MS; });
-    travadas.forEach(function (t) { total += t.aberta ? (agora - t.em) : t.ms; });
+    travadas.forEach(function (t) { total += t.ms; });
+    /* a suspeita em curso conta enquanto o relógio estiver parado */
+    if (suspeita && suspeita.confirmada) total += agora - suspeita.em;
     return total;
   }
 
@@ -4342,6 +4389,11 @@ window.CFG = {
       conferirEscada();
     },
     _fixar: fixarDegrau,
+    _travas: function () {
+      return { registradas: travadas.length, suspeitaAberta: !!suspeita,
+               msNaJanela: Math.round(msTravadosNaJanela()),
+               rodinha: !spinner.classList.contains('hidden') };
+    },
     _arraste: function () {
       return { ativo: arrastando, alvo: Math.round(alvoArraste), passo: PASSOS[nivelPasso] };
     },
@@ -4490,8 +4542,22 @@ window.CFG = {
   /* Os canais marcados, com o objeto COMPLETO — o favorito
      guardado no Store tem só o essencial para a lista, e para
      tocar é preciso a escada de qualidade inteira. */
-  function temFavoritosDeCanal() {
-    return w.Store.favorites().some(function (f) { return f.kind === 'live'; });
+  /* Qual "kind" de favorito pertence a cada seção. */
+  function kindDe(tipo) {
+    return tipo === 'series' ? 'series' : tipo === 'movie' ? 'movie' : 'live';
+  }
+
+  function temFavoritosDe(tipo) {
+    var k = kindDe(tipo);
+    return w.Store.favorites().some(function (f) { return f.kind === k; });
+  }
+
+  function favoritosDe(tipo) {
+    if (tipo === 'live') return canaisFavoritos();
+    var k = kindDe(tipo);
+    return Promise.resolve(w.Store.favorites().filter(function (f) {
+      return f.kind === k && naoAdulto(f);
+    }));
   }
 
   function canaisFavoritos() {
@@ -4652,9 +4718,12 @@ window.CFG = {
                          'O que você assistir aparece nesta pasta. Conteúdo adulto ' +
                          'nunca entra — nem aqui, nem em recentes, nem em relacionados.')
           : atual === FAVORITOS
-            ? w.UI.vazio('Nenhum canal favoritado ainda',
-                         'Segure OK sobre um canal em qualquer pasta para marcá-lo. ' +
-                         'Ele aparece aqui na hora.')
+            ? w.UI.vazio('Nada favoritado ainda',
+                         tipo === 'live'
+                           ? 'Segure OK sobre um canal em qualquer pasta para marcá-lo. ' +
+                             'Ele aparece aqui na hora.'
+                           : 'Use o botão Favoritar na tela do título. ' +
+                             'Ele aparece aqui na hora.')
             : w.UI.vazio('Nada nesta pasta',
                          'A categoria "' + (cat ? cat.nome : '') + '" veio vazia do provedor.'));
         return;
@@ -4685,7 +4754,7 @@ window.CFG = {
       w.clear(caixaGrade);
       caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
 
-      (cat.id === FAVORITOS ? canaisFavoritos()
+      (cat.id === FAVORITOS ? favoritosDe(tipo)
         : cat.id === HISTORICO ? historicoDe(tipo)
         : cat.id === TODOS ? w.Catalog.itens(tipo, '')
         : w.Catalog.itens(tipo, cat.id))
@@ -4719,9 +4788,13 @@ window.CFG = {
 
          É uma pasta de mentira: não existe no provedor, é montada
          a partir do que você marcou. Por isso o id reservado. */
+      /* Favorito tem UM lugar: a pasta. Ele estava também em duas
+         fileiras da tela inicial, e você viu o resultado — o mesmo
+         canal aparecendo duas vezes na abertura. Uma pasta em cada
+         seção é suficiente e é onde a pessoa procura. */
       var virtuais = [];
-      if (tipo === 'live') virtuais.push({ id: FAVORITOS, nome: '★ Favoritos' });
-      else virtuais.push({ id: TODOS, nome: 'Todos' });
+      if (tipo !== 'live') virtuais.push({ id: TODOS, nome: 'Todos' });
+      virtuais.push({ id: FAVORITOS, nome: '★ Favoritos' });
       virtuais.push({ id: HISTORICO, nome: 'Histórico' });
       cats = virtuais.concat(cats);
       if (!cats.length) {
@@ -4747,7 +4820,7 @@ window.CFG = {
          Vivo abria em branco. Medido no app real: 53 focáveis na
          coluna e zero cartões. */
       var vaziaAgora = function (id) {
-        if (id === FAVORITOS) return !temFavoritosDeCanal();
+        if (id === FAVORITOS) return !temFavoritosDe(tipo);
         if (id === HISTORICO) {
           var kind = tipo === 'series' ? 'episode' : tipo === 'movie' ? 'movie' : 'live';
           return !w.Store.historyList(200).some(function (r) { return r && r.kind === kind; });
@@ -4845,7 +4918,6 @@ window.CFG = {
     w.UI.trocar(tela, 'rows');
 
     var continuar = agruparPorSerie(w.Store.continueList(40).filter(naoAdulto)).slice(0, 20);
-    var favoritos = w.Store.favorites().filter(naoAdulto);
 
     /* O destaque precisa de arte. Um registro antigo sem capa
        deixava a tela de abertura preta com um título solto —
@@ -4881,15 +4953,6 @@ window.CFG = {
       if (continuar.length) {
         fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
           { forma: 'wide', aoAbrir: tocarDoDestaque }));
-      }
-      if (favoritos.length) {
-        fileiras.appendChild(w.UI.fileira('Favoritos', favoritos,
-          { forma: 'poster', aoAbrir: abrir }));
-      }
-      var favCanais = canais.filter(function (c) { return w.Store.isFavorite(c.id); });
-      if (favCanais.length) {
-        fileiras.appendChild(w.UI.fileira('Canais favoritos', favCanais,
-          { forma: 'logo', aoAbrir: abrir }));
       }
       if (canais.length) {
         fileiras.appendChild(w.UI.fileira('Canais ao vivo', porHabito(canais).slice(0, 120),
