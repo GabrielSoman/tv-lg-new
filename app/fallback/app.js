@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+67c40343";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+acb0452f";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -5609,6 +5609,35 @@ window.CFG = {
           .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
       };
       pD.appendChild(bTeste);
+
+      /* -------------------------------------------------------
+         Reenviar TUDO
+         -------------------------------------------------------
+         `Cloud.queue` descarta em silêncio quando o banco está
+         desligado — e o banco esteve desligado esse tempo todo,
+         por causa do bug das credenciais. Ou seja: tudo o que
+         você assistiu até agora nunca chegou a entrar na fila.
+         Conectar depois não recupera sozinho; precisa reenviar.
+         ------------------------------------------------------- */
+      var bTudo = el('button', { class: 'btn ghost', 'data-focusable': '' });
+      bTudo.innerHTML = '<span>Enviar todo o histórico para o banco</span>';
+      bTudo.onclick = function () {
+        var t = bTudo.querySelector('span');
+        var todos = w.Store.allProgress();
+        var ids = Object.keys(todos);
+        if (!ids.length) { t.textContent = 'Não há histórico para enviar'; return; }
+        t.textContent = 'Enfileirando ' + ids.length + '…';
+        ids.forEach(function (k) { w.Cloud.queue(todos[k]); });
+        Promise.resolve(w.Cloud.flush())
+          .then(function () {
+            var faltam = w.Cloud.pending();
+            t.textContent = faltam
+              ? 'Enviado — ' + faltam + ' ainda na fila'
+              : 'Enviado: ' + ids.length + ' registros';
+          })
+          .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
+      };
+      pD.appendChild(bTudo);
 
       var bEnviar = el('button', { class: 'btn ghost', 'data-focusable': '' });
       bEnviar.innerHTML = '<span>Enviar agora o que está na fila</span>';
