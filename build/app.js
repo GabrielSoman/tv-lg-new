@@ -7671,6 +7671,11 @@ window.CFG = {
 
     current: function () { return currentRoute; },
 
+    /* Expostos para o banco de provas conseguir exercitar a
+       correção de credenciais sem recarregar a página. */
+    reaplicarDefaults: function () { return applyDefaults(false); },
+    corrigidos: function () { return applyDefaults.corrigidos || []; },
+
     lastParams: null
   };
 
@@ -7788,9 +7793,6 @@ window.CFG = {
   });
 
   /* ---------------------------------------------------------
-     Configuração embutida no pacote instalado
-     --------------------------------------------------------- */
-  /* ---------------------------------------------------------
      Configuração embutida no pacote
      ---------------------------------------------------------
      Isto rodava SÓ quando o app estava zerado. Consequência que
@@ -7799,16 +7801,39 @@ window.CFG = {
      preenchidas no `nebula.config.json` depois. O banco ficava
      desligado sem nenhum aviso.
 
-     Agora roda em todo boot, mas em modo COMPLEMENTAR: só grava
-     o que ainda está vazio. Nunca sobrescreve uma escolha sua —
-     se você trocou a lista pela tela de configuração, o pacote
-     não desfaz isso.
+     Depois passou a rodar em todo boot, mas em modo
+     complementar: só gravava o que estava vazio. Isso consertou
+     um caso e criou outro, pior, porque é silencioso.
+
+     ---------------------------------------------------------
+     QUEM MANDA EM CADA COISA
+     ---------------------------------------------------------
+     `source` é seu: existe uma tela para trocar a lista, então o
+     pacote só preenche o que estiver vazio e nunca desfaz uma
+     escolha feita ali.
+
+     `cloud` e `update` NÃO são seus — não há tela para editá-los,
+     eles só podem vir do pacote. Tratá-los como "escolha do
+     usuário" congelava para sempre o primeiro valor que caísse no
+     aparelho. Foi exatamente o que aconteceu: o navegador de
+     desenvolvimento guardou o endereço de um projeto antigo do
+     Supabase (`bcewmk…`), o `nebula.config.json` passou a apontar
+     para o atual (`bkakxo…`), e o app continuou batendo num
+     domínio que nem existe mais — ERR_NAME_NOT_RESOLVED em toda
+     requisição, para sempre, sem nada na tela dizendo por quê.
+
+     Agora o pacote manda nesses dois grupos. Trocar de projeto,
+     girar a chave ou rodar com `PERFIL=teste` passa a ter efeito
+     no boot seguinte, em vez de esbarrar num valor velho.
      --------------------------------------------------------- */
+  var MANDA_O_PACOTE = { cloud: true, update: true };
+
   function applyDefaults(sobrescrever) {
     var d = w.NEBULA_DEFAULTS;
     if (!d || typeof d !== 'object') return false;
 
     var gravou = false;
+    var corrigidos = [];
     Object.keys(d).forEach(function (grupo) {
       if (grupo.charAt(0) === '_') return;            /* comentários do arquivo */
       var g = d[grupo];
@@ -7821,20 +7846,35 @@ window.CFG = {
         if (valor === '' || valor === null) return;
         var caminho = grupo + '.' + k;
         var atual = w.Store.get(caminho, '');
-        if (sobrescrever || atual === '' || atual === undefined) {
-          w.Store.set(caminho, valor);
-          gravou = true;
-        }
+        var vazio = (atual === '' || atual === undefined);
+        if (!sobrescrever && !vazio && !MANDA_O_PACOTE[grupo]) return;
+        if (!vazio && atual === valor) return;              /* já está certo */
+        if (!vazio) corrigidos.push(caminho);
+        w.Store.set(caminho, valor);
+        gravou = true;
       });
     });
+
+    /* Corrigir uma credencial por baixo do pano é o tipo de coisa
+       que faz um problema reaparecer meses depois sem explicação.
+       Se um valor guardado foi substituído, isso é dito. */
+    if (corrigidos.length && w.console) {
+      console.warn('[config] o pacote corrigiu: ' + corrigidos.join(', '));
+    }
+    applyDefaults.corrigidos = corrigidos;
     return gravou;
   }
 
   /* Completa o que faltar, sem mexer no que já existe. */
   function completarDefaults() {
     var antes = w.Cloud.enabled();
+    var antesUrl = w.Store.get('cloud.url', '');
     applyDefaults(false);
-    if (!antes && w.Cloud.enabled()) {
+    var trocouBanco = antesUrl && antesUrl !== w.Store.get('cloud.url', '');
+    if (trocouBanco) {
+      w.toast('O endereço do banco estava desatualizado neste aparelho e foi corrigido.', 6000);
+      sincronizar(true);
+    } else if (!antes && w.Cloud.enabled()) {
       w.toast('Banco de dados conectado — histórico volta a sincronizar.', 5000);
       sincronizar(true);
     }

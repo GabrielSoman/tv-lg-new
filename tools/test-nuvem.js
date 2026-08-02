@@ -118,6 +118,49 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
   ok('e conhece as cinco tabelas',
      await page.evaluate(() => Cloud.chaves.length), 5);
 
+  console.log('\n1-B) Credencial velha no aparelho não pode se eternizar');
+
+  /* O caso real: o navegador de desenvolvimento tinha guardado o
+     endereço de um projeto ANTIGO do Supabase. O
+     `nebula.config.json` já apontava para o projeto atual, mas
+     `applyDefaults` só preenchia campos vazios — então o valor
+     velho ficava lá, e todas as requisições morriam em
+     ERR_NAME_NOT_RESOLVED, em silêncio, para sempre.
+
+     `cloud` e `update` não têm tela de edição: só podem vir do
+     pacote. Logo, o pacote manda neles. */
+  await page.evaluate(() => {
+    Store.set('cloud.url', 'https://projeto-que-nao-existe-mais.supabase.co');
+    Store.set('cloud.key', 'chave-velha');
+    /* A lista É escolha do usuário e não pode ser desfeita. */
+    Store.set('source.url', 'http://a-minha-lista-escolhida-a-mao/get.php');
+    window.NEBULA_DEFAULTS = {
+      source: { url: 'http://lista-do-pacote/get.php' },
+      cloud: { url: 'https://projeto-novo.supabase.co', key: 'chave-nova', profile: 'teste' },
+      update: { repo: 'g/tv', branch: 'main', dir: 'build' }
+    };
+    App.reaplicarDefaults();
+  });
+
+  ok('o endereço velho do banco é corrigido pelo pacote',
+     await page.evaluate(() => Store.get('cloud.url', '')),
+     'https://projeto-novo.supabase.co');
+  ok('a chave também', await page.evaluate(() => Store.get('cloud.key', '')), 'chave-nova');
+  ok('mas a lista escolhida à mão continua sendo a sua',
+     await page.evaluate(() => Store.get('source.url', '')),
+     'http://a-minha-lista-escolhida-a-mao/get.php');
+  ok('e a correção fica registrada, não acontece por baixo do pano',
+     await page.evaluate(() => (App.corrigidos() || []).indexOf('cloud.url') >= 0), true);
+
+  /* Devolve o cenário do teste. */
+  await page.evaluate(([lista, supa]) => {
+    window.NEBULA_DEFAULTS = null;
+    Store.set('cloud.url', supa);
+    Store.set('cloud.key', 'chave-de-teste');
+    Store.set('cloud.profile', 'teste');
+    Store.set('source.url', lista);
+  }, [LISTA, SUPA]);
+
   console.log('\n2) Favoritos vão para o banco');
   await page.evaluate(() => {
     Store.toggleFavorite({ id: 'movie:4242', kind: 'movie', title: 'Um Filme', poster: 'p.png' });
