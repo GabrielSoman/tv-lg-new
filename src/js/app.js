@@ -159,19 +159,56 @@
   /* ---------------------------------------------------------
      Configuração embutida no pacote instalado
      --------------------------------------------------------- */
-  function applyDefaults() {
+  /* ---------------------------------------------------------
+     Configuração embutida no pacote
+     ---------------------------------------------------------
+     Isto rodava SÓ quando o app estava zerado. Consequência que
+     apareceu na TV: quem já tinha a lista configurada nunca
+     recebia as credenciais do Supabase, porque elas foram
+     preenchidas no `nebula.config.json` depois. O banco ficava
+     desligado sem nenhum aviso.
+
+     Agora roda em todo boot, mas em modo COMPLEMENTAR: só grava
+     o que ainda está vazio. Nunca sobrescreve uma escolha sua —
+     se você trocou a lista pela tela de configuração, o pacote
+     não desfaz isso.
+     --------------------------------------------------------- */
+  function applyDefaults(sobrescrever) {
     var d = w.NEBULA_DEFAULTS;
     if (!d || typeof d !== 'object') return false;
-    if (!d.source || !d.source.url) return false;
 
-    Object.keys(d).forEach(function (group) {
-      var g = d[group];
-      if (g === null || typeof g !== 'object') { w.Store.set(group, g); return; }
+    var gravou = false;
+    Object.keys(d).forEach(function (grupo) {
+      if (grupo.charAt(0) === '_') return;            /* comentários do arquivo */
+      var g = d[grupo];
+      if (g === null || typeof g !== 'object') {
+        if (sobrescrever || w.Store.get(grupo, '') === '') { w.Store.set(grupo, g); gravou = true; }
+        return;
+      }
       Object.keys(g).forEach(function (k) {
-        if (g[k] !== '' && g[k] !== null) w.Store.set(group + '.' + k, g[k]);
+        var valor = g[k];
+        if (valor === '' || valor === null) return;
+        var caminho = grupo + '.' + k;
+        var atual = w.Store.get(caminho, '');
+        if (sobrescrever || atual === '' || atual === undefined) {
+          w.Store.set(caminho, valor);
+          gravou = true;
+        }
       });
     });
-    return true;
+    return gravou;
+  }
+
+  /* Completa o que faltar, sem mexer no que já existe. */
+  function completarDefaults() {
+    var antes = w.Cloud.enabled();
+    applyDefaults(false);
+    if (!antes && w.Cloud.enabled()) {
+      w.toast('Banco de dados conectado — histórico volta a sincronizar.', 5000);
+      w.Cloud.pull().then(function (n) {
+        if (n && w.App.current() === 'home') w.App.reload();
+      }).catch(function () {});
+    }
   }
 
   /* Reconecta na lista e traz o histórico de volta, sem pedir nada
@@ -211,10 +248,14 @@
 
     /* Reinstalou o app e caiu num aparelho zerado? Se o .ipk trouxe
        credenciais embutidas, o app se reconfigura sozinho. */
-    if (!w.Store.isConfigured() && applyDefaults()) {
+    if (!w.Store.isConfigured() && applyDefaults(true)) {
       restoreFromDefaults();
       return;
     }
+
+    /* Já configurado: ainda assim completa o que faltar — foi
+       assim que o Supabase ficou de fora até agora. */
+    completarDefaults();
 
     if (!w.Store.isConfigured()) {
       w.App.go('setup', null, { replace: true });
