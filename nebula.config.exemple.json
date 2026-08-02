@@ -1,0 +1,20 @@
+{
+  "_leia": "Copie este arquivo para nebula.config.json e preencha. Ele NUNCA vai para o GitHub (está no .gitignore), mas é embutido no .ipk. Assim, se a TV desinstalar o app, um 'npm run deploy' o traz de volta já configurado.",
+
+  "source": {
+    "url": "http://SERVIDOR:PORTA/get.php?username=SEU_USUARIO&password=SUA_SENHA&type=m3u_plus",
+    "proxy": ""
+  },
+
+  "cloud": {
+    "url": "https://SEU_SUPABASE.supabase.co",
+    "key": "SUA_CHAVE_ANON",
+    "profile": "gabriel"
+  },
+
+  "update": {
+    "repo": "SEU-USUARIO/nebula-tv",
+    "branch": "main",
+    "dir": "build"
+  }
+}

@@ -1,0 +1,64 @@
+# =========================================================
+#  ClaudeTV — o que NÃO vai para o GitHub
+#
+#  O repositório é PÚBLICO por necessidade: a TV baixa o
+#  pacote de build/ sem autenticação nenhuma. Então a regra
+#  aqui é simples — só sobe o que a TV precisa e o código
+#  que gera esse pacote. Todo o resto fica no Mac.
+# =========================================================
+
+# ---- credenciais ----------------------------------------
+# Suas chaves. Ficam só no Mac e dentro do .ipk.
+nebula.config.json
+
+# GERADO a cada build a partir do arquivo acima, e contém as
+# MESMAS credenciais. Sem esta linha, o `git add -A` do
+# npm run publish mandaria suas chaves para o repositório.
+app/defaults.js
+
+# ---- relatórios do provedor -----------------------------
+# Não têm senha, mas mostram sua lista, suas categorias e o
+# tamanho da sua assinatura. Não é assunto de repositório
+# público.
+relatorio-*.md
+
+# ---- documentos de projeto ------------------------------
+# Specs e anotações são para você, não para a TV.
+SPEC.md
+SPEC-EXPERIENCIA.md
+NOTAS-*.md
+
+# ---- ferramentas de diagnóstico e teste -----------------
+# Falam com o seu provedor e leem o nebula.config.json.
+# Nenhuma contém senha, mas não têm por que estar num
+# repositório público.
+tools/diagnostico-lista.js
+tools/sonda-api.js
+tools/catchup.js
+tools/mock-iptv.js
+tools/smoke.js
+tools/test-update.js
+tools/dev-server.js
+tools/cloudflare-worker.js
+
+# ---- gerados / locais -----------------------------------
+node_modules/
+dist/
+shots/
+.DS_Store
+*.log
+relatorio-api.md
+
+# =========================================================
+#  O que SOBE, de propósito:
+#
+#    build/          o pacote que a TV baixa — sem isto a
+#                    atualização pelo GitHub não funciona
+#    src/            o código do app
+#    app/            a casca que vira o .ipk (sem defaults.js)
+#    tools/build.js  gera o build/
+#    tools/files.js  a ordem dos arquivos
+#    tools/check-secrets.js  a trava que impede vazamento
+#    package.json    os comandos
+#    README.md       como reinstalar do zero
+# =========================================================

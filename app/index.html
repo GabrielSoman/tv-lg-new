@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920, initial-scale=1">
+  <title>Nebula</title>
+  <style>
+    /* Estilos minimos da casca. O visual de verdade vem no pacote. */
+    html, body { margin:0; padding:0; height:100%; background:#07080B; color:#EEF1F6;
+                 font-family:"LG Smart UI","Helvetica Neue",Helvetica,Arial,sans-serif;
+                 overflow:hidden; }
+    #shell-boot { position:fixed; inset:0; z-index:9000; display:flex; gap:1.2rem;
+                  flex-direction:column; align-items:center; justify-content:center; }
+    #shell-boot .ring { width:48px; height:48px; border-radius:50%;
+                        border:4px solid rgba(255,255,255,.12); border-top-color:#7C5CFF;
+                        animation:sp .8s linear infinite; }
+    #shell-boot .msg { color:#8B93A1; font-size:16px; letter-spacing:.01em; }
+    #shell-boot .sub { color:#4a5160; font-size:13px; }
+    @keyframes sp { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <div id="shell-boot">
+    <div class="ring"></div>
+    <div class="msg">Iniciando o Nebula…</div>
+    <div class="sub" id="shell-sub"></div>
+  </div>
+
+  <!-- Bibliotecas que nao mudam ficam na casca -->
+  <script src="js/vendor/hls.min.js"></script>
+
+  <!-- Credenciais embutidas no pacote (geradas por npm run build).
+       E o que faz o app voltar configurado depois de uma reinstalacao. -->
+  <script src="defaults.js"></script>
+
+  <!-- Carregador: decide entre o pacote baixado do GitHub e a copia local -->
+  <script src="js/boot.js"></script>
+</body>
+</html>

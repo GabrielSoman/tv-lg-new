@@ -1,0 +1,17 @@
+{
+  "id": "com.gabriel.claudetv",
+  "version": "1.0.0",
+  "vendor": "Gabriel",
+  "type": "web",
+  "main": "index.html",
+  "title": "ClaudeTV",
+  "appDescription": "Player de IPTV pessoal com histórico e retomada",
+  "icon": "assets/icon.png",
+  "largeIcon": "assets/largeIcon.png",
+  "splashBackground": "assets/splash.png",
+  "bgColor": "#120E0D",
+  "iconColor": "#D9694A",
+  "disableBackHistoryAPI": true,
+  "supportTouchMode": "none",
+  "handlesRelaunch": true
+}

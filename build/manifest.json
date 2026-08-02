@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0+f7e84ee0",
+  "js": "app.js",
+  "css": "app.css",
+  "date": "2026-08-02T01:44:59.794Z",
+  "notes": "build f7e84ee0",
+  "bytes": {
+    "js": 129553,
+    "css": 25634
+  }
+}

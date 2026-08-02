@@ -1,0 +1,251 @@
+/* =========================================================
+   Roteador e inicialização.
+   ========================================================= */
+(function (w) {
+  'use strict';
+
+  var stack = [];          // histórico de telas
+  var currentRoute = null;
+
+  var ROUTES = {
+    home:            { view: function (p) { return w.Views.home(p); },        rail: 'home' },
+    live:            { view: function (p) { return w.Views.live(p); },        rail: 'live' },
+    movies:          { view: function (p) { return w.Views.movies(p); },      rail: 'movies' },
+    series:          { view: function (p) { return w.Views.series(p); },      rail: 'series' },
+    search:          { view: function (p) { return w.Views.search(p); },      rail: 'search' },
+    settings:        { view: function (p) { return w.Views.settings(p); },    rail: 'settings' },
+    setup:           { view: function (p) { return w.Views.setup(p); },       rail: null },
+    'movie-detail':  { view: function (p) { return w.Views.movieDetail(p); }, rail: null },
+    'series-detail': { view: function (p) { return w.Views.seriesDetail(p); },rail: null }
+  };
+
+  function paintRail(railKey) {
+    w.$$('.rail-item').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-route') === railKey);
+    });
+  }
+
+  function render(route, params) {
+    var r = ROUTES[route];
+    if (!r) return;
+    currentRoute = route;
+    w.Views.stopBillboard();
+    paintRail(r.rail);
+    w.setAmbient('');
+    try {
+      var out = r.view(params || {});
+      if (out && out.catch) out.catch(function (e) { console.error(e); });
+    } catch (e) {
+      console.error('Falha ao montar a tela ' + route, e);
+      w.toast('Algo quebrou ao abrir esta tela.');
+    }
+  }
+
+  w.App = {
+
+    go: function (route, params, opts) {
+      opts = opts || {};
+      if (w.Player.isOpen()) w.Player.close();
+      if (!opts.replace && currentRoute) {
+        stack.push({ route: currentRoute, params: w.App.lastParams });
+        if (stack.length > 12) stack.shift();
+      }
+      w.App.lastParams = params;
+      render(route, params);
+    },
+
+    back: function () {
+      var prev = stack.pop();
+      if (prev) {
+        w.App.lastParams = prev.params;
+        render(prev.route, prev.params);
+        return true;
+      }
+      return false;
+    },
+
+    reload: function () { render(currentRoute, w.App.lastParams); },
+
+    current: function () { return currentRoute; },
+
+    lastParams: null
+  };
+
+  /* ---------------------------------------------------------
+     Barra lateral: abre quando o foco entra nela.
+     --------------------------------------------------------- */
+  function wireRail() {
+    w.$$('.rail-item').forEach(function (b) {
+      b.onclick = function () {
+        var route = b.getAttribute('data-route');
+        if (route === currentRoute) return;
+        w.App.go(route, null, { replace: currentRoute === 'home' && route === 'home' });
+      };
+    });
+  }
+
+  /* ---------------------------------------------------------
+     Reações ao foco: abre a barra lateral, troca o fundo
+     ambiente e pré-seleciona categorias.
+     --------------------------------------------------------- */
+  var catTimer = null;
+  w.Nav.onFocusHook = function (el) {
+    var inRail = !!(el.closest && el.closest('#rail'));
+    var rail = w.$('#rail');
+    if (rail) rail.classList.toggle('open', inRail);
+
+    w.setAmbient(el.getAttribute('data-ambient') || '');
+
+    clearTimeout(catTimer);
+    if (el._select) {
+      catTimer = setTimeout(function () {
+        if (w.Nav.current() === el) el._select();
+      }, 380);
+    }
+  };
+
+  /* ---------------------------------------------------------
+     Tecla Voltar
+     --------------------------------------------------------- */
+  w.Nav.addKeyHandler(function (k) {
+    if (k !== w.KEY.BACK && k !== w.KEY.BACKSPACE && k !== w.KEY.ESC) return false;
+
+    if (w.Player.isOpen()) { w.Player.close(); return true; }
+
+    if (!w.$('#confirm-layer').classList.contains('hidden')) {
+      var no = w.$('#confirm-no'); if (no) no.click();
+      return true;
+    }
+    if (!w.$('#resume-layer').classList.contains('hidden')) return true;
+
+    /* Dentro de uma tela, se o foco não está na barra lateral, o
+       primeiro Voltar leva o foco para o menu — igual aos apps da TV. */
+    var cur = w.Nav.current();
+    if (cur && cur.closest && !cur.closest('#rail') && currentRoute !== 'home') {
+      if (w.App.back()) return true;
+    }
+    if (cur && cur.closest && !cur.closest('#rail')) {
+      w.Nav.focusFirst('.rail-item.active') || w.Nav.focusFirst('.rail-item');
+      return true;
+    }
+    if (currentRoute !== 'home') { w.App.go('home', null, { replace: true }); return true; }
+
+    w.confirmDialog('Sair do Nebula?', 'Você volta para a tela inicial da TV.', 'Sair')
+      .then(function (yes) { if (yes) { try { w.close(); } catch (e) {} } });
+    return true;
+  });
+
+  /* Teclas coloridas: atalhos rápidos. */
+  w.Nav.addKeyHandler(function (k) {
+    if (w.Player.isOpen()) return false;
+    if (k === w.KEY.RED)    { w.App.go('search');   return true; }
+    if (k === w.KEY.GREEN)  { w.App.go('live');     return true; }
+    if (k === w.KEY.YELLOW) { w.App.go('movies');   return true; }
+    if (k === w.KEY.BLUE)   { w.App.go('settings'); return true; }
+    return false;
+  });
+
+  /* ---------------------------------------------------------
+     Configuração embutida no pacote instalado
+     --------------------------------------------------------- */
+  function applyDefaults() {
+    var d = w.NEBULA_DEFAULTS;
+    if (!d || typeof d !== 'object') return false;
+    if (!d.source || !d.source.url) return false;
+
+    Object.keys(d).forEach(function (group) {
+      var g = d[group];
+      if (g === null || typeof g !== 'object') { w.Store.set(group, g); return; }
+      Object.keys(g).forEach(function (k) {
+        if (g[k] !== '' && g[k] !== null) w.Store.set(group + '.' + k, g[k]);
+      });
+    });
+    return true;
+  }
+
+  /* Reconecta na lista e traz o histórico de volta, sem pedir nada
+     no controle remoto. */
+  function restoreFromDefaults() {
+    var s = w.$('#stage');
+    s.innerHTML =
+      '<div class="screen enter"><div class="empty" style="padding-top:12rem">' +
+      '<h2>Restaurando sua configuração</h2>' +
+      '<div id="restore-msg">Reconectando à sua lista…</div></div></div>';
+    var msg = w.$('#restore-msg');
+
+    w.Catalog.connect(w.Store.get('source.url'), function (m) { msg.textContent = m; })
+      .then(function () {
+        if (!w.Cloud.enabled()) return 0;
+        msg.textContent = 'Trazendo o histórico da nuvem…';
+        return w.Cloud.pull();
+      })
+      .then(function (n) {
+        w.toast(n ? 'Tudo de volta — ' + n + ' itens no histórico.' : 'Tudo de volta.', 4000);
+        w.App.go('home', null, { replace: true });
+      })
+      .catch(function (e) {
+        msg.innerHTML = 'Não consegui reconectar sozinho: ' + w.esc(e.message) +
+                        '<br>Vou abrir a tela de configuração.';
+        setTimeout(function () { w.App.go('setup', null, { replace: true }); }, 3500);
+      });
+  }
+
+  /* ---------------------------------------------------------
+     Início
+     --------------------------------------------------------- */
+  function start() {
+    w.buildDOM();
+    w.startClock();
+    wireRail();
+
+    /* Reinstalou o app e caiu num aparelho zerado? Se o .ipk trouxe
+       credenciais embutidas, o app se reconfigura sozinho. */
+    if (!w.Store.isConfigured() && applyDefaults()) {
+      restoreFromDefaults();
+      return;
+    }
+
+    if (!w.Store.isConfigured()) {
+      w.App.go('setup', null, { replace: true });
+    } else {
+      w.App.go('home', null, { replace: true });
+      /* Traz o histórico da nuvem sem travar a tela. */
+      if (w.Cloud.enabled()) {
+        w.Cloud.pull().then(function (n) {
+          if (n && w.App.current() === 'home') w.App.reload();
+        });
+        w.Cloud.flush();
+      }
+    }
+
+    /* A tela já está desenhada: pode tirar o "Iniciando…" da frente. */
+    if (w.Updater && w.Updater.ready) w.Updater.ready();
+
+    /* A aprovação da versão vem só depois, quando ficou claro que o app
+       realmente subiu. Se algo quebrar antes disso, a casca desfaz a
+       atualização no próximo boot. */
+    setTimeout(function () {
+      if (w.$('.screen') && w.Updater && w.Updater.ok) w.Updater.ok();
+    }, 6000);
+
+    /* Procura atualização em segundo plano, sem instalar nada sozinho. */
+    if (w.Updater && w.Updater.configured && w.Updater.configured()) {
+      setTimeout(function () {
+        w.Updater.check().then(function (info) {
+          if (info.isNew) w.toast('Versão ' + info.version + ' disponível — veja em Ajustes.', 5000);
+        }).catch(function () {});
+      }, 6000);
+    }
+  }
+
+  /* Grava o progresso se o app for para segundo plano. */
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && w.Player.isOpen()) w.Cloud.flush();
+  });
+  w.addEventListener('beforeunload', function () { w.Cloud.flush(); });
+
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', start);
+  else start();
+
+})(window);

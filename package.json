@@ -1,0 +1,25 @@
+{
+  "name": "claudetv",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ClaudeTV - player de IPTV pessoal para LG webOS",
+  "scripts": {
+    "build": "node tools/build.js",
+    "dev": "node tools/dev-server.js",
+    "tv:setup": "ares-setup-device",
+    "tv:list": "ares-setup-device --list",
+    "tv:check": "ares-device --device tv --system-info",
+    "pack": "npm run build && ares-package app --outdir dist --no-minify",
+    "deploy": "npm run pack && ares-install --device tv dist/com.gabriel.claudetv_1.0.0_all.ipk && ares-launch --device tv com.gabriel.claudetv",
+    "publish": "npm run build && npm run check && git add -A && git commit -m \"nebula: nova versao\" && git push",
+    "launch": "ares-launch --device tv com.gabriel.claudetv",
+    "close": "ares-launch --device tv --close com.gabriel.claudetv",
+    "log": "ares-inspect --device tv --app com.gabriel.claudetv --open",
+    "remove": "ares-install --device tv --remove com.gabriel.claudetv",
+    "check": "node tools/check-secrets.js",
+    "tv:remove-antigo": "ares-install --device tv --remove com.gabriel.nebula"
+  },
+  "devDependencies": {
+    "@webos-tools/cli": "^3.2.5"
+  }
+}
