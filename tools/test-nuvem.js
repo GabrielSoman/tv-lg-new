@@ -187,6 +187,97 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
   ok('todas receberam escrita', tabelasEscritas(),
      ['channel_usage', 'favorites', 'series_state', 'settings_sync', 'watch_progress']);
 
+  console.log('\n6-B) O BANCO manda: o que some de lá some da TV');
+
+  /* Até aqui o Supabase de mentira devolvia `[]` em todo GET, e a
+     TV nunca perdia nada — que era exatamente o defeito: o `pull`
+     só acrescentava. Deste ponto em diante o mock passa a devolver
+     um conteúdo controlado, e o teste é sobre a TV OBEDECER. */
+  let bancoFake = {};
+  await page.unroute('**/rest/v1/**');
+  await page.route('**/rest/v1/**', async (route) => {
+    const req = route.request();
+    const tabela = new URL(req.url()).pathname.split('/rest/v1/')[1].split('?')[0];
+    if (req.method() !== 'GET') {
+      let corpo = null;
+      try { corpo = JSON.parse(req.postData() || 'null'); } catch (e) { corpo = null; }
+      registrar(tabela, req.method(), corpo);
+      return route.fulfill({ status: 200, contentType: 'application/json',
+                             headers: { 'Access-Control-Allow-Origin': '*' }, body: '' });
+    }
+    return route.fulfill({
+      status: 200, contentType: 'application/json',
+      headers: { 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify(bancoFake[tabela] || [])
+    });
+  });
+
+  /* Estado de partida: dois favoritos e um progresso, gravados na
+     TV e presentes no banco. */
+  bancoFake = {
+    favorites: [
+      { profile: 'teste', id: 'movie:1', kind: 'movie', title: 'Fica', poster: null,
+        chave: null, ordem: 0, created_at: '2026-01-01T00:00:00Z' },
+      { profile: 'teste', id: 'movie:2', kind: 'movie', title: 'Sai', poster: null,
+        chave: null, ordem: 0, created_at: '2026-01-01T00:00:00Z' }
+    ],
+    watch_progress: [
+      { id: 'movie:9', profile: 'teste', kind: 'movie', title: 'Progresso do banco',
+        position_sec: 100, duration_sec: 1000, completed: false,
+        updated_at: '2026-01-01T00:00:00Z' }
+    ],
+    channel_usage: [], series_state: [], settings_sync: []
+  };
+
+  await page.evaluate(() => Cloud.pull());
+  await espera(500);
+  ok('a leitura traz os favoritos do banco',
+     await page.evaluate(() => Store.favorites().map((f) => f.id).sort()),
+     ['movie:1', 'movie:2']);
+  ok('e o progresso do banco',
+     await page.evaluate(() => !!Store.progressOf('movie:9')), true);
+
+  /* Agora some com um deles NO BANCO, como se você tivesse
+     apagado a linha no Supabase. */
+  bancoFake.favorites = bancoFake.favorites.filter((f) => f.id !== 'movie:2');
+  bancoFake.watch_progress = [];
+
+  await page.evaluate(() => Cloud.pull());
+  await espera(500);
+  ok('apagar um favorito no banco apaga na TV',
+     await page.evaluate(() => Store.favorites().map((f) => f.id)), ['movie:1']);
+  ok('e o que sobrou continua lá',
+     await page.evaluate(() => Store.isFavorite('movie:1')), true);
+  ok('apagar o progresso no banco apaga na TV',
+     await page.evaluate(() => !!Store.progressOf('movie:9')), false);
+
+  /* O que ainda NÃO subiu é intocável: existe na TV e ainda não
+     existe no banco, e ler isso como "removido lá" apagaria o que
+     você acabou de fazer. */
+  ok('mas o que está na fila sobrevive à leitura', await (async () => {
+    /* Sem flush em seguida: o favorito fica só na fila. */
+    await page.evaluate(() =>
+      Store.toggleFavorite({ id: 'movie:77', kind: 'movie', title: 'Recém-marcado' }));
+    await page.evaluate(() => Cloud.pull());
+    await espera(400);
+    return page.evaluate(() => Store.isFavorite('movie:77'));
+  })(), true);
+
+  /* Banco fora do ar NÃO apaga nada. Falha de leitura é diferente
+     de tabela vazia, e confundir as duas coisas seria destruir o
+     histórico de quem ficou sem rede. */
+  ok('e uma FALHA de leitura não apaga nada', await (async () => {
+    await page.unroute('**/rest/v1/**');
+    await page.route('**/rest/v1/**', (r) =>
+      r.request().method() === 'GET'
+        ? r.fulfill({ status: 500, body: 'erro' })
+        : r.fulfill({ status: 200, contentType: 'application/json',
+                      headers: { 'Access-Control-Allow-Origin': '*' }, body: '' }));
+    await page.evaluate(() => Cloud.pull());
+    await espera(400);
+    return page.evaluate(() => Store.favorites().length > 0);
+  })(), true);
+
   console.log('\n7) Conteúdo adulto não chega ao banco');
   const antesAdulto = JSON.stringify(escritas);
   await page.evaluate(() => {

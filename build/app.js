@@ -393,6 +393,55 @@ window.CFG = {
     return (w.Cloud && w.Cloud.enabled && w.Cloud.enabled()) ? w.Cloud : null;
   }
 
+  /* -----------------------------------------------------------
+     Reconciliar: o banco manda
+     -----------------------------------------------------------
+     Recebe a lista COMPLETA que o banco devolveu e substitui o
+     mapa local por ela. Some do banco, some da TV — que é o
+     comportamento que faltava e que fazia o banco parecer
+     enfeite: apagar uma linha lá não tinha efeito nenhum aqui.
+
+     Duas garantias:
+
+     · o que ainda está na fila de subida é preservado. Ele existe
+       na TV e ainda não existe no banco; ler isso como "foi
+       removido lá" apagaria o que você acabou de fazer;
+
+     · isto só roda quando a leitura DEU CERTO. Banco fora do ar
+       não apaga nada — quem chama trata o erro antes de chegar
+       aqui. Uma tabela que voltou vazia, por outro lado, é uma
+       resposta de verdade e é aplicada.
+
+     Devolve quantas linhas mudaram, para quem quiser redesenhar.
+     ----------------------------------------------------------- */
+  function reconciliar(mapa, rows, chaveDe, protegidos, gravarEm) {
+    var novo = {};
+
+    (rows || []).forEach(function (r) {
+      var k = r && chaveDe(r);
+      if (k) novo[k] = r;
+    });
+
+    /* A fila tem prioridade sobre o banco, e não o contrário: se
+       a linha está esperando para subir, a versão da TV é a mais
+       nova por definição. */
+    (protegidos || []).forEach(function (k) {
+      if (mapa[k]) novo[k] = mapa[k];
+    });
+
+    /* A contagem vem DEPOIS de restaurar a fila. Contando antes,
+       uma linha protegida entraria como "sumiu" e o app pediria
+       um redesenho por uma mudança que não houve. */
+    var mudou = 0;
+    Object.keys(novo).forEach(function (k) {
+      if (!mapa[k] || JSON.stringify(mapa[k]) !== JSON.stringify(novo[k])) mudou++;
+    });
+    Object.keys(mapa).forEach(function (k) { if (!novo[k]) mudou++; });
+
+    if (mudou) write(gravarEm, novo);
+    return { mapa: novo, mudou: mudou };
+  }
+
   w.Store = {
 
     /* ---------------- Ajustes ---------------- */
@@ -515,6 +564,13 @@ window.CFG = {
       return mudou;
     },
 
+    reconciliarFavoritos: function (rows, protegidos) {
+      var r = reconciliar(favorites, rows, function (x) { return x.id; },
+                          protegidos, K_FAVORITES);
+      favorites = r.mapa;
+      return r.mudou;
+    },
+
     /* ---------------- Hábito de canal ----------------
        Ao vivo não tem "onde parei", mas TEM "o que eu vejo".
        Aberturas ordenam a lista; segundos dizem o que você
@@ -606,6 +662,13 @@ window.CFG = {
       return mudou;
     },
 
+    reconciliarCanais: function (rows, protegidos) {
+      var r = reconciliar(channels, rows, function (x) { return x.chave || x.id; },
+                          protegidos, K_CHANNELS);
+      channels = r.mapa;
+      return r.mudou;
+    },
+
     /* ---------------- Estado da série ----------------
        Responde "em que ponto da série eu estou", que é outra
        pergunta que "quanto deste episódio eu vi". Sem isto o
@@ -651,6 +714,13 @@ window.CFG = {
       return mudou;
     },
 
+    reconciliarSeries: function (rows, protegidos) {
+      var r = reconciliar(series, rows, function (x) { return String(x.series_id); },
+                          protegidos, K_SERIES);
+      series = r.mapa;
+      return r.mudou;
+    },
+
     /* ---------------- Progresso ---------------- */
     progressOf: function (id) { return progress[id] || null; },
 
@@ -668,6 +738,14 @@ window.CFG = {
       });
       if (changed) { w.Store._trim(); write(K_PROGRESS, progress); }
       return changed;
+    },
+
+    reconciliarProgresso: function (rows, protegidos) {
+      var r = reconciliar(progress, rows, function (x) { return x.id; },
+                          protegidos, K_PROGRESS);
+      progress = r.mapa;
+      if (r.mudou) { w.Store._trim(); write(K_PROGRESS, progress); }
+      return r.mudou;
     },
 
     saveProgress: function (rec) {
@@ -827,6 +905,7 @@ window.CFG = {
   var flushing = false;
   var lastError = null;
   var erroDe = {};          /* último erro por tabela */
+  var ultimaLeitura = null; /* quando o banco foi lido pela última vez */
 
   /* -----------------------------------------------------------
      As tabelas
@@ -1034,13 +1113,30 @@ window.CFG = {
     }
   };
 
-  /* Para onde cada tabela deságua ao voltar do banco. */
+  /* -----------------------------------------------------------
+     Para onde cada tabela deságua ao voltar do banco
+     -----------------------------------------------------------
+     Quatro delas RECONCILIAM: o que voltou do banco passa a ser a
+     lista, inteira. Some do banco, some da TV.
+
+     Isso é uma inversão em relação a como estava, e é o ponto
+     principal. Antes a TV era a dona e a nuvem recebia cópia: o
+     `pull` só acrescentava o que fosse mais recente e nunca tirava
+     nada. Consequência exata do que você viu — apagar uma linha no
+     Supabase não fazia diferença nenhuma, e o app parecia rodar
+     sozinho, com o banco de enfeite.
+
+     `ajustes` é a exceção e continua fundindo por data. Preferência
+     não é conteúdo: uma leitura parcial do banco não pode zerar o
+     que você escolheu na tela, e um banco vazio na primeira vez não
+     pode desfazer suas opções todo boot.
+     ----------------------------------------------------------- */
   var funde = {
-    progresso: function (rs) { return w.Store.mergeProgress(rs); },
-    favoritos: function (rs) { return w.Store.mergeFavorites(rs); },
-    canais:    function (rs) { return w.Store.mergeChannels(rs); },
-    series:    function (rs) { return w.Store.mergeSeries(rs); },
-    ajustes:   function (rs) { return w.Store.mergeSettings(rs); }
+    progresso: function (rs, p) { return w.Store.reconciliarProgresso(rs, p); },
+    favoritos: function (rs, p) { return w.Store.reconciliarFavoritos(rs, p); },
+    canais:    function (rs, p) { return w.Store.reconciliarCanais(rs, p); },
+    series:    function (rs, p) { return w.Store.reconciliarSeries(rs, p); },
+    ajustes:   function (rs)    { return w.Store.mergeSettings(rs); }
   };
 
   /* Quantas linhas trazer de cada tabela, e por qual coluna
@@ -1184,9 +1280,18 @@ window.CFG = {
        registros mudaram alguma coisa na TV. Uma tabela que
        falha vale zero e não derruba as outras.
        ------------------------------------------------------- */
+    /* Quando a última leitura do banco deu certo. */
+    ultimaLeitura: function () { return ultimaLeitura; },
+
     pull: function () {
       var c = cfg();
       if (!c) return Promise.resolve(0);
+
+      /* O que ainda não subiu é intocável. Sem esta lista, uma
+         leitura logo depois de você favoritar algo apagaria o
+         favorito — ele existe na TV e ainda não existe no banco,
+         e a reconciliação leria isso como "foi removido lá". */
+      var fila = loadQueue();
 
       return Promise.all(CHAVES.map(function (k) {
         var url = endpoint(k) + '?select=*&' + filtroPerfil() +
@@ -1194,8 +1299,14 @@ window.CFG = {
         return w.fetchJSON(url, { headers: headers(), raw: true })
           .then(function (rows) {
             erroDe[k] = null;
-            if (!rows || !rows.length) return 0;
-            return funde[k](rows.map(vindoDe[k])) || 0;
+            ultimaLeitura = agora();
+            /* Uma tabela vazia é uma resposta legítima e precisa
+               ser aplicada: "não há nada aqui" é diferente de
+               "não consegui ler". Só o `catch` abaixo significa
+               a segunda coisa, e é o único caso em que a TV
+               mantém o que tinha. */
+            var lista = (rows || []).map(vindoDe[k]);
+            return funde[k](lista, Object.keys(fila[k] || {})) || 0;
           })
           .catch(function (e) {
             erroDe[k] = e.message;
@@ -1205,6 +1316,16 @@ window.CFG = {
       })).then(function (ns) {
         return ns.reduce(function (a, b) { return a + b; }, 0);
       });
+    },
+
+    /* Uma volta completa: sobe o que está na fila e, logo depois,
+       relê o banco inteiro. É esta ordem que importa — ler antes
+       de enviar faria a leitura apagar o que ainda ia subir. */
+    sincronizar: function () {
+      if (!cfg()) return Promise.resolve(0);
+      return Promise.resolve(w.Cloud.flush())
+        .then(function () { return w.Cloud.pull(); })
+        .catch(function () { return 0; });
     },
 
     /* -------------------------------------------------------
@@ -6822,8 +6943,15 @@ window.CFG = {
        tela. */
 
     /* --- dados --- */
-    var pD = painel('Dados', 'Cache do catálogo e sincronização do histórico.');
+    var pD = painel('Dados',
+      'O banco é a fonte da verdade: o que você apagar lá some da TV na ' +
+      'próxima leitura. Sem banco, o app funciona igual — só não guarda ' +
+      'favoritos nem retomada.');
     pD.appendChild(linha('Blocos em memória', w.Catalog.emMemoria()));
+
+    var lida = w.Cloud.ultimaLeitura && w.Cloud.ultimaLeitura();
+    pD.appendChild(linha('Última leitura do banco',
+      lida ? new Date(lida).toLocaleTimeString('pt-BR') : 'ainda não'));
 
     /* Estado do banco, escrito em português claro. Ele estava
        desligado na TV e não havia como saber olhando a tela. */
@@ -6891,6 +7019,35 @@ window.CFG = {
          você assistiu até agora nunca chegou a entrar na fila.
          Conectar depois não recupera sozinho; precisa reenviar.
          ------------------------------------------------------- */
+      /* -------------------------------------------------------
+         Ler o banco agora
+         -------------------------------------------------------
+         O caminho normal já faz isso sozinho — ao abrir o app, ao
+         voltar para a tela inicial, ao sair do segundo plano e de
+         cinco em cinco minutos. Este botão é para quando você
+         acabou de mexer no Supabase e quer ver o efeito sem
+         esperar.
+         ------------------------------------------------------- */
+      var bLer = el('button', { class: 'btn', 'data-focusable': '' });
+      bLer.innerHTML = w.icon('down') + '<span>Ler o banco agora</span>';
+      bLer.onclick = function () {
+        var t = bLer.querySelector('span');
+        t.textContent = 'Lendo…';
+        w.Cloud.sincronizar()
+          .then(function (n) {
+            t.textContent = n
+              ? n + ' registro(s) mudaram — a TV está igual ao banco'
+              : 'A TV já estava igual ao banco';
+          })
+          .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
+      };
+      pD.appendChild(bLer);
+
+      /* Este é o inverso, e é perigoso de propósito: manda para o
+         banco o que existe na TV. Serve para a primeira carga, ou
+         para o dia em que o banco esteve desligado. Depois que a
+         reconciliação está funcionando, usar isto ressuscita no
+         banco o que você tiver apagado lá e ainda estiver aqui. */
       var bTudo = el('button', { class: 'btn ghost', 'data-focusable': '' });
       bTudo.innerHTML = '<span>Enviar tudo o que está na TV</span>';
       bTudo.onclick = function () {
@@ -7110,6 +7267,63 @@ window.CFG = {
       console.error('Falha ao montar a tela ' + route, e);
       w.toast('Algo quebrou ao abrir esta tela.');
     }
+    if (route === 'home') sincronizar();
+  }
+
+  /* ---------------------------------------------------------
+     Sincronização: uma volta completa com o banco
+     ---------------------------------------------------------
+     Sobe a fila, relê o banco inteiro, e redesenha se algo mudou.
+     Rodava só no boot — e como o `pull` de então nunca tirava
+     nada, uma linha apagada no Supabase continuava na TV para
+     sempre. Agora roda:
+
+       · ao abrir o app;
+       · toda vez que a tela inicial é montada;
+       · quando o app volta do segundo plano;
+       · e de cinco em cinco minutos, de fundo.
+
+     O estrangulamento de 45 segundos existe porque entrar e sair
+     da tela inicial é o movimento mais comum do controle, e cada
+     volta são cinco requisições.
+
+     Redesenhar tem uma regra: só quando o foco está no destaque
+     ou no menu. Refazer a tela sob os pés de quem está rolando
+     uma fileira joga o foco para o topo, e perder o lugar é pior
+     do que ver a novidade meio minuto depois. Quando não dá para
+     redesenhar agora, fica anotado e a próxima montagem da tela
+     inicial mostra.
+     --------------------------------------------------------- */
+  var ULTIMA_SINC = 0;
+  var INTERVALO_SINC = 45000;
+  var mudouEsperando = false;
+
+  function podeRedesenhar() {
+    if (currentRoute !== 'home') return false;
+    var f = w.Nav.current();
+    if (!f || !f.closest) return true;
+    return !!(f.closest('#rail') || f.closest('.hero'));
+  }
+
+  function sincronizar(forcar) {
+    if (!w.Cloud.enabled()) return Promise.resolve(0);
+    var agora = Date.now();
+    if (!forcar && agora - ULTIMA_SINC < INTERVALO_SINC) {
+      /* Não sincroniza, mas se ficou algo pendente da última vez,
+         esta é a hora de mostrar. */
+      if (mudouEsperando && currentRoute === 'home') {
+        mudouEsperando = false;
+        setTimeout(function () { if (currentRoute === 'home') w.App.reload(); }, 0);
+      }
+      return Promise.resolve(0);
+    }
+    ULTIMA_SINC = agora;
+    return w.Cloud.sincronizar().then(function (n) {
+      if (!n) return 0;
+      if (podeRedesenhar()) w.App.reload();
+      else mudouEsperando = true;
+      return n;
+    }).catch(function () { return 0; });
   }
 
   w.App = {
@@ -7308,9 +7522,7 @@ window.CFG = {
     applyDefaults(false);
     if (!antes && w.Cloud.enabled()) {
       w.toast('Banco de dados conectado — histórico volta a sincronizar.', 5000);
-      w.Cloud.pull().then(function (n) {
-        if (n && w.App.current() === 'home') w.App.reload();
-      }).catch(function () {});
+      sincronizar(true);
     }
   }
 
@@ -7364,13 +7576,9 @@ window.CFG = {
       w.App.go('setup', null, { replace: true });
     } else {
       w.App.go('home', null, { replace: true });
-      /* Traz o histórico da nuvem sem travar a tela. */
-      if (w.Cloud.enabled()) {
-        w.Cloud.pull().then(function (n) {
-          if (n && w.App.current() === 'home') w.App.reload();
-        });
-        w.Cloud.flush();
-      }
+      /* `render('home')` já dispara a sincronização; aqui só se
+         garante que ela não caia no estrangulamento do boot. */
+      sincronizar(true);
     }
 
     /* A tela já está desenhada: pode tirar o "Iniciando…" da frente. */
@@ -7417,9 +7625,24 @@ window.CFG = {
 
   /* Grava o progresso se o app for para segundo plano. */
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden && w.Player.isOpen()) w.Cloud.flush();
+    if (document.hidden) {
+      if (w.Player.isOpen()) w.Cloud.flush();
+      return;
+    }
+    /* Voltou do segundo plano: o banco pode ter mudado noutra TV,
+       ou na tela do Supabase. Força a leitura sem esperar o
+       intervalo — é o momento em que a defasagem mais incomoda. */
+    sincronizar(true);
   });
   w.addEventListener('beforeunload', function () { w.Cloud.flush(); });
+
+  /* De fundo, a cada cinco minutos. Cinco requisições pequenas —
+     e é o que faz uma exclusão feita no Supabase aparecer na TV
+     sozinha, sem precisar reabrir o app. */
+  setInterval(function () {
+    if (document.hidden || w.Player.isOpen()) return;
+    sincronizar(true);
+  }, 5 * 60 * 1000);
 
   if (document.readyState === 'loading')
     document.addEventListener('DOMContentLoaded', start);

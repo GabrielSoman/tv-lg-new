@@ -38,6 +38,63 @@
       console.error('Falha ao montar a tela ' + route, e);
       w.toast('Algo quebrou ao abrir esta tela.');
     }
+    if (route === 'home') sincronizar();
+  }
+
+  /* ---------------------------------------------------------
+     Sincronização: uma volta completa com o banco
+     ---------------------------------------------------------
+     Sobe a fila, relê o banco inteiro, e redesenha se algo mudou.
+     Rodava só no boot — e como o `pull` de então nunca tirava
+     nada, uma linha apagada no Supabase continuava na TV para
+     sempre. Agora roda:
+
+       · ao abrir o app;
+       · toda vez que a tela inicial é montada;
+       · quando o app volta do segundo plano;
+       · e de cinco em cinco minutos, de fundo.
+
+     O estrangulamento de 45 segundos existe porque entrar e sair
+     da tela inicial é o movimento mais comum do controle, e cada
+     volta são cinco requisições.
+
+     Redesenhar tem uma regra: só quando o foco está no destaque
+     ou no menu. Refazer a tela sob os pés de quem está rolando
+     uma fileira joga o foco para o topo, e perder o lugar é pior
+     do que ver a novidade meio minuto depois. Quando não dá para
+     redesenhar agora, fica anotado e a próxima montagem da tela
+     inicial mostra.
+     --------------------------------------------------------- */
+  var ULTIMA_SINC = 0;
+  var INTERVALO_SINC = 45000;
+  var mudouEsperando = false;
+
+  function podeRedesenhar() {
+    if (currentRoute !== 'home') return false;
+    var f = w.Nav.current();
+    if (!f || !f.closest) return true;
+    return !!(f.closest('#rail') || f.closest('.hero'));
+  }
+
+  function sincronizar(forcar) {
+    if (!w.Cloud.enabled()) return Promise.resolve(0);
+    var agora = Date.now();
+    if (!forcar && agora - ULTIMA_SINC < INTERVALO_SINC) {
+      /* Não sincroniza, mas se ficou algo pendente da última vez,
+         esta é a hora de mostrar. */
+      if (mudouEsperando && currentRoute === 'home') {
+        mudouEsperando = false;
+        setTimeout(function () { if (currentRoute === 'home') w.App.reload(); }, 0);
+      }
+      return Promise.resolve(0);
+    }
+    ULTIMA_SINC = agora;
+    return w.Cloud.sincronizar().then(function (n) {
+      if (!n) return 0;
+      if (podeRedesenhar()) w.App.reload();
+      else mudouEsperando = true;
+      return n;
+    }).catch(function () { return 0; });
   }
 
   w.App = {
@@ -236,9 +293,7 @@
     applyDefaults(false);
     if (!antes && w.Cloud.enabled()) {
       w.toast('Banco de dados conectado — histórico volta a sincronizar.', 5000);
-      w.Cloud.pull().then(function (n) {
-        if (n && w.App.current() === 'home') w.App.reload();
-      }).catch(function () {});
+      sincronizar(true);
     }
   }
 
@@ -292,13 +347,9 @@
       w.App.go('setup', null, { replace: true });
     } else {
       w.App.go('home', null, { replace: true });
-      /* Traz o histórico da nuvem sem travar a tela. */
-      if (w.Cloud.enabled()) {
-        w.Cloud.pull().then(function (n) {
-          if (n && w.App.current() === 'home') w.App.reload();
-        });
-        w.Cloud.flush();
-      }
+      /* `render('home')` já dispara a sincronização; aqui só se
+         garante que ela não caia no estrangulamento do boot. */
+      sincronizar(true);
     }
 
     /* A tela já está desenhada: pode tirar o "Iniciando…" da frente. */
@@ -345,9 +396,24 @@
 
   /* Grava o progresso se o app for para segundo plano. */
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden && w.Player.isOpen()) w.Cloud.flush();
+    if (document.hidden) {
+      if (w.Player.isOpen()) w.Cloud.flush();
+      return;
+    }
+    /* Voltou do segundo plano: o banco pode ter mudado noutra TV,
+       ou na tela do Supabase. Força a leitura sem esperar o
+       intervalo — é o momento em que a defasagem mais incomoda. */
+    sincronizar(true);
   });
   w.addEventListener('beforeunload', function () { w.Cloud.flush(); });
+
+  /* De fundo, a cada cinco minutos. Cinco requisições pequenas —
+     e é o que faz uma exclusão feita no Supabase aparecer na TV
+     sozinha, sem precisar reabrir o app. */
+  setInterval(function () {
+    if (document.hidden || w.Player.isOpen()) return;
+    sincronizar(true);
+  }, 5 * 60 * 1000);
 
   if (document.readyState === 'loading')
     document.addEventListener('DOMContentLoaded', start);

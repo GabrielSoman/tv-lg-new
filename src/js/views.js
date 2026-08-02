@@ -1667,8 +1667,15 @@
        tela. */
 
     /* --- dados --- */
-    var pD = painel('Dados', 'Cache do catálogo e sincronização do histórico.');
+    var pD = painel('Dados',
+      'O banco é a fonte da verdade: o que você apagar lá some da TV na ' +
+      'próxima leitura. Sem banco, o app funciona igual — só não guarda ' +
+      'favoritos nem retomada.');
     pD.appendChild(linha('Blocos em memória', w.Catalog.emMemoria()));
+
+    var lida = w.Cloud.ultimaLeitura && w.Cloud.ultimaLeitura();
+    pD.appendChild(linha('Última leitura do banco',
+      lida ? new Date(lida).toLocaleTimeString('pt-BR') : 'ainda não'));
 
     /* Estado do banco, escrito em português claro. Ele estava
        desligado na TV e não havia como saber olhando a tela. */
@@ -1736,6 +1743,35 @@
          você assistiu até agora nunca chegou a entrar na fila.
          Conectar depois não recupera sozinho; precisa reenviar.
          ------------------------------------------------------- */
+      /* -------------------------------------------------------
+         Ler o banco agora
+         -------------------------------------------------------
+         O caminho normal já faz isso sozinho — ao abrir o app, ao
+         voltar para a tela inicial, ao sair do segundo plano e de
+         cinco em cinco minutos. Este botão é para quando você
+         acabou de mexer no Supabase e quer ver o efeito sem
+         esperar.
+         ------------------------------------------------------- */
+      var bLer = el('button', { class: 'btn', 'data-focusable': '' });
+      bLer.innerHTML = w.icon('down') + '<span>Ler o banco agora</span>';
+      bLer.onclick = function () {
+        var t = bLer.querySelector('span');
+        t.textContent = 'Lendo…';
+        w.Cloud.sincronizar()
+          .then(function (n) {
+            t.textContent = n
+              ? n + ' registro(s) mudaram — a TV está igual ao banco'
+              : 'A TV já estava igual ao banco';
+          })
+          .catch(function (e) { t.textContent = 'Falhou: ' + e.message; });
+      };
+      pD.appendChild(bLer);
+
+      /* Este é o inverso, e é perigoso de propósito: manda para o
+         banco o que existe na TV. Serve para a primeira carga, ou
+         para o dia em que o banco esteve desligado. Depois que a
+         reconciliação está funcionando, usar isto ressuscita no
+         banco o que você tiver apagado lá e ainda estiver aqui. */
       var bTudo = el('button', { class: 'btn ghost', 'data-focusable': '' });
       bTudo.innerHTML = '<span>Enviar tudo o que está na TV</span>';
       bTudo.onclick = function () {

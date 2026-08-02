@@ -28,6 +28,7 @@
   var flushing = false;
   var lastError = null;
   var erroDe = {};          /* último erro por tabela */
+  var ultimaLeitura = null; /* quando o banco foi lido pela última vez */
 
   /* -----------------------------------------------------------
      As tabelas
@@ -235,13 +236,30 @@
     }
   };
 
-  /* Para onde cada tabela deságua ao voltar do banco. */
+  /* -----------------------------------------------------------
+     Para onde cada tabela deságua ao voltar do banco
+     -----------------------------------------------------------
+     Quatro delas RECONCILIAM: o que voltou do banco passa a ser a
+     lista, inteira. Some do banco, some da TV.
+
+     Isso é uma inversão em relação a como estava, e é o ponto
+     principal. Antes a TV era a dona e a nuvem recebia cópia: o
+     `pull` só acrescentava o que fosse mais recente e nunca tirava
+     nada. Consequência exata do que você viu — apagar uma linha no
+     Supabase não fazia diferença nenhuma, e o app parecia rodar
+     sozinho, com o banco de enfeite.
+
+     `ajustes` é a exceção e continua fundindo por data. Preferência
+     não é conteúdo: uma leitura parcial do banco não pode zerar o
+     que você escolheu na tela, e um banco vazio na primeira vez não
+     pode desfazer suas opções todo boot.
+     ----------------------------------------------------------- */
   var funde = {
-    progresso: function (rs) { return w.Store.mergeProgress(rs); },
-    favoritos: function (rs) { return w.Store.mergeFavorites(rs); },
-    canais:    function (rs) { return w.Store.mergeChannels(rs); },
-    series:    function (rs) { return w.Store.mergeSeries(rs); },
-    ajustes:   function (rs) { return w.Store.mergeSettings(rs); }
+    progresso: function (rs, p) { return w.Store.reconciliarProgresso(rs, p); },
+    favoritos: function (rs, p) { return w.Store.reconciliarFavoritos(rs, p); },
+    canais:    function (rs, p) { return w.Store.reconciliarCanais(rs, p); },
+    series:    function (rs, p) { return w.Store.reconciliarSeries(rs, p); },
+    ajustes:   function (rs)    { return w.Store.mergeSettings(rs); }
   };
 
   /* Quantas linhas trazer de cada tabela, e por qual coluna
@@ -385,9 +403,18 @@
        registros mudaram alguma coisa na TV. Uma tabela que
        falha vale zero e não derruba as outras.
        ------------------------------------------------------- */
+    /* Quando a última leitura do banco deu certo. */
+    ultimaLeitura: function () { return ultimaLeitura; },
+
     pull: function () {
       var c = cfg();
       if (!c) return Promise.resolve(0);
+
+      /* O que ainda não subiu é intocável. Sem esta lista, uma
+         leitura logo depois de você favoritar algo apagaria o
+         favorito — ele existe na TV e ainda não existe no banco,
+         e a reconciliação leria isso como "foi removido lá". */
+      var fila = loadQueue();
 
       return Promise.all(CHAVES.map(function (k) {
         var url = endpoint(k) + '?select=*&' + filtroPerfil() +
@@ -395,8 +422,14 @@
         return w.fetchJSON(url, { headers: headers(), raw: true })
           .then(function (rows) {
             erroDe[k] = null;
-            if (!rows || !rows.length) return 0;
-            return funde[k](rows.map(vindoDe[k])) || 0;
+            ultimaLeitura = agora();
+            /* Uma tabela vazia é uma resposta legítima e precisa
+               ser aplicada: "não há nada aqui" é diferente de
+               "não consegui ler". Só o `catch` abaixo significa
+               a segunda coisa, e é o único caso em que a TV
+               mantém o que tinha. */
+            var lista = (rows || []).map(vindoDe[k]);
+            return funde[k](lista, Object.keys(fila[k] || {})) || 0;
           })
           .catch(function (e) {
             erroDe[k] = e.message;
@@ -406,6 +439,16 @@
       })).then(function (ns) {
         return ns.reduce(function (a, b) { return a + b; }, 0);
       });
+    },
+
+    /* Uma volta completa: sobe o que está na fila e, logo depois,
+       relê o banco inteiro. É esta ordem que importa — ler antes
+       de enviar faria a leitura apagar o que ainda ia subir. */
+    sincronizar: function () {
+      if (!cfg()) return Promise.resolve(0);
+      return Promise.resolve(w.Cloud.flush())
+        .then(function () { return w.Cloud.pull(); })
+        .catch(function () { return 0; });
     },
 
     /* -------------------------------------------------------

@@ -100,6 +100,55 @@
     return (w.Cloud && w.Cloud.enabled && w.Cloud.enabled()) ? w.Cloud : null;
   }
 
+  /* -----------------------------------------------------------
+     Reconciliar: o banco manda
+     -----------------------------------------------------------
+     Recebe a lista COMPLETA que o banco devolveu e substitui o
+     mapa local por ela. Some do banco, some da TV — que é o
+     comportamento que faltava e que fazia o banco parecer
+     enfeite: apagar uma linha lá não tinha efeito nenhum aqui.
+
+     Duas garantias:
+
+     · o que ainda está na fila de subida é preservado. Ele existe
+       na TV e ainda não existe no banco; ler isso como "foi
+       removido lá" apagaria o que você acabou de fazer;
+
+     · isto só roda quando a leitura DEU CERTO. Banco fora do ar
+       não apaga nada — quem chama trata o erro antes de chegar
+       aqui. Uma tabela que voltou vazia, por outro lado, é uma
+       resposta de verdade e é aplicada.
+
+     Devolve quantas linhas mudaram, para quem quiser redesenhar.
+     ----------------------------------------------------------- */
+  function reconciliar(mapa, rows, chaveDe, protegidos, gravarEm) {
+    var novo = {};
+
+    (rows || []).forEach(function (r) {
+      var k = r && chaveDe(r);
+      if (k) novo[k] = r;
+    });
+
+    /* A fila tem prioridade sobre o banco, e não o contrário: se
+       a linha está esperando para subir, a versão da TV é a mais
+       nova por definição. */
+    (protegidos || []).forEach(function (k) {
+      if (mapa[k]) novo[k] = mapa[k];
+    });
+
+    /* A contagem vem DEPOIS de restaurar a fila. Contando antes,
+       uma linha protegida entraria como "sumiu" e o app pediria
+       um redesenho por uma mudança que não houve. */
+    var mudou = 0;
+    Object.keys(novo).forEach(function (k) {
+      if (!mapa[k] || JSON.stringify(mapa[k]) !== JSON.stringify(novo[k])) mudou++;
+    });
+    Object.keys(mapa).forEach(function (k) { if (!novo[k]) mudou++; });
+
+    if (mudou) write(gravarEm, novo);
+    return { mapa: novo, mudou: mudou };
+  }
+
   w.Store = {
 
     /* ---------------- Ajustes ---------------- */
@@ -222,6 +271,13 @@
       return mudou;
     },
 
+    reconciliarFavoritos: function (rows, protegidos) {
+      var r = reconciliar(favorites, rows, function (x) { return x.id; },
+                          protegidos, K_FAVORITES);
+      favorites = r.mapa;
+      return r.mudou;
+    },
+
     /* ---------------- Hábito de canal ----------------
        Ao vivo não tem "onde parei", mas TEM "o que eu vejo".
        Aberturas ordenam a lista; segundos dizem o que você
@@ -313,6 +369,13 @@
       return mudou;
     },
 
+    reconciliarCanais: function (rows, protegidos) {
+      var r = reconciliar(channels, rows, function (x) { return x.chave || x.id; },
+                          protegidos, K_CHANNELS);
+      channels = r.mapa;
+      return r.mudou;
+    },
+
     /* ---------------- Estado da série ----------------
        Responde "em que ponto da série eu estou", que é outra
        pergunta que "quanto deste episódio eu vi". Sem isto o
@@ -358,6 +421,13 @@
       return mudou;
     },
 
+    reconciliarSeries: function (rows, protegidos) {
+      var r = reconciliar(series, rows, function (x) { return String(x.series_id); },
+                          protegidos, K_SERIES);
+      series = r.mapa;
+      return r.mudou;
+    },
+
     /* ---------------- Progresso ---------------- */
     progressOf: function (id) { return progress[id] || null; },
 
@@ -375,6 +445,14 @@
       });
       if (changed) { w.Store._trim(); write(K_PROGRESS, progress); }
       return changed;
+    },
+
+    reconciliarProgresso: function (rows, protegidos) {
+      var r = reconciliar(progress, rows, function (x) { return x.id; },
+                          protegidos, K_PROGRESS);
+      progress = r.mapa;
+      if (r.mudou) { w.Store._trim(); write(K_PROGRESS, progress); }
+      return r.mudou;
     },
 
     saveProgress: function (rec) {
