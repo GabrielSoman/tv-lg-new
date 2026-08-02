@@ -130,10 +130,22 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
   ok('e com o perfil certo',
      escritas['favorites'] && escritas['favorites'][0].corpo[0].profile, 'teste');
 
+  /* Espera por uma condição AQUI no node — o DELETE é disparado
+     sem `await` do lado da página, e um `sleep` fixo transforma
+     isso num teste que falha de vez em quando por causa da
+     máquina, não do código. */
+  const ateAqui = async (fn, ms = 8000) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (fn()) return true;
+      await espera(80);
+    }
+    return false;
+  };
+
   ok('desfavoritar apaga no banco', await (async () => {
     await page.evaluate(() => Store.toggleFavorite({ id: 'movie:4242', kind: 'movie' }));
-    await espera(400);
-    return (escritas['favorites'] || []).some((e) => e.metodo === 'DELETE');
+    return ateAqui(() => (escritas['favorites'] || []).some((e) => e.metodo === 'DELETE'));
   })(), true);
 
   console.log('\n3) Hábito de canal vai para channel_usage');
@@ -332,6 +344,54 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
   }), true);
 
   ok('a fileira chega aos dez', nums.length >= 5 && nums.length <= 10, true);
+
+  /* -------------------------------------------------------
+     E são as novidades DE VERDADE
+     -------------------------------------------------------
+     A conta era feita sobre a pasta cortada nos 60 primeiros, e
+     os 60 primeiros vêm na ordem do provedor, que não é ordem de
+     chegada. A abertura anunciava como novidade o começo da
+     lista, e a mesma pasta ordenada por "Recentes" mostrava
+     coisas mais novas que não estavam no Top 10.
+     ------------------------------------------------------- */
+  const datas = await page.evaluate(() => {
+    const f = Array.prototype.slice.call(document.querySelectorAll('.row'))
+      .filter((r) => /Top 10/.test(r.textContent))[0];
+    return Array.prototype.slice.call(f.querySelectorAll('.card'))
+      .map((c) => c._item.added || 0);
+  });
+  ok('a fileira está em ordem decrescente de chegada',
+     datas.every((d, i) => i === 0 || datas[i - 1] >= d), true);
+
+  /* A prova de que a pasta inteira foi considerada: o mais novo
+     de uma pasta de 600 itens não está nos 60 primeiros que o
+     provedor manda — se estivesse na fileira só por acaso, este
+     teste não passaria de forma estável. */
+  const olhouAPastaInteira = await page.evaluate(async (m) => {
+    const cats = await Catalog.categorias('movie');
+    const util = cats.filter((c) => !Catalog.ehAdulta(c.nome));
+    for (const c of util) {
+      const itens = await Catalog.itens('movie', c.id);
+      if (itens.length < 100) continue;
+      const maior = itens.reduce((a, b) => ((b.added || 0) > (a.added || 0) ? b : a));
+      const posicao = itens.indexOf(maior);
+      if (posicao > 60) return { pasta: c.nome, posicao: posicao, titulo: maior.title };
+    }
+    return null;
+  }, MOCK);
+  ok('há uma pasta cujo item mais novo está além dos 60 primeiros',
+     !!olhouAPastaInteira, true);
+  if (olhouAPastaInteira) {
+    console.log(`         "${olhouAPastaInteira.titulo}" é o mais novo de ` +
+                `"${olhouAPastaInteira.pasta}", na posição ${olhouAPastaInteira.posicao}`);
+    ok('e o Top 10 da abertura o inclui — logo, olhou a pasta inteira',
+       await page.evaluate((t) => {
+         const f = Array.prototype.slice.call(document.querySelectorAll('.row'))
+           .filter((r) => /Top 10/.test(r.textContent))[0];
+         return Array.prototype.slice.call(f.querySelectorAll('.card'))
+           .some((c) => c._item.title === t);
+       }, olhouAPastaInteira.titulo), true);
+  }
 
   console.log('\n9) O trailer da abertura');
   const veioTrailer = await ate(() => !!document.querySelector('.hero-trailer iframe'), null, 12000);

@@ -5526,9 +5526,33 @@ window.CFG = {
   /* -----------------------------------------------------------
      Navegar: coluna de categorias + grade
      ----------------------------------------------------------- */
+  /* -----------------------------------------------------------
+     O que a tela de pastas lembra entre uma visita e outra
+     -----------------------------------------------------------
+     Abrir um filme e voltar refazia a tela do zero: a pasta
+     voltava a ser a primeira, a ordenação voltava a "Da pasta" e
+     o filtro digitado sumia. Ordenar por nota, entrar num título
+     e perder a ordenação é perder o trabalho de escolher.
+
+     A memória é de UMA VIAGEM, não da sessão: ela é escrita no
+     instante em que você abre um título e consumida na primeira
+     montagem seguinte da tela. Depois disso some.
+
+     Essa validade curta é o ponto. Guardar para sempre entraria
+     em conflito com uma decisão anterior que continua certa —
+     entrar em Filmes pelo menu abre em "Todos", porque cair numa
+     pasta arbitrária do provedor é uma escolha que ninguém pediu.
+     Uma coisa é "eu voltei do filme que abri"; outra é "eu entrei
+     em Filmes de novo". Só a primeira pede continuidade.
+     ----------------------------------------------------------- */
+  var memoriaPasta = {};
+
   function navegar(tipo, forma) {
     var tela = w.UI.tela('nav-' + tipo);
     var conteudo = el('div', { class: 'conteudo' });
+    /* Consome de uma vez: esta montagem é a única que restaura. */
+    var mem = memoriaPasta[tipo] || {};
+    delete memoriaPasta[tipo];
 
     /* ---------------------------------------------------------
        Filtrar DENTRO da pasta
@@ -5566,13 +5590,13 @@ window.CFG = {
       { id: 'recentes', nome: 'Recentes' },
       { id: 'nota',     nome: 'Nota' }
     ];
-    var ordemAtual = 'padrao';
+    var ordemAtual = mem.ordem || 'padrao';
     var botoesOrdem = [];
 
     if (tipo !== 'live') {
       var caixaOrdem = el('div', { class: 'filtro-ordem' });
       ORDENS.forEach(function (o) {
-        var b = el('button', { class: 'ordem-btn' + (o.id === 'padrao' ? ' ativo' : ''),
+        var b = el('button', { class: 'ordem-btn' + (o.id === ordemAtual ? ' ativo' : ''),
                                'data-focusable': '', text: o.nome });
         b.onclick = function () {
           ordemAtual = o.id;
@@ -5584,6 +5608,16 @@ window.CFG = {
         caixaOrdem.appendChild(b);
       });
       barra.appendChild(caixaOrdem);
+    }
+
+    /* Tira uma fotografia da tela no instante em que um título é
+       aberto. É a única coisa que escreve na memória, e é o que
+       torna a restauração previsível: o que volta é exatamente o
+       que estava na tela quando você apertou OK. */
+    function anotarSaida(foco) {
+      memoriaPasta[tipo] = {
+        catId: atual, ordem: ordemAtual, filtro: campo.value, foco: foco || ''
+      };
     }
 
     function ordenar(lista) {
@@ -5615,6 +5649,7 @@ window.CFG = {
 
     var atual = null;
     var itensDaPasta = [];
+    var aRestaurar = mem.foco || '';
 
     function normal(s) {
       return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
@@ -5642,9 +5677,28 @@ window.CFG = {
                          'A categoria "' + (cat ? cat.nome : '') + '" veio vazia do provedor.'));
         return;
       }
-      var g = w.UI.grade(itens, { forma: forma, colunas: COLUNAS, aoAbrir: abrir });
+      var g = w.UI.grade(itens, {
+        forma: forma, colunas: COLUNAS,
+        /* Abrir um título é o momento exato de anotar onde a
+           pessoa estava — é para cá que ela volta. */
+        aoAbrir: function (item) { anotarSaida(item.id); abrir(item); }
+      });
       caixaGrade.appendChild(g);
       w.UI.ligar(g);
+
+      /* A volta: recoloca o foco no cartaz que foi aberto. A grade
+         é virtualizada, então o cartão pode nem existir no DOM —
+         `garantir` monta aquele índice sob demanda. */
+      if (aRestaurar) {
+        var alvo = aRestaurar;
+        aRestaurar = '';
+        for (var i = 0; i < itens.length; i++) {
+          if (String(itens[i].id) !== String(alvo)) continue;
+          var no = g.ctrl && g.ctrl.garantir ? g.ctrl.garantir(i) : null;
+          if (no) assumirFocoEm(no);
+          break;
+        }
+      }
     }
 
     function aplicarFiltro() {
@@ -5666,13 +5720,17 @@ window.CFG = {
       return w.Nav.entrar('grid');
     }
 
-    function mostrar(cat, forcar, entrar) {
+    function mostrar(cat, forcar, entrar, manterFiltro) {
       if (atual === cat.id && !forcar) {
         if (entrar) entrarNaGrade();
         return;
       }
       atual = cat.id;
-      campo.value = '';
+      /* Trocar de pasta zera o filtro — senão a pasta nova abre
+         escondida atrás de um termo que era da anterior. A
+         exceção é a restauração: ali a pasta é a MESMA de antes e
+         o filtro faz parte do que se está devolvendo. */
+      if (!manterFiltro) campo.value = '';
       conta.textContent = '';
       w.Virt.dentroDe(caixaGrade).forEach(function (c) { c.destruir(); });
       w.clear(caixaGrade);
@@ -5685,8 +5743,11 @@ window.CFG = {
       .then(function (itens) {
         if (atual !== cat.id) return;                 /* já mudou de categoria */
         itensDaPasta = itens;
-        conta.textContent = itens.length + ' itens';
-        pintar(ordenar(itens), cat);
+        if (campo.value.trim()) { aplicarFiltro(); }
+        else {
+          conta.textContent = itens.length + ' itens';
+          pintar(ordenar(itens), cat);
+        }
         if (entrar) entrarNaGrade();
       }).catch(function (e) {
         if (atual !== cat.id) return;
@@ -5786,10 +5847,23 @@ window.CFG = {
       };
       var inicial = 0;
       while (inicial < cats.length - 1 && vaziaAgora(cats[inicial].id)) inicial++;
+
+      /* A pasta lembrada vence a seleção automática: voltar de um
+         título tem de cair na pasta em que você estava, não na
+         primeira útil da coluna. */
+      var voltando = false;
+      if (mem.catId) {
+        for (var ci = 0; ci < cats.length; ci++) {
+          if (String(cats[ci].id) === String(mem.catId)) { inicial = ci; voltando = true; break; }
+        }
+      }
+
       var botoes = w.$$('.cat-item', coluna);
       botoes.forEach(function (b) { b.classList.remove('ativa'); });
       if (botoes[inicial]) botoes[inicial].classList.add('ativa');
-      mostrar(cats[inicial]);
+
+      if (voltando && mem.filtro) campo.value = mem.filtro;
+      mostrar(cats[inicial], false, false, voltando);
 
       /* O foco tem de cair na pasta ATIVA, não na primeira da
          coluna. Sem isto acontecia uma coisa que parecia
@@ -6160,10 +6234,26 @@ window.CFG = {
 
      Sai do material que a abertura já baixou para montar as
      outras fileiras: nenhuma requisição a mais.
+
+     ---------------------------------------------------------
+     O erro que isto conserta
+     ---------------------------------------------------------
+     A conta era feita sobre `bloco.itens`, que é a pasta CORTADA
+     nos 60 primeiros — e os 60 primeiros vêm na ordem do
+     provedor, que não é ordem de chegada. Resultado: a abertura
+     anunciava como novidade o que era simplesmente o começo da
+     lista, e abrir a mesma pasta ordenando por "Recentes"
+     mostrava coisas mais novas que não estavam no Top 10. Você
+     viu a contradição e ela era real.
+
+     Agora a conta é sobre `bloco.todos`, a pasta inteira. Ordenar
+     antes de cortar, e não o contrário.
      ----------------------------------------------------------- */
   function topNovidades(blocos, quantos) {
     var todos = [];
-    (blocos || []).forEach(function (b) { todos = todos.concat((b && b.itens) || []); });
+    (blocos || []).forEach(function (b) {
+      todos = todos.concat((b && (b.todos || b.itens)) || []);
+    });
 
     var vistos = {};
     return todos.filter(function (i) {
@@ -6359,8 +6449,15 @@ window.CFG = {
       var ordenadas = uteis.slice().sort(function (a, b) { return nota(a) - nota(b); });
       return Promise.all(ordenadas.slice(0, quantas).map(function (c) {
         return w.Catalog.itens(tipo, c.id)
-          .then(function (its) { return { nome: c.nome, itens: its.slice(0, 60) }; })
-          .catch(function () { return { nome: c.nome, itens: [] }; });
+          /* `itens` é o recorte que vira fileira; `todos` é a pasta
+             inteira, e é dela que sai o Top 10. Ver o comentário
+             em `topNovidades`: cortar antes de ordenar por data
+             era a razão de a abertura mostrar novidades mais
+             velhas que as da própria pasta. */
+          .then(function (its) {
+            return { nome: c.nome, itens: its.slice(0, 60), todos: its };
+          })
+          .catch(function () { return { nome: c.nome, itens: [], todos: [] }; });
       }));
     }).catch(function () { return []; });
   }
