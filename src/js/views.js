@@ -149,10 +149,25 @@
   }
 
   function colunaCategorias(cats, aoEscolher) {
+    /* ---------------------------------------------------------
+       A coluna de pastas
+       ---------------------------------------------------------
+       Não tem mais vizinho à direita. A seta para a direita
+       atravessando para a grade era o terceiro degrau de um
+       caminho que o OK já faz num toque só — e gastava o eixo
+       horizontal, que numa coluna de 60 pastas com 20 visíveis
+       tem uso muito melhor: `data-page` faz ←/→ andarem uma
+       janela inteira.
+
+       O ← continua saindo para o menu, mas só a partir da
+       primeira página. Enquanto houver página anterior, ele
+       volta uma página. Como num livro.
+       --------------------------------------------------------- */
     var aside = el('div', {
       class: 'coluna-cats',
       'data-region': 'cats', 'data-axis': 'y',
-      'data-nb-left': 'rail', 'data-nb-right': 'grid',
+      'data-nb-left': 'rail',
+      'data-page': '',
       'data-enter': 'last'
     });
     var janela = el('div', { class: 'janela cheia' });
@@ -266,10 +281,14 @@
       return copia;
     }
 
+    /* A grade não sai mais pela esquerda. Dentro do conteúdo, as
+       setas navegam o conteúdo e nada mais — sair é com Voltar,
+       que sobe para as pastas (ver `tela._voltar`), ou com ↑, que
+       chega à barra de filtro e de lá tem ← para as pastas. */
     var caixaGrade = el('div', {
       class: 'grade-caixa',
       'data-region': 'grid', 'data-axis': 'grid',
-      'data-nb-left': 'cats', 'data-nb-up': 'filtro', 'data-enter': 'last'
+      'data-nb-up': 'filtro', 'data-enter': 'last'
     });
     caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
 
@@ -352,6 +371,38 @@
       if (k !== w.KEY.RED) return false;
       w.Nav.focar(campo);
       return true;
+    };
+
+    /* -----------------------------------------------------------
+       A escada do Voltar
+       -----------------------------------------------------------
+       Grade → filtro? Não: filtro é um desvio, não um nível. A
+       escada real desta tela tem três degraus, e Voltar desce um
+       de cada vez:
+
+         conteúdo → pastas → menu → (tela anterior)
+
+       Sem isto, o Voltar dentro da grade sumia com a tela inteira
+       e a pessoa perdia a pasta que tinha aberto — o que já era
+       ruim antes e ficaria pior agora que a seta esquerda não sai
+       mais do conteúdo.
+       ----------------------------------------------------------- */
+    tela._voltar = function () {
+      var foco = w.Nav.atual();
+      if (!foco || !tela.contains(foco)) return false;
+
+      var reg = w.Nav.regiaoAtual();
+      var nome = reg && reg.getAttribute('data-region');
+
+      if (nome === 'grid' || nome === 'filtro') {
+        /* volta para a pasta que está aberta, não para a primeira */
+        var ativa = w.$('.cat-item.ativa', tela);
+        return w.Nav.focar(ativa) || w.Nav.entrar('cats');
+      }
+      if (nome === 'cats') {
+        return w.Nav.focusFirst('.rail-item.active') || w.Nav.focusFirst('.rail-item');
+      }
+      return false;
     };
 
     w.Catalog.categorias(tipo).then(function (cats) {
@@ -1407,23 +1458,19 @@
     pIni.appendChild(bSom);
     caixa.appendChild(pIni);
 
-    /* --- conteúdo adulto --- */
-    var pAd = painel('Conteúdo adulto',
-      'Independentemente desta opção, nada de conteúdo adulto é gravado como ' +
-      'assistido, recente ou em andamento — nem entra em relacionados.');
-    var oculto = !!w.Store.get('adulto.ocultar');
-    var bAd = el('button', { class: 'btn ghost' + (oculto ? ' ativo' : ''), 'data-focusable': '' });
-    bAd.innerHTML = '<span>' + (oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo') + '</span>';
-    bAd.onclick = function () {
-      oculto = !oculto;
-      w.Store.set('adulto.ocultar', oculto);
-      bAd.classList.toggle('ativo', oculto);
-      bAd.querySelector('span').textContent =
-        oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo';
-      w.Catalog.limparCache();
-    };
-    pAd.appendChild(bAd);
-    caixa.appendChild(pAd);
+    /* O painel de conteúdo adulto saiu daqui de propósito.
+       -------------------------------------------------------
+       O comportamento continua exatamente o mesmo, e é o certo:
+       as categorias aparecem no catálogo normalmente, e NADA
+       delas é gravado — nem progresso, nem favorito, nem hábito
+       de canal, nem relacionado. Isso é regra de código, no
+       `store.js` e no `player.js`, não uma preferência.
+
+       Ter um botão para uma coisa que já está resolvida só
+       convida a mexer no que não precisa. O interruptor de
+       ocultar continua existindo em `adulto.ocultar` para quem
+       quiser ligar à mão um dia; ele só não ocupa mais uma
+       tela. */
 
     /* --- dados --- */
     var pD = painel('Dados', 'Cache do catálogo e sincronização do histórico.');

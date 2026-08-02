@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+3f7d4260";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+9c8ced14";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -2395,13 +2395,18 @@ window.CFG = {
           data-nb-left="rail"        vizinho ao sair pela esquerda
           data-nb-right="grid"
           data-enter="last"          last | first | seletor CSS
-          data-wrap="y">             eixos em que dá a volta
+          data-wrap="y"              eixos em que dá a volta
+          data-page>                 ←/→ paginam a coluna
        <button data-focusable>…</button>
      </div>
 
    Eixo `rows`: a região contém elementos [data-row]; esquerda
    e direita andam dentro da fileira, cima e baixo trocam de
    fileira mantendo a posição horizontal.
+
+   `data-page`, numa região de eixo `y`: ←/→ deixam de ser
+   "sair para o vizinho" e passam a andar uma janela inteira
+   dentro da própria coluna.
 
    Rolagem: o elemento com [data-scroll="x|y"] é o trilho que
    se move; o pai dele é a janela. A janela precisa ter
@@ -2512,6 +2517,31 @@ window.CFG = {
     if (eixo === 'y') {
       if (dir === 'down') return lista[i + 1] || null;
       if (dir === 'up') return lista[i - 1] || null;
+
+      /* -------------------------------------------------------
+         Paginar uma coluna com ←/→
+         -------------------------------------------------------
+         Numa coluna longa, o eixo horizontal não tem uso: não há
+         nada ao lado. Numa região que declara `data-page`, ele
+         passa a valer uma TELA de cada vez — que é a distância
+         que interessa quando a lista tem 60 pastas e a janela
+         mostra 20.
+
+         Na ponta devolve null de propósito. Assim a última
+         página não engole a tecla, e a primeira deixa o ← cair
+         no vizinho declarado (o menu) em vez de prender a pessoa
+         na coluna.
+         ------------------------------------------------------- */
+      if (reg.hasAttribute('data-page') && (dir === 'left' || dir === 'right')) {
+        var passo = tamanhoDaPagina(lista);
+        var j = i + (dir === 'right' ? passo : -passo);
+        if (dir === 'right') {
+          if (i >= lista.length - 1) return null;
+          return lista[Math.min(j, lista.length - 1)];
+        }
+        if (i <= 0) return null;
+        return lista[Math.max(j, 0)];
+      }
       return null;
     }
     if (eixo === 'grid') {
@@ -2523,6 +2553,24 @@ window.CFG = {
       return gradeVertical(lista, i, dir);
     }
     return null;
+  }
+
+  /* Quantos itens cabem na janela da coluna — medido, não
+     chutado. O passo entre dois itens já inclui margem e borda,
+     e é por isso que ele sai da diferença de `offsetTop` em vez
+     de `offsetHeight`. Um a menos no fim: uma página que começa
+     no item seguinte ao último visível salta uma linha; deixar
+     uma de sobreposição é o que faz a leitura ter continuidade,
+     e é o que qualquer leitor de página longa faz. */
+  function tamanhoDaPagina(lista) {
+    if (lista.length < 2) return 1;
+    var passo = Math.abs(lista[1].offsetTop - lista[0].offsetTop) || lista[0].offsetHeight;
+    if (!passo) return 1;
+    var t = trilhos(lista[0])[0];
+    var janela = t && t.parentElement;
+    var altura = janela ? janela.clientHeight : 0;
+    if (!altura) return 1;
+    return Math.max(1, Math.floor(altura / passo) - 1);
   }
 
   /* Cima/baixo numa grade: linha vizinha, escolhida por
@@ -3888,18 +3936,6 @@ window.CFG = {
     return s;
   }
 
-  /* -----------------------------------------------------------
-     Troca o conteúdo do palco — e diz ao menu para onde ir
-     -----------------------------------------------------------
-     O menu lateral não tem vizinho à direita fixo: depende da
-     tela. Sem declarar isso, a seta para a direita não saía do
-     menu — o motor procurava `data-nb-right` no `#rail`, não
-     achava, e parava na borda. Corretíssimo do ponto de vista
-     do algoritmo, e péssimo para quem está com o controle na
-     mão.
-
-     Cada tela informa aqui qual é a sua região principal.
-     ----------------------------------------------------------- */
   /* Nem tudo o que uma tela cria morre sozinho quando o nó sai do
      documento. O trailer da abertura, por exemplo, é um <iframe>
      do YouTube com um temporizador atrás: remover o nó para o
@@ -3925,11 +3961,26 @@ window.CFG = {
     return elemento;
   }
 
+  /* -----------------------------------------------------------
+     Cada tela diz ao menu qual é a sua região principal
+     -----------------------------------------------------------
+     Antes isto virava `data-nb-right` no menu, e a seta para a
+     direita atravessava as colunas: menu → pastas → grade. Três
+     paradas para chegar ao conteúdo, fazendo com a seta o mesmo
+     que o OK já faz — e gastando o eixo horizontal, que nas
+     pastas tem uso melhor (paginar).
+
+     Agora a região principal fica guardada como propriedade, e
+     quem a usa é o OK: apertar OK numa seção em que você já está
+     entra nela. A seta para a direita no menu deixa de ser um
+     atalho de ida; ela só devolve ao lugar de onde você veio,
+     que é o `_retorno` do próprio motor.
+     ----------------------------------------------------------- */
   function apontarMenu(regiao) {
     var rail = w.$('#rail');
     if (!rail) return;
-    if (regiao) rail.setAttribute('data-nb-right', regiao);
-    else rail.removeAttribute('data-nb-right');
+    rail.removeAttribute('data-nb-right');
+    rail._principal = regiao || null;
   }
 
   w.UI = {
@@ -5216,10 +5267,25 @@ window.CFG = {
   }
 
   function colunaCategorias(cats, aoEscolher) {
+    /* ---------------------------------------------------------
+       A coluna de pastas
+       ---------------------------------------------------------
+       Não tem mais vizinho à direita. A seta para a direita
+       atravessando para a grade era o terceiro degrau de um
+       caminho que o OK já faz num toque só — e gastava o eixo
+       horizontal, que numa coluna de 60 pastas com 20 visíveis
+       tem uso muito melhor: `data-page` faz ←/→ andarem uma
+       janela inteira.
+
+       O ← continua saindo para o menu, mas só a partir da
+       primeira página. Enquanto houver página anterior, ele
+       volta uma página. Como num livro.
+       --------------------------------------------------------- */
     var aside = el('div', {
       class: 'coluna-cats',
       'data-region': 'cats', 'data-axis': 'y',
-      'data-nb-left': 'rail', 'data-nb-right': 'grid',
+      'data-nb-left': 'rail',
+      'data-page': '',
       'data-enter': 'last'
     });
     var janela = el('div', { class: 'janela cheia' });
@@ -5333,10 +5399,14 @@ window.CFG = {
       return copia;
     }
 
+    /* A grade não sai mais pela esquerda. Dentro do conteúdo, as
+       setas navegam o conteúdo e nada mais — sair é com Voltar,
+       que sobe para as pastas (ver `tela._voltar`), ou com ↑, que
+       chega à barra de filtro e de lá tem ← para as pastas. */
     var caixaGrade = el('div', {
       class: 'grade-caixa',
       'data-region': 'grid', 'data-axis': 'grid',
-      'data-nb-left': 'cats', 'data-nb-up': 'filtro', 'data-enter': 'last'
+      'data-nb-up': 'filtro', 'data-enter': 'last'
     });
     caixaGrade.appendChild(el('div', { class: 'carregando', text: 'Carregando…' }));
 
@@ -5419,6 +5489,38 @@ window.CFG = {
       if (k !== w.KEY.RED) return false;
       w.Nav.focar(campo);
       return true;
+    };
+
+    /* -----------------------------------------------------------
+       A escada do Voltar
+       -----------------------------------------------------------
+       Grade → filtro? Não: filtro é um desvio, não um nível. A
+       escada real desta tela tem três degraus, e Voltar desce um
+       de cada vez:
+
+         conteúdo → pastas → menu → (tela anterior)
+
+       Sem isto, o Voltar dentro da grade sumia com a tela inteira
+       e a pessoa perdia a pasta que tinha aberto — o que já era
+       ruim antes e ficaria pior agora que a seta esquerda não sai
+       mais do conteúdo.
+       ----------------------------------------------------------- */
+    tela._voltar = function () {
+      var foco = w.Nav.atual();
+      if (!foco || !tela.contains(foco)) return false;
+
+      var reg = w.Nav.regiaoAtual();
+      var nome = reg && reg.getAttribute('data-region');
+
+      if (nome === 'grid' || nome === 'filtro') {
+        /* volta para a pasta que está aberta, não para a primeira */
+        var ativa = w.$('.cat-item.ativa', tela);
+        return w.Nav.focar(ativa) || w.Nav.entrar('cats');
+      }
+      if (nome === 'cats') {
+        return w.Nav.focusFirst('.rail-item.active') || w.Nav.focusFirst('.rail-item');
+      }
+      return false;
     };
 
     w.Catalog.categorias(tipo).then(function (cats) {
@@ -6474,23 +6576,19 @@ window.CFG = {
     pIni.appendChild(bSom);
     caixa.appendChild(pIni);
 
-    /* --- conteúdo adulto --- */
-    var pAd = painel('Conteúdo adulto',
-      'Independentemente desta opção, nada de conteúdo adulto é gravado como ' +
-      'assistido, recente ou em andamento — nem entra em relacionados.');
-    var oculto = !!w.Store.get('adulto.ocultar');
-    var bAd = el('button', { class: 'btn ghost' + (oculto ? ' ativo' : ''), 'data-focusable': '' });
-    bAd.innerHTML = '<span>' + (oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo') + '</span>';
-    bAd.onclick = function () {
-      oculto = !oculto;
-      w.Store.set('adulto.ocultar', oculto);
-      bAd.classList.toggle('ativo', oculto);
-      bAd.querySelector('span').textContent =
-        oculto ? 'Escondendo do catálogo' : 'Aparece no catálogo';
-      w.Catalog.limparCache();
-    };
-    pAd.appendChild(bAd);
-    caixa.appendChild(pAd);
+    /* O painel de conteúdo adulto saiu daqui de propósito.
+       -------------------------------------------------------
+       O comportamento continua exatamente o mesmo, e é o certo:
+       as categorias aparecem no catálogo normalmente, e NADA
+       delas é gravado — nem progresso, nem favorito, nem hábito
+       de canal, nem relacionado. Isso é regra de código, no
+       `store.js` e no `player.js`, não uma preferência.
+
+       Ter um botão para uma coisa que já está resolvida só
+       convida a mexer no que não precisa. O interruptor de
+       ocultar continua existindo em `adulto.ocultar` para quem
+       quiser ligar à mão um dia; ele só não ocupa mais uma
+       tela. */
 
     /* --- dados --- */
     var pD = painel('Dados', 'Cache do catálogo e sincronização do histórico.');
@@ -6807,12 +6905,24 @@ window.CFG = {
   /* ---------------------------------------------------------
      Barra lateral: abre quando o foco entra nela.
      --------------------------------------------------------- */
+  /* OK no menu é o jeito de ENTRAR — inclusive quando você já
+     está na seção. Antes, apertar OK sobre a aba atual não fazia
+     nada, e como a seta para a direita também deixou de
+     atravessar colunas, isso deixaria a pessoa parada no menu
+     sem saída óbvia. Agora OK sempre leva para dentro: se muda
+     de seção, abre; se é a mesma, devolve o foco ao conteúdo. */
   function wireRail() {
     w.$$('.rail-item').forEach(function (b) {
       b.onclick = function () {
         var route = b.getAttribute('data-route');
-        if (route === currentRoute) return;
-        w.App.go(route, null, { replace: currentRoute === 'home' && route === 'home' });
+        if (route !== currentRoute) {
+          w.App.go(route, null, { replace: currentRoute === 'home' && route === 'home' });
+          return;
+        }
+        var rail = w.$('#rail');
+        var principal = rail && rail._principal;
+        if (principal && w.Nav.entrar(principal)) return;
+        w.Nav.focusFirst('.screen [data-focusable]');
       };
     });
   }
@@ -6857,6 +6967,20 @@ window.CFG = {
       return true;
     }
     if (!w.$('#resume-layer').classList.contains('hidden')) return true;
+
+    /* -------------------------------------------------------
+       A tela pode ter degraus próprios
+       -------------------------------------------------------
+       Nas telas de pasta, Voltar deixou de ser "some com a tela"
+       e virou "sobe um nível": da grade para as pastas, das
+       pastas para o menu, e só então para a tela anterior. É o
+       que sobrou de saída depois que a seta esquerda parou de
+       atravessar colunas — e é o degrau que qualquer app de TV
+       tem, com a diferença de que aqui ele é declarado pela
+       própria tela em vez de adivinhado daqui.
+       ------------------------------------------------------- */
+    var telaAtual = w.$('.screen');
+    if (telaAtual && telaAtual._voltar && telaAtual._voltar() === true) return true;
 
     /* Dentro de uma tela, se o foco não está na barra lateral, o
        primeiro Voltar leva o foco para o menu — igual aos apps da TV. */

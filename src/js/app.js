@@ -73,12 +73,24 @@
   /* ---------------------------------------------------------
      Barra lateral: abre quando o foco entra nela.
      --------------------------------------------------------- */
+  /* OK no menu é o jeito de ENTRAR — inclusive quando você já
+     está na seção. Antes, apertar OK sobre a aba atual não fazia
+     nada, e como a seta para a direita também deixou de
+     atravessar colunas, isso deixaria a pessoa parada no menu
+     sem saída óbvia. Agora OK sempre leva para dentro: se muda
+     de seção, abre; se é a mesma, devolve o foco ao conteúdo. */
   function wireRail() {
     w.$$('.rail-item').forEach(function (b) {
       b.onclick = function () {
         var route = b.getAttribute('data-route');
-        if (route === currentRoute) return;
-        w.App.go(route, null, { replace: currentRoute === 'home' && route === 'home' });
+        if (route !== currentRoute) {
+          w.App.go(route, null, { replace: currentRoute === 'home' && route === 'home' });
+          return;
+        }
+        var rail = w.$('#rail');
+        var principal = rail && rail._principal;
+        if (principal && w.Nav.entrar(principal)) return;
+        w.Nav.focusFirst('.screen [data-focusable]');
       };
     });
   }
@@ -123,6 +135,20 @@
       return true;
     }
     if (!w.$('#resume-layer').classList.contains('hidden')) return true;
+
+    /* -------------------------------------------------------
+       A tela pode ter degraus próprios
+       -------------------------------------------------------
+       Nas telas de pasta, Voltar deixou de ser "some com a tela"
+       e virou "sobe um nível": da grade para as pastas, das
+       pastas para o menu, e só então para a tela anterior. É o
+       que sobrou de saída depois que a seta esquerda parou de
+       atravessar colunas — e é o degrau que qualquer app de TV
+       tem, com a diferença de que aqui ele é declarado pela
+       própria tela em vez de adivinhado daqui.
+       ------------------------------------------------------- */
+    var telaAtual = w.$('.screen');
+    if (telaAtual && telaAtual._voltar && telaAtual._voltar() === true) return true;
 
     /* Dentro de uma tela, se o foco não está na barra lateral, o
        primeiro Voltar leva o foco para o menu — igual aos apps da TV. */

@@ -348,18 +348,6 @@
     return s;
   }
 
-  /* -----------------------------------------------------------
-     Troca o conteúdo do palco — e diz ao menu para onde ir
-     -----------------------------------------------------------
-     O menu lateral não tem vizinho à direita fixo: depende da
-     tela. Sem declarar isso, a seta para a direita não saía do
-     menu — o motor procurava `data-nb-right` no `#rail`, não
-     achava, e parava na borda. Corretíssimo do ponto de vista
-     do algoritmo, e péssimo para quem está com o controle na
-     mão.
-
-     Cada tela informa aqui qual é a sua região principal.
-     ----------------------------------------------------------- */
   /* Nem tudo o que uma tela cria morre sozinho quando o nó sai do
      documento. O trailer da abertura, por exemplo, é um <iframe>
      do YouTube com um temporizador atrás: remover o nó para o
@@ -385,11 +373,26 @@
     return elemento;
   }
 
+  /* -----------------------------------------------------------
+     Cada tela diz ao menu qual é a sua região principal
+     -----------------------------------------------------------
+     Antes isto virava `data-nb-right` no menu, e a seta para a
+     direita atravessava as colunas: menu → pastas → grade. Três
+     paradas para chegar ao conteúdo, fazendo com a seta o mesmo
+     que o OK já faz — e gastando o eixo horizontal, que nas
+     pastas tem uso melhor (paginar).
+
+     Agora a região principal fica guardada como propriedade, e
+     quem a usa é o OK: apertar OK numa seção em que você já está
+     entra nela. A seta para a direita no menu deixa de ser um
+     atalho de ida; ela só devolve ao lugar de onde você veio,
+     que é o `_retorno` do próprio motor.
+     ----------------------------------------------------------- */
   function apontarMenu(regiao) {
     var rail = w.$('#rail');
     if (!rail) return;
-    if (regiao) rail.setAttribute('data-nb-right', regiao);
-    else rail.removeAttribute('data-nb-right');
+    rail.removeAttribute('data-nb-right');
+    rail._principal = regiao || null;
   }
 
   w.UI = {

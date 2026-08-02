@@ -18,13 +18,18 @@
           data-nb-left="rail"        vizinho ao sair pela esquerda
           data-nb-right="grid"
           data-enter="last"          last | first | seletor CSS
-          data-wrap="y">             eixos em que dá a volta
+          data-wrap="y"              eixos em que dá a volta
+          data-page>                 ←/→ paginam a coluna
        <button data-focusable>…</button>
      </div>
 
    Eixo `rows`: a região contém elementos [data-row]; esquerda
    e direita andam dentro da fileira, cima e baixo trocam de
    fileira mantendo a posição horizontal.
+
+   `data-page`, numa região de eixo `y`: ←/→ deixam de ser
+   "sair para o vizinho" e passam a andar uma janela inteira
+   dentro da própria coluna.
 
    Rolagem: o elemento com [data-scroll="x|y"] é o trilho que
    se move; o pai dele é a janela. A janela precisa ter
@@ -135,6 +140,31 @@
     if (eixo === 'y') {
       if (dir === 'down') return lista[i + 1] || null;
       if (dir === 'up') return lista[i - 1] || null;
+
+      /* -------------------------------------------------------
+         Paginar uma coluna com ←/→
+         -------------------------------------------------------
+         Numa coluna longa, o eixo horizontal não tem uso: não há
+         nada ao lado. Numa região que declara `data-page`, ele
+         passa a valer uma TELA de cada vez — que é a distância
+         que interessa quando a lista tem 60 pastas e a janela
+         mostra 20.
+
+         Na ponta devolve null de propósito. Assim a última
+         página não engole a tecla, e a primeira deixa o ← cair
+         no vizinho declarado (o menu) em vez de prender a pessoa
+         na coluna.
+         ------------------------------------------------------- */
+      if (reg.hasAttribute('data-page') && (dir === 'left' || dir === 'right')) {
+        var passo = tamanhoDaPagina(lista);
+        var j = i + (dir === 'right' ? passo : -passo);
+        if (dir === 'right') {
+          if (i >= lista.length - 1) return null;
+          return lista[Math.min(j, lista.length - 1)];
+        }
+        if (i <= 0) return null;
+        return lista[Math.max(j, 0)];
+      }
       return null;
     }
     if (eixo === 'grid') {
@@ -146,6 +176,24 @@
       return gradeVertical(lista, i, dir);
     }
     return null;
+  }
+
+  /* Quantos itens cabem na janela da coluna — medido, não
+     chutado. O passo entre dois itens já inclui margem e borda,
+     e é por isso que ele sai da diferença de `offsetTop` em vez
+     de `offsetHeight`. Um a menos no fim: uma página que começa
+     no item seguinte ao último visível salta uma linha; deixar
+     uma de sobreposição é o que faz a leitura ter continuidade,
+     e é o que qualquer leitor de página longa faz. */
+  function tamanhoDaPagina(lista) {
+    if (lista.length < 2) return 1;
+    var passo = Math.abs(lista[1].offsetTop - lista[0].offsetTop) || lista[0].offsetHeight;
+    if (!passo) return 1;
+    var t = trilhos(lista[0])[0];
+    var janela = t && t.parentElement;
+    var altura = janela ? janela.clientHeight : 0;
+    if (!altura) return 1;
+    return Math.max(1, Math.floor(altura / passo) - 1);
   }
 
   /* Cima/baixo numa grade: linha vizinha, escolhida por
