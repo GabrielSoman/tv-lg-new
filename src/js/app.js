@@ -284,7 +284,29 @@
     if (w.Updater && w.Updater.configured && w.Updater.configured()) {
       setTimeout(function () {
         w.Updater.check().then(function (info) {
-          if (info.isNew) w.toast('Versão ' + info.version + ' disponível — veja em Ajustes.', 5000);
+          if (!info.isNew) return;
+
+          /* Atualização automática, ligada por padrão.
+             -------------------------------------------------
+             O ponto do GitHub era não ter que ir até a TV. Se
+             ainda é preciso apertar um botão no controle toda
+             vez, metade do ganho se perde. Então o app instala
+             sozinho e recarrega — a casca já tem a rede de
+             segurança: aprova a versão só depois de seis
+             segundos de app de pé, e desfaz no próximo boot se
+             algo estourar antes disso.
+
+             Quem preferir decidir na mão desliga em Ajustes. */
+          if (w.Store.get('update.auto', true) === false) {
+            w.toast('Versão ' + info.version + ' disponível — veja em Ajustes.', 5000);
+            return;
+          }
+          w.toast('Atualizando para ' + info.version + '…', 4000);
+          w.Updater.install(info)
+            .then(function () { setTimeout(function () { w.Updater.reload(); }, 1200); })
+            .catch(function (e) {
+              w.toast('Não consegui atualizar sozinho: ' + e.message, 6000);
+            });
         }).catch(function () {});
       }, 6000);
     }

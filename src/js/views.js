@@ -1134,6 +1134,25 @@
     pAtu.appendChild(bAtu);
     pAtu.appendChild(passo);
 
+    /* Liga/desliga a instalação sozinha. Ligada por padrão. */
+    var auto = w.Store.get('update.auto', true) !== false;
+    var bAuto = el('button', { class: 'btn ghost' + (auto ? ' ativo' : ''),
+                               'data-focusable': '' });
+    var pintaAuto = function () {
+      bAuto.querySelector('span').textContent = auto
+        ? 'Atualizar sozinho: ligado'
+        : 'Atualizar sozinho: desligado';
+      bAuto.classList.toggle('ativo', auto);
+    };
+    bAuto.innerHTML = '<span></span>';
+    pintaAuto();
+    bAuto.onclick = function () {
+      auto = !auto;
+      w.Store.set('update.auto', auto);
+      pintaAuto();
+    };
+    pAtu.appendChild(bAuto);
+
     if (w.Updater && w.Updater.hasPrevious && w.Updater.hasPrevious()) {
       var bVolta = el('button', { class: 'btn ghost', 'data-focusable': '' });
       bVolta.innerHTML = '<span>Voltar para a versão anterior</span>';

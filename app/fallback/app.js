@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+acb0452f";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+ac1f3422";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -5557,6 +5557,25 @@ window.CFG = {
     pAtu.appendChild(bAtu);
     pAtu.appendChild(passo);
 
+    /* Liga/desliga a instalação sozinha. Ligada por padrão. */
+    var auto = w.Store.get('update.auto', true) !== false;
+    var bAuto = el('button', { class: 'btn ghost' + (auto ? ' ativo' : ''),
+                               'data-focusable': '' });
+    var pintaAuto = function () {
+      bAuto.querySelector('span').textContent = auto
+        ? 'Atualizar sozinho: ligado'
+        : 'Atualizar sozinho: desligado';
+      bAuto.classList.toggle('ativo', auto);
+    };
+    bAuto.innerHTML = '<span></span>';
+    pintaAuto();
+    bAuto.onclick = function () {
+      auto = !auto;
+      w.Store.set('update.auto', auto);
+      pintaAuto();
+    };
+    pAtu.appendChild(bAuto);
+
     if (w.Updater && w.Updater.hasPrevious && w.Updater.hasPrevious()) {
       var bVolta = el('button', { class: 'btn ghost', 'data-focusable': '' });
       bVolta.innerHTML = '<span>Voltar para a versão anterior</span>';
@@ -6077,7 +6096,29 @@ window.CFG = {
     if (w.Updater && w.Updater.configured && w.Updater.configured()) {
       setTimeout(function () {
         w.Updater.check().then(function (info) {
-          if (info.isNew) w.toast('Versão ' + info.version + ' disponível — veja em Ajustes.', 5000);
+          if (!info.isNew) return;
+
+          /* Atualização automática, ligada por padrão.
+             -------------------------------------------------
+             O ponto do GitHub era não ter que ir até a TV. Se
+             ainda é preciso apertar um botão no controle toda
+             vez, metade do ganho se perde. Então o app instala
+             sozinho e recarrega — a casca já tem a rede de
+             segurança: aprova a versão só depois de seis
+             segundos de app de pé, e desfaz no próximo boot se
+             algo estourar antes disso.
+
+             Quem preferir decidir na mão desliga em Ajustes. */
+          if (w.Store.get('update.auto', true) === false) {
+            w.toast('Versão ' + info.version + ' disponível — veja em Ajustes.', 5000);
+            return;
+          }
+          w.toast('Atualizando para ' + info.version + '…', 4000);
+          w.Updater.install(info)
+            .then(function () { setTimeout(function () { w.Updater.reload(); }, 1200); })
+            .catch(function (e) {
+              w.toast('Não consegui atualizar sozinho: ' + e.message, 6000);
+            });
         }).catch(function () {});
       }, 6000);
     }
