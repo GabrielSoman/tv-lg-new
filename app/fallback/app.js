@@ -1,4 +1,4 @@
-window.NEBULA_FALLBACK_VERSION = "1.0.0+9c8ced14";
+window.NEBULA_FALLBACK_VERSION = "1.0.0+2d555b58";
 
 /* ===== config.js ================================================= */
 /* =========================================================
@@ -5158,10 +5158,38 @@ window.CFG = {
      Regra: só assume o foco se ninguém tem, se quem tinha saiu do
      documento (é o caso quando o palco é trocado), ou se o foco
      ainda está dentro do palco. Foco no menu é do menu.
+
+     ---------------------------------------------------------
+     A EXCEÇÃO: quando foi o menu que PEDIU para entrar
+     ---------------------------------------------------------
+     A regra acima, sozinha, custava um OK a mais. Você aperta OK
+     em "Ao Vivo", a tela monta — e o foco fica no menu, porque a
+     regra vê "foco fora do palco" e cede o lugar. Aí precisa de
+     um segundo OK para finalmente entrar nas pastas. Medido no
+     aparelho: dois toques para uma ação só.
+
+     A diferença entre os dois casos é a intenção, e ela dá para
+     registrar: `pedirEntrada()` guarda QUAL elemento pediu. Se,
+     quando o conteúdo chegar, o foco ainda estiver exatamente
+     nele, a pessoa não mexeu — ela está esperando entrar, e a
+     tela entra. Se ela andou no menu nesse meio tempo, o foco é
+     dela e a regra original vale.
+
+     Guardar o elemento, e não um "sim" solto, é o que faz isso
+     se limpar sozinho: andar uma tecla já invalida o pedido.
      ----------------------------------------------------------- */
+  var pedidoDeEntrada = null;
+
+  function pedirEntrada() {
+    var atual = w.Nav.atual();
+    pedidoDeEntrada = (atual && document.body.contains(atual)) ? atual : null;
+  }
+
   function podeAssumir() {
     var atual = w.Nav.atual();
-    return !(atual && document.body.contains(atual) && !atual.closest('#stage'));
+    if (!(atual && document.body.contains(atual) && !atual.closest('#stage'))) return true;
+    if (pedidoDeEntrada && pedidoDeEntrada === atual) { pedidoDeEntrada = null; return true; }
+    return false;
   }
   function assumirFoco(regiao) {
     return podeAssumir() ? w.Nav.entrar(regiao) : false;
@@ -5294,6 +5322,9 @@ window.CFG = {
     cats.forEach(function (c, i) {
       var b = el('button', { class: 'cat-item', 'data-focusable': '', text: c.nome });
       b._cat = c;
+      /* `_escolher` é o que o DESCANSO do foco dispara: carrega a
+         pasta e fica onde está. Sem `entrar`, senão passar o foco
+         por cima de uma pasta jogaria você na grade. */
       b._escolher = function () {
         w.$$('.cat-item', aside).forEach(function (o) { o.classList.remove('ativa'); });
         b.classList.add('ativa');
@@ -5304,7 +5335,18 @@ window.CFG = {
          tem de se refazer, e `_escolher` sozinho não faz nada
          porque a pasta já é a atual. */
       b._recarregar = function () { aoEscolher(c, true); };
-      b.onclick = b._escolher;
+
+      /* O OK é outra coisa: é "quero ESTA pasta, me leve até ela".
+         Carrega, se ainda não estiver carregada, e leva o foco
+         para os cartões quando eles chegarem. Sem isto o OK na
+         pasta não fazia nada visível — a pasta já estava aberta
+         pelo descanso do foco — e não havia como chegar à grade
+         depois que a seta parou de atravessar colunas. */
+      b.onclick = function () {
+        w.$$('.cat-item', aside).forEach(function (o) { o.classList.remove('ativa'); });
+        b.classList.add('ativa');
+        aoEscolher(c, false, true);
+      };
       if (i === 0) b.classList.add('ativa');
       trilho.appendChild(b);
     });
@@ -5459,8 +5501,18 @@ window.CFG = {
     }
     campo.oninput = w.debounce(aplicarFiltro, 160);
 
-    function mostrar(cat, forcar) {
-      if (atual === cat.id && !forcar) return;
+    /* Leva o foco para os cartões. Se a pasta veio vazia não há
+       o que focar, e aí o foco fica onde está — na pasta — em vez
+       de sumir para lugar nenhum. */
+    function entrarNaGrade() {
+      return w.Nav.entrar('grid');
+    }
+
+    function mostrar(cat, forcar, entrar) {
+      if (atual === cat.id && !forcar) {
+        if (entrar) entrarNaGrade();
+        return;
+      }
       atual = cat.id;
       campo.value = '';
       conta.textContent = '';
@@ -5477,6 +5529,7 @@ window.CFG = {
         itensDaPasta = itens;
         conta.textContent = itens.length + ' itens';
         pintar(ordenar(itens), cat);
+        if (entrar) entrarNaGrade();
       }).catch(function (e) {
         if (atual !== cat.id) return;
         w.clear(caixaGrade);
@@ -5700,7 +5753,15 @@ window.CFG = {
     var vid = idYoutube(item.trailer);
     if (!vid) return;
 
-    var mudo = w.Store.get('hero.som', false) !== true;
+    /* Com som por padrão. O iframe SOBE mudo mesmo assim, e o som
+       entra logo depois por postMessage — não é firula: navegador
+       nenhum deixa um vídeo embutido começar com áudio sem gesto
+       do usuário, e a resposta a isso é recusar a reprodução
+       inteira. Subir mudo e tirar o mudo em seguida é o que faz o
+       trailer tocar em todo caso: com som quando o aparelho
+       permite, sem som quando não permite. Nunca uma caixa preta
+       parada. */
+    var mudo = w.Store.get('hero.som', true) !== true;
     var caixa = null, quadro = null, relogio = null, vigia = null, morto = false;
 
     function parar() {
@@ -5745,7 +5806,7 @@ window.CFG = {
       quadro.setAttribute('allow', 'autoplay; encrypted-media');
       quadro.setAttribute('tabindex', '-1');
       quadro.src = 'https://www.youtube.com/embed/' + vid +
-        '?autoplay=1&mute=' + (mudo ? 1 : 0) +
+        '?autoplay=1&mute=1' +
         '&controls=0&disablekb=1&fs=0&rel=0&modestbranding=1' +
         '&iv_load_policy=3&playsinline=1&enablejsapi=1' +
         '&loop=1&playlist=' + vid;
@@ -5760,6 +5821,10 @@ window.CFG = {
           b.classList.add('hero-som');
           botoes.appendChild(b);
         }
+        /* O som entra depois que o player do YouTube existe do
+           outro lado — mandar antes é falar sozinho. Um segundo
+           é folga suficiente e ninguém percebe. */
+        if (!mudo) setTimeout(function () { if (!morto) comandar('unMute'); }, 1000);
       };
 
       caixa.appendChild(quadro);
@@ -5774,6 +5839,71 @@ window.CFG = {
 
     relogio = setTimeout(comecar, ATRASO_TRAILER);
     sec._desligar = function () { morto = true; parar(); };
+  }
+
+  /* -----------------------------------------------------------
+     O destaque acompanha o que você está olhando
+     -----------------------------------------------------------
+     Enquanto você anda pelo "Continuar assistindo", o hero troca
+     junto: a arte grande, a sinopse, os botões e o trailer passam
+     a ser do item em foco. É a fileira certa para isto — ela fica
+     logo abaixo do hero, então os dois estão na tela ao mesmo
+     tempo e a troca se vê. Nas fileiras de baixo o hero já saiu
+     de cena e trocá-lo seria trabalho para ninguém ver.
+
+     Duas cautelas, as duas por causa do que custa numa TV:
+
+     · troca no DESCANSO do foco, não a cada tecla. Passar rápido
+       por dez cartazes não pode disparar dez trocas de arte e dez
+       chamadas ao painel — foi assim que o fundo ambiente da
+       versão anterior derrubou a taxa de quadros;
+
+     · o hero antigo é DESLIGADO antes de sair. Ele pode ter um
+       trailer tocando atrás, e um <iframe> do YouTube removido
+       sem aviso continua consumindo rede e som.
+     ----------------------------------------------------------- */
+  var heroVivo = null;
+  var esperaHero = null;
+  var ESPERA_HERO = 380;
+
+  function chaveDoDestaque(item) {
+    if (!item) return '';
+    var s = item.series_id || item.seriesId;
+    return s ? 's:' + s : String(item.id || '');
+  }
+
+  function aoFocarCartao(elemento) {
+    clearTimeout(esperaHero);
+    if (!heroVivo) return;
+    if (!document.body.contains(heroVivo.no)) { heroVivo = null; return; }
+    if (!elemento || !elemento._item) return;
+    if (!heroVivo.fileira || !heroVivo.fileira.contains(elemento)) return;
+
+    var item = elemento._item;
+    if (chaveDoDestaque(item) === heroVivo.id) return;
+
+    esperaHero = setTimeout(function () {
+      if (w.Nav.atual() !== elemento) return;
+      trocarDestaque(item);
+    }, ESPERA_HERO);
+  }
+
+  function trocarDestaque(item) {
+    if (!heroVivo) return;
+    var id = chaveDoDestaque(item);
+    heroVivo.id = id;
+
+    enriquecerDestaque(marcarRetomar(item)).then(function (cheio) {
+      /* Entre o pedido e a resposta a pessoa pode ter andado mais,
+         ou trocado de tela. Só pinta se ainda for este o alvo. */
+      if (!heroVivo || heroVivo.id !== id) return;
+      if (!heroVivo.no || !document.body.contains(heroVivo.no)) { heroVivo = null; return; }
+
+      var novo = destaque(cheio || item, tocarDoDestaque, abrir);
+      w.UI.desligar(heroVivo.no);
+      heroVivo.no.parentNode.replaceChild(novo, heroVivo.no);
+      heroVivo.no = novo;
+    }).catch(function () {});
   }
 
   /* O destaque merece uma chamada a mais: o registro de progresso
@@ -5886,13 +6016,24 @@ window.CFG = {
       w.clear(fileiras);
       w.clear(coluna);
 
-      if (dest) coluna.appendChild(destaque(dest, tocarDoDestaque, abrir));
+      var noHero = null;
+      if (dest) {
+        noHero = destaque(dest, tocarDoDestaque, abrir);
+        coluna.appendChild(noHero);
+      }
       coluna.appendChild(fileiras);
 
+      var fileiraContinuar = null;
       if (continuar.length) {
-        fileiras.appendChild(w.UI.fileira('Continuar assistindo', continuar,
-          { forma: 'wide', aoAbrir: tocarDoDestaque }));
+        fileiraContinuar = w.UI.fileira('Continuar assistindo', continuar,
+          { forma: 'wide', aoAbrir: tocarDoDestaque });
+        fileiras.appendChild(fileiraContinuar);
       }
+
+      /* A partir daqui o destaque segue o foco desta fileira. */
+      heroVivo = (noHero && fileiraContinuar)
+        ? { no: noHero, id: chaveDoDestaque(dest), fileira: fileiraContinuar }
+        : null;
 
       /* A fileira numerada vem logo depois do que está em
          andamento e antes das pastas: é a única fileira em que a
@@ -6560,7 +6701,7 @@ window.CFG = {
     };
     pIni.appendChild(bTr);
 
-    var somOn = w.Store.get('hero.som', false) === true;
+    var somOn = w.Store.get('hero.som', true) === true;
     var bSom = el('button', { class: 'btn ghost' + (somOn ? ' ativo' : ''), 'data-focusable': '' });
     var pintaSom = function () {
       bSom.innerHTML = w.icon(somOn ? 'volume' : 'mute') + '<span>' +
@@ -6823,7 +6964,16 @@ window.CFG = {
     seriesDetail: detalheSerie,
 
     aoFocarCategoria: aoFocarCategoria,
-    stopBillboard: function () { clearTimeout(esperaCat); }
+    aoFocarCartao: aoFocarCartao,
+    pedirEntrada: pedirEntrada,
+    /* Chamado a cada troca de tela: mata o que a tela anterior
+       deixou agendado. Sem isto, um destaque pedido meio segundo
+       antes de sair pintaria por cima da tela nova. */
+    stopBillboard: function () {
+      clearTimeout(esperaCat);
+      clearTimeout(esperaHero);
+      heroVivo = null;
+    }
   };
 
 })(window);
@@ -6877,6 +7027,10 @@ window.CFG = {
     go: function (route, params, opts) {
       opts = opts || {};
       if (w.Player.isOpen()) w.Player.close();
+      /* Quem manda trocar de tela está pedindo para ENTRAR nela.
+         A tela nova consulta isso antes de tomar o foco — ver o
+         comentário de `podeAssumir` no views.js. */
+      if (w.Views && w.Views.pedirEntrada) w.Views.pedirEntrada();
       if (!opts.replace && currentRoute) {
         stack.push({ route: currentRoute, params: w.App.lastParams });
         if (stack.length > 12) stack.shift();
@@ -6952,6 +7106,7 @@ window.CFG = {
     if (rail) rail.classList.toggle('open', noMenu);
 
     w.Views.aoFocarCategoria(el);
+    w.Views.aoFocarCartao(el);
   };
 
   /* ---------------------------------------------------------

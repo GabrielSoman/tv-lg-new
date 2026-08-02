@@ -45,6 +45,10 @@
     go: function (route, params, opts) {
       opts = opts || {};
       if (w.Player.isOpen()) w.Player.close();
+      /* Quem manda trocar de tela está pedindo para ENTRAR nela.
+         A tela nova consulta isso antes de tomar o foco — ver o
+         comentário de `podeAssumir` no views.js. */
+      if (w.Views && w.Views.pedirEntrada) w.Views.pedirEntrada();
       if (!opts.replace && currentRoute) {
         stack.push({ route: currentRoute, params: w.App.lastParams });
         if (stack.length > 12) stack.shift();
@@ -120,6 +124,7 @@
     if (rail) rail.classList.toggle('open', noMenu);
 
     w.Views.aoFocarCategoria(el);
+    w.Views.aoFocarCartao(el);
   };
 
   /* ---------------------------------------------------------

@@ -256,7 +256,73 @@ function tabelasEscritas() { return Object.keys(escritas).sort(); }
   ok('e aparece o botão de som',
      await page.evaluate(() => !!document.querySelector('.hero-som')), true);
 
+  console.log('\n9-B) O destaque acompanha o "Continuar assistindo"');
+
+  /* Precisa de histórico para a fileira existir. Dois itens
+     diferentes, porque o teste é sobre a TROCA. */
+  await page.evaluate(() => {
+    Store.saveProgress({ id: 'movie:18000', kind: 'movie', title: 'Primeiro Filme',
+                         poster: 'http://localhost:9099/img/2.png',
+                         position: 600, duration: 6000 });
+    Store.saveProgress({ id: 'movie:18002', kind: 'movie', title: 'Segundo Filme',
+                         poster: 'http://localhost:9099/img/4.png',
+                         position: 300, duration: 6000 });
+    App.go('home', null, { replace: true });
+  });
+  await ate(() => !!document.querySelector('.hero-titulo'), null, 20000);
+  await ate(() => {
+    const f = Array.prototype.slice.call(document.querySelectorAll('.row'))
+      .filter((r) => /Continuar assistindo/.test(r.textContent))[0];
+    return !!(f && f.querySelectorAll('.card').length > 1);
+  }, null, 20000);
+  await espera(600);
+
+  const tituloInicial = await page.evaluate(() =>
+    document.querySelector('.hero-titulo').textContent);
+  ok('a abertura tem destaque com título', !!tituloInicial, true);
+
+  /* Anda um cartão na fileira e espera o descanso do foco. */
+  const trocou = await page.evaluate(() => {
+    const f = Array.prototype.slice.call(document.querySelectorAll('.row'))
+      .filter((r) => /Continuar assistindo/.test(r.textContent))[0];
+    const cards = f.querySelectorAll('.card');
+    Nav.focar(cards[0]);
+    Nav.mover('right');
+    return Nav.atual() && Nav.atual()._item ? Nav.atual()._item.title : null;
+  });
+  ok('dá para andar na fileira', !!trocou, true);
+
+  const acompanhou = await ate(() => {
+    const h = document.querySelector('.hero-titulo');
+    const a = Nav.atual();
+    return !!(h && a && a._item && h.textContent.indexOf(a._item.title.slice(0, 8)) >= 0);
+  }, null, 8000);
+  ok('o destaque troca para o item em foco', acompanhou, true);
+
+  /* E não troca a cada tecla: só quando o foco descansa. */
+  ok('mas só no descanso do foco, não a cada tecla', await page.evaluate(async () => {
+    const antes = document.querySelector('.hero-titulo').textContent;
+    for (let i = 0; i < 3; i++) Nav.mover('left');
+    await new Promise((r) => setTimeout(r, 120));
+    return document.querySelector('.hero-titulo').textContent === antes;
+  }), true);
+
+  /* Andar numa fileira de BAIXO não mexe no destaque: ele já
+     saiu da tela e trocá-lo seria trabalho para ninguém ver. */
+  ok('fileiras de baixo não mexem no destaque', await page.evaluate(async () => {
+    const antes = document.querySelector('.hero-titulo').textContent;
+    const fs = Array.prototype.slice.call(document.querySelectorAll('.row'))
+      .filter((r) => !/Continuar assistindo/.test(r.textContent));
+    const outra = fs.map((r) => r.querySelector('.card')).filter(Boolean)[0];
+    if (!outra) return true;
+    Nav.focar(outra);
+    await new Promise((r) => setTimeout(r, 900));
+    return document.querySelector('.hero-titulo').textContent === antes;
+  }), true);
+
   console.log('\n10) O trailer MORRE ao trocar de tela');
+  await page.evaluate(() => App.go('home', null, { replace: true }));
+  await ate(() => !!document.querySelector('.hero-trailer iframe'), null, 15000);
   await page.evaluate(() => App.go('live'));
   await espera(1200);
   ok('nenhum iframe do YouTube sobrou',
